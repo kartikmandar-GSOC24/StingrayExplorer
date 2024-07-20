@@ -240,8 +240,6 @@ class MainHeader(pn.viewable.Viewer):
         )
 
         return layout
-        
-
 
 
 class MainArea(pn.viewable.Viewer):
@@ -310,7 +308,6 @@ class OutputBox(pn.viewable.Viewer):
         return pn.Column(heading, output_box, sizing_mode="stretch_both")
 
 
-
 class WarningBox(pn.viewable.Viewer):
     """
     WarningBox class represents a box to display warning content.
@@ -342,9 +339,9 @@ class WarningBox(pn.viewable.Viewer):
         return pn.Column(heading, warning_box, sizing_mode="stretch_both")
 
 
-class BokehPlotsContainer(pn.viewable.Viewer):
+class PlotsContainer(pn.viewable.Viewer):
     """
-    BokehPlotsContainer class represents a container for displaying multiple Bokeh plots.
+    PlotsContainer class represents a container for displaying multiple  plots.
     """
 
     # Parameters for the contents, titles, and sizes of the FlexBox containers
@@ -362,13 +359,13 @@ class BokehPlotsContainer(pn.viewable.Viewer):
 
     def __init__(self, **params):
         """
-        Initializes the BokehPlotsContainer class with the provided parameters.
+        Initializes thePlotsContainer class with the provided parameters.
         """
         super().__init__(**params)
 
     def __panel__(self):
         """
-        Returns the Panel layout for the Bokeh plots container, including the plots with their respective titles and sizes.
+        Returns the Panel layout for the B plots container, including the plots with their respective titles and sizes.
         """
         flexbox_container = pn.FlexBox(
             align_items="center", justify_content="flex-start", flex_wrap="wrap"
@@ -533,5 +530,3 @@ class Footer(pn.viewable.Viewer):
         )
 
         return footer
-
-

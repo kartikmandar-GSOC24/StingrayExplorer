@@ -1,5 +1,13 @@
 import panel as pn
-from modules.Home.HomeContent import create_home_bokeh_plots_container, create_home_footer, create_home_header, create_home_help_box, create_home_main_area, create_home_output_box, create_home_warning_box
+from modules.Home.HomeContent import (
+    home_header,
+    home_main_area,
+    home_output_box,
+    home_warning_box,
+    home_plots_area,
+    home_help_area,
+    home_footer
+)
 from utils.sidebar import create_sidebar
 
 
@@ -12,26 +20,24 @@ busy_indicator = pn.indicators.BooleanStatus(
 )
 
 # Create the header
-header = create_home_header()
+header = home_header
 
 # Create the main area
-main_area = create_home_main_area()
+main_area = home_main_area
 
 # Create the output box
-output_box = create_home_output_box()
+output_box = home_output_box
 
 # Create the warning box
-warning_box = create_home_warning_box()
-
+warning_box = home_warning_box
 # Create the plots container
-bokeh_plots = create_home_bokeh_plots_container()
+bokeh_plots = home_plots_area
 
 # Create the help box
-help_box = create_home_help_box()
+help_box = home_help_area
 
 # Create the footer
-footer = create_home_footer()
-
+footer = home_footer
 # Containers for changing the layouts dynamically
 header_container = pn.Column(header)
 main_area_container = pn.Column(main_area)
@@ -41,7 +47,14 @@ bokeh_plots_container = pn.Column(bokeh_plots)
 help_box_container = pn.Column(help_box)
 footer_container = pn.Column(footer)
 
-sidebar = create_sidebar(main_area=main_area_container, header=header_container, footer=footer_container, output_box=output_box_container, warning_box=warning_box_container, help_box=help_box_container)
+sidebar = create_sidebar(
+    main_area=main_area_container,
+    header=header_container,
+    footer=footer_container,
+    output_box=output_box_container,
+    warning_box=warning_box_container,
+    help_box=help_box_container,
+)
 
 
 # Create a FastGridTemplate layout
@@ -69,8 +82,8 @@ layout = pn.template.FastGridTemplate(
     save_layout=True,
     # Styling parameter
     theme="default",
-    theme_toggle=True,
-    # background_color="#FFFFFF", # The toggle button choses it according to the theme
+    theme_toggle=False,
+    background_color="#FFFFFF", 
     neutral_color="#D3D3D3",
     accent_base_color="#5ead61",
     header_background="#000000",
