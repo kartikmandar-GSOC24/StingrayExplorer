@@ -15,6 +15,7 @@ from modules.DataLoading.DataIngestion import (
     create_loadingdata_main_area,
     create_loadingdata_output_box,
     create_loadingdata_warning_box,
+    create_loadingdata_help_area,
 )
 from modules.QuickLook.LightCurve import create_quicklook_lightcurve_header
 from assets.icons.svg import HOME_ICON_SVG, LOAD_DATA_ICON_SVG
@@ -71,6 +72,7 @@ def create_sidebar(main_area, header, footer, output_box, warning_box, help_box)
         main_area[:] = [create_loadingdata_main_area(output_box, warning_box)]
         output_box[:] = [create_home_output_box()]
         warning_box[:] = [create_home_warning_box()]
+        help_box[:] = [create_loadingdata_help_area()]
 
     load_data_button.on_click(load_data)
 

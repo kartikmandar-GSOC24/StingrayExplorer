@@ -10,14 +10,14 @@ from utils.DashboardClasses import (
 )
 from utils.strings import (
     HOME_HEADER_STRING,
-    WELCOME_MESSAGE_STRING,
-    FOOTER_STRING,
-    STINGRAY_TAB_STRING,
-    HOLOVIZ_TAB_STRING,
-    DASHBOARD_TAB_STRING,
-    OUTPUT_BOX_STRING,
-    WARNING_BOX_STRING,
-    HELP_BOX_STRING,
+    HOME_WELCOME_MESSAGE_STRING,
+    HOME_FOOTER_STRING,
+    HOME_STINGRAY_TAB_STRING,
+    HOME_HOLOVIZ_TAB_STRING,
+    HOME_DASHBOARD_TAB_STRING,
+    HOME_OUTPUT_BOX_STRING,
+    HOME_WARNING_BOX_STRING,
+    HOME_HELP_BOX_STRING,
 )
 
 """ Header Section """
@@ -33,9 +33,9 @@ def create_home_header():
 
 """ Main Area Section """
 def create_home_main_area():
-    tab1_content = pn.pane.Markdown(STINGRAY_TAB_STRING)
-    tab2_content = pn.pane.Markdown(HOLOVIZ_TAB_STRING)
-    tab3_content = pn.pane.Markdown(DASHBOARD_TAB_STRING)
+    tab1_content = pn.pane.Markdown(HOME_STINGRAY_TAB_STRING)
+    tab2_content = pn.pane.Markdown(HOME_HOLOVIZ_TAB_STRING)
+    tab3_content = pn.pane.Markdown(HOME_DASHBOARD_TAB_STRING)
 
     tabs_content = {
         "What's Stingray?": tab1_content,
@@ -47,11 +47,11 @@ def create_home_main_area():
 
 """ Output Box Section """
 def create_home_output_box():
-    return OutputBox(output_content=OUTPUT_BOX_STRING)
+    return OutputBox(output_content=HOME_OUTPUT_BOX_STRING)
 
 """ Warning Box Section """
 def create_home_warning_box():
-    return WarningBox(warning_content=WARNING_BOX_STRING)
+    return WarningBox(warning_content=HOME_WARNING_BOX_STRING)
 
 """ Plots Area Section """
 def create_home_plots_area():
@@ -69,7 +69,7 @@ def create_home_plots_area():
 
 """ Help Area Section """
 def create_home_help_area():
-    help_content = HELP_BOX_STRING
+    help_content = HOME_HELP_BOX_STRING
     return HelpBox(help_content=help_content, title="Help Section")
 
 """ Footer Section """
