@@ -1,20 +1,22 @@
 import panel as pn
 import importlib
-from modules.QuickLook.LightCurve import lightcurve_header, lightcurve_main_area
+
 from modules.Home.HomeContent import (
-    home_header,
-    home_main_area,
-    home_output_box,
-    home_warning_box,
-    home_help_area,
-    home_footer,
+    create_home_header,
+    create_home_main_area,
+    create_home_output_box,
+    create_home_warning_box,
+    create_home_plots_area,
+    create_home_help_area,
+    create_home_footer,
 )
 from modules.DataLoading.DataIngestion import (
-    loadingdata_header,
-    loadingdata_main_area,
-    loadingdata_output_box,
-    loadingdata_warning_box,
+    create_loadingdata_header,
+    create_loadingdata_main_area,
+    create_loadingdata_output_box,
+    create_loadingdata_warning_box,
 )
+from modules.QuickLook.LightCurve import create_quicklook_lightcurve_header
 from assets.icons.svg import HOME_ICON_SVG, LOAD_DATA_ICON_SVG
 
 
@@ -54,21 +56,21 @@ def create_sidebar(main_area, header, footer, output_box, warning_box, help_box)
     )
 
     def handle_home_button_selection(event):
-        header[:] = [home_header]
-        main_area[:] = [home_main_area]
-        output_box[:] = [home_output_box]
-        warning_box[:] = [home_warning_box]
-        help_box[:] = [home_help_area]
-        footer[:] = [home_footer]
+        header[:] = [create_home_header()]
+        main_area[:] = [create_home_main_area()]
+        output_box[:] = [create_home_output_box()]
+        warning_box[:] = [create_home_warning_box()]
+        help_box[:] = [create_home_help_area()]
+        footer[:] = [create_home_footer()]
 
     home_button.on_click(handle_home_button_selection)
 
     # Load Button changing main content
     def load_data(event):
-        header[:] = [loadingdata_header]
-        main_area[:] = [loadingdata_main_area]
-        output_box[:] = [loadingdata_output_box]
-        warning_box[:] = [loadingdata_warning_box]
+        header[:] = [create_loadingdata_header()]
+        main_area[:] = [create_loadingdata_main_area(output_box, warning_box)]
+        output_box[:] = [create_home_output_box()]
+        warning_box[:] = [create_home_warning_box()]
 
     load_data_button.on_click(load_data)
 
@@ -76,8 +78,7 @@ def create_sidebar(main_area, header, footer, output_box, warning_box, help_box)
     def handle_quicklook_button_selection(event):
         clicked = event.new
         if clicked == "QuickLookLightCurve":
-            header[:] = [lightcurve_header]
-            main_area[:] = [lightcurve_main_area]
+            header[:] = [create_quicklook_lightcurve_header()]
 
     quicklook_stingray_button.on_click(handle_quicklook_button_selection)
 

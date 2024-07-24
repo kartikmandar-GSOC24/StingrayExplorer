@@ -1,12 +1,12 @@
 import panel as pn
 from modules.Home.HomeContent import (
-    home_header,
-    home_main_area,
-    home_output_box,
-    home_warning_box,
-    home_plots_area,
-    home_help_area,
-    home_footer
+    create_home_header,
+    create_home_main_area,
+    create_home_output_box,
+    create_home_warning_box,
+    create_home_plots_area,
+    create_home_help_area,
+    create_home_footer
 )
 from utils.sidebar import create_sidebar
 
@@ -20,24 +20,26 @@ busy_indicator = pn.indicators.BooleanStatus(
 )
 
 # Create the header
-header = home_header
+header = create_home_header()
 
 # Create the main area
-main_area = home_main_area
+main_area = create_home_main_area()
 
 # Create the output box
-output_box = home_output_box
+output_box = create_home_output_box()
 
 # Create the warning box
-warning_box = home_warning_box
+warning_box = create_home_warning_box()
+
 # Create the plots container
-bokeh_plots = home_plots_area
+bokeh_plots = create_home_plots_area()
 
 # Create the help box
-help_box = home_help_area
+help_box = create_home_help_area()
 
 # Create the footer
-footer = home_footer
+footer = create_home_footer()
+
 # Containers for changing the layouts dynamically
 header_container = pn.Column(header)
 main_area_container = pn.Column(main_area)
@@ -83,7 +85,7 @@ layout = pn.template.FastGridTemplate(
     # Styling parameter
     theme="default",
     theme_toggle=False,
-    background_color="#FFFFFF", 
+    background_color="#FFFFFF",
     neutral_color="#D3D3D3",
     accent_base_color="#5ead61",
     header_background="#000000",

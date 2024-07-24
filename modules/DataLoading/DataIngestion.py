@@ -1,10 +1,11 @@
+# component_factories.py
+
 import panel as pn
 from stingray.events import EventList
 from stingray import Lightcurve
 import warnings
 import os
 import stat
-import numpy as np
 from bokeh.models import Tooltip
 from utils.globals import loaded_event_data
 from utils.DashboardClasses import (
@@ -18,23 +19,12 @@ from utils.DashboardClasses import (
 )
 import param
 
-""" Header Section """
-home_heading_input = pn.widgets.TextInput(
-    name="Heading", value="Data Ingestion and creation"
-)
-# home_subheading_input = pn.widgets.TextInput(name="Subheading", value="Stingray GUI using HoloViz")
-
-loadingdata_header = MainHeader(heading=home_heading_input)
-
-
-""" Main Area Section """
 
 # Path to the topmost directory for loaded-data
 loaded_data_path = os.path.join(os.getcwd(), "files", "loaded-data")
 
 # Create the loaded-data directory if it doesn't exist
 os.makedirs(loaded_data_path, exist_ok=True)
-
 
 # Custom warning handler
 class WarningHandler:
@@ -48,15 +38,30 @@ class WarningHandler:
         self.warnings.append(warning_message)
 
 
-# Create an instance of the warning handler
-warning_handler = WarningHandler()
+def create_warning_handler():
+    # Create an instance of the warning handler
+    warning_handler = WarningHandler()
 
-# Redirect warnings to the custom handler
-warnings.showwarning = warning_handler.warn
+    # Redirect warnings to the custom handler
+    warnings.showwarning = warning_handler.warn
 
-# Create instances of OutputBox and WarningBox
-loadingdata_output_box = OutputBox()
-loadingdata_warning_box = WarningBox()
+    return warning_handler
+
+
+def create_loadingdata_header():
+    home_heading_input = pn.widgets.TextInput(
+        name="Heading", value="Data Ingestion and creation"
+    )
+    return MainHeader(heading=home_heading_input)
+
+
+def create_loadingdata_output_box(content):
+    return OutputBox(output_content=content)
+
+
+def create_loadingdata_warning_box(content):
+    return WarningBox(warning_content=content)
+
 
 def load_event_data(
     event,
@@ -64,11 +69,12 @@ def load_event_data(
     filename_input,
     format_input,
     format_checkbox,
-    loadingdata_output_box,
-    loadingdata_warning_box,
+    output_box_container,
+    warning_box_container,
+    warning_handler,
 ):
     if not file_selector.value:
-        loadingdata_output_box.output_content = "No file selected. Please select a file to upload."
+        output_box_container[:] = [create_loadingdata_output_box("No file selected. Please select a file to upload.")]
         return
 
     file_paths = file_selector.value
@@ -94,16 +100,14 @@ def load_event_data(
             ]
         )
     if len(formats) < len(file_paths):
-        loadingdata_output_box.output_content = (
-            "Please specify formats for all files or check the default format option."
-        )
+        output_box_container[:] = [create_loadingdata_output_box("Please specify formats for all files or check the default format option.")]
         return
 
     try:
         loaded_files = []
         for file_path, file_name, file_format in zip(file_paths, filenames, formats):
             if any(file_name == event[0] for event in loaded_event_data):
-                loadingdata_output_box.output_content = f"A file with the name '{file_name}' already exists in memory. Please provide a different name."
+                output_box_container[:] = [create_loadingdata_output_box(f"A file with the name '{file_name}' already exists in memory. Please provide a different name.")]
                 return
 
             event_list = EventList.read(file_path, file_format)
@@ -111,24 +115,29 @@ def load_event_data(
             loaded_files.append(
                 f"File '{file_path}' loaded successfully as '{file_name}' with format '{file_format}'."
             )
-
-        loadingdata_output_box.output_content = "\n".join(loaded_files)
+        output_box_container[:] = [create_loadingdata_output_box("\n".join(loaded_files))]
         if warning_handler.warnings:
-            loadingdata_warning_box.warning_content = "\n".join(warning_handler.warnings)
+            warning_box_container[:] = [create_loadingdata_warning_box("\n".join(warning_handler.warnings))]
         else:
-            loadingdata_warning_box.warning_content = "No warnings."
+            warning_box_container[:] = [create_loadingdata_warning_box("No warnings.")]
     except Exception as e:
-        loadingdata_output_box.output_content = f"An error occurred: {e}"
+        output_box_container[:] = [create_loadingdata_output_box(f"An error occurred: {e}")]
 
     # Clear the warnings after displaying them
     warning_handler.warnings.clear()
 
 
 def save_loaded_files(
-    event, filename_input, format_input, format_checkbox, loadingdata_output_box, loadingdata_warning_box
+    event,
+    filename_input,
+    format_input,
+    format_checkbox,
+    output_box_container,
+    warning_box_container,
+    warning_handler,
 ):
     if not loaded_event_data:
-        loadingdata_output_box.output_content = "No files loaded to save."
+        output_box_container[:] = [create_loadingdata_output_box("No files loaded to save.")]
         return
 
     filenames = (
@@ -146,15 +155,13 @@ def save_loaded_files(
         formats = ["hdf5" for _ in range(len(loaded_event_data))]
 
     if len(filenames) < len(loaded_event_data):
-        loadingdata_output_box.output_content = "Please specify names for all loaded files."
+        output_box_container[:] = [create_loadingdata_output_box("Please specify names for all loaded files.")]
         return
     if len(filenames) != len(loaded_event_data):
-        loadingdata_output_box.output_content = (
-            "Please ensure that the number of names matches the number of loaded files."
-        )
+        output_box_container[:] = [create_loadingdata_output_box("Please ensure that the number of names matches the number of loaded files.")]
         return
     if len(formats) < len(loaded_event_data):
-        loadingdata_output_box.output_content = "Please specify formats for all loaded files or check the default format option."
+        output_box_container[:] = [create_loadingdata_output_box("Please specify formats for all loaded files or check the default format option.")]
         return
 
     saved_files = []
@@ -165,7 +172,7 @@ def save_loaded_files(
             if os.path.exists(
                 os.path.join(loaded_data_path, f"{file_name}.{file_format}")
             ):
-                loadingdata_output_box.output_content = f"A file with the name '{file_name}' already exists. Please provide a different name."
+                output_box_container[:] = [create_loadingdata_output_box(f"A file with the name '{file_name}' already exists. Please provide a different name.")]
                 return
 
             save_path = os.path.join(loaded_data_path, f"{file_name}.{file_format}")
@@ -180,21 +187,27 @@ def save_loaded_files(
                 f"File '{file_name}' saved successfully to '{save_path}'."
             )
 
-        loadingdata_output_box.output_content = "\n".join(saved_files)
+        output_box_container[:] = [create_loadingdata_output_box("\n".join(saved_files))]
         if warning_handler.warnings:
-            loadingdata_warning_box.warning_content = "\n".join(warning_handler.warnings)
+            warning_box_container[:] = [create_loadingdata_warning_box("\n".join(warning_handler.warnings))]
         else:
-            loadingdata_warning_box.warning_content = "No warnings."
+            warning_box_container[:] = [create_loadingtab_warning_box("No warnings.")]
     except Exception as e:
-        loadingdata_output_box.output_content = f"An error occurred while saving files: {e}"
+        warning_box_container[:] = [create_loadingdata_warning_box(f"An error occurred while saving files: {e}")]
 
     # Clear the warnings after displaying them
     warning_handler.warnings.clear()
 
 
-def delete_selected_files(event, file_selector, loadingdata_output_box, loadingdata_warning_box):
+def delete_selected_files(
+    event,
+    file_selector,
+    output_box_container,
+    warning_box_container,
+    warning_handler,
+):
     if not file_selector.value:
-        loadingdata_output_box.output_content = "No file selected. Please select a file to delete."
+        output_box_container[:] = [create_loadingdata_output_box("No file selected. Please select a file to delete.")]
         return
 
     file_paths = file_selector.value
@@ -213,19 +226,24 @@ def delete_selected_files(event, file_selector, loadingdata_output_box, loadingd
             deleted_files.append(f"File '{file_path}' deleted successfully.")
         except Exception as e:
             deleted_files.append(f"An error occurred while deleting '{file_path}': {e}")
-
-    loadingdata_output_box.output_content = "\n".join(deleted_files)
+    output_box_container[:] = [create_loadingdata_output_box("\n".join(deleted_files))]
     if warning_handler.warnings:
-        loadingdata_warning_box.warning_content = "\n".join(warning_handler.warnings)
+        warning_box_container[:] = [create_loadingdata_warning_box("\n".join(warning_handler.warnings))]
     else:
-        loadingdata_warning_box.warning_content = "No warnings."
+        warning_box_container[:] = [create_loadingdata_warning_box("No warnings.")]
 
     warning_handler.warnings.clear()
 
 
-def preview_loaded_files(event, loadingdata_output_box, loadingdata_warning_box, time_limit=10):
+def preview_loaded_files(
+    event,
+    output_box_container,
+    warning_box_container,
+    warning_handler,
+    time_limit=10,
+):
     if not loaded_event_data:
-        loadingdata_output_box.output_content = "No files loaded to preview."
+        output_box_container[:] = [create_loadingdata_output_box("No files loaded to preview.")]
         return
 
     preview_data = []
@@ -239,19 +257,19 @@ def preview_loaded_files(event, loadingdata_output_box, loadingdata_warning_box,
             warning_handler.warn(str(e), category=RuntimeWarning)
 
     if preview_data:
-        loadingdata_output_box.output_content = "\n\n".join(preview_data)
+        output_box_container[:] = [create_loadingdata_output_box("\n\n".join(preview_data))]
     else:
-        loadingdata_output_box.output_content = "No valid files loaded for preview."
+        output_box_container[:] = [create_loadingdata_output_box("No valid files loaded for preview.")]
 
     if warning_handler.warnings:
-        loadingdata_warning_box.warning_content = "\n".join(warning_handler.warnings)
+        warning_box_container[:] = [create_loadingdata_warning_box("\n".join(warning_handler.warnings))]
     else:
-        loadingdata_warning_box.warning_content = "No warnings."
+        warning_box_container[:] = [create_loadingdata_warning_box("No warnings.")]
 
     warning_handler.warnings.clear()
 
 
-def create_loading_tab():
+def create_loading_tab(output_box_container, warning_box_container, warning_handler):
     file_selector = pn.widgets.FileSelector(
         os.getcwd(), only_files=True, name="Select File", show_hidden=True
     )
@@ -293,8 +311,8 @@ def create_loading_tab():
 
     def on_load_click(event):
         # Clear previous outputs and warnings
-        loadingdata_output_box.output_content = ""
-        loadingdata_warning_box.warning_content = ""
+        output_box_container[:] = [create_loadingdata_output_box("")]
+        warning_box_container[:] = [create_loadingdata_warning_box("")]
         warning_handler.warnings.clear()
         warnings.resetwarnings()
 
@@ -304,38 +322,53 @@ def create_loading_tab():
             filename_input,
             format_input,
             format_checkbox,
-            loadingdata_output_box,
-            loadingdata_warning_box,
+            output_box_container,
+            warning_box_container,
+            warning_handler,
         )
 
     def on_save_click(event):
         # Clear previous outputs and warnings
-        loadingdata_output_box.output_content = ""
-        loadingdata_warning_box.warning_content = ""
+        output_box_container[:] = [create_loadingdata_output_box("")]
+        warning_box_container[:] = [create_loadingdata_warning_box("")]
         warning_handler.warnings.clear()
         warnings.resetwarnings()
 
         save_loaded_files(
-            event, filename_input, format_input, format_checkbox, loadingdata_output_box, loadingdata_warning_box
+            event,
+            filename_input,
+            format_input,
+            format_checkbox,
+            output_box_container,
+            warning_box_container,
+            warning_handler,
         )
 
     def on_delete_click(event):
         # Clear previous outputs and warnings
-        loadingdata_output_box.output_content = ""
-        loadingdata_warning_box.warning_content = ""
+        warning_box_container[:] = [create_loadingdata_warning_box("")]
+        output_box_container[:] = [create_loadingdata_output_box("")]
         warning_handler.warnings.clear()
         warnings.resetwarnings()
 
-        delete_selected_files(event, file_selector, loadingdata_output_box, loadingdata_warning_box)
+        delete_selected_files(
+            event,
+            file_selector,
+            warning_box_container,
+            output_box_container,
+            warning_handler,
+        )
 
     def on_preview_click(event):
         # Clear previous outputs and warnings
-        loadingdata_output_box.output_content = ""
-        loadingdata_warning_box.warning_content = ""
+        output_box_container[:] = [create_loadingdata_output_box("")]
+        warning_box_container[:] = [create_loadingdata_warning_box("")]
         warning_handler.warnings.clear()
         warnings.resetwarnings()
 
-        preview_loaded_files(event, loadingdata_output_box, loadingdata_warning_box)
+        preview_loaded_files(
+            event, output_box_container, warning_box_container, warning_handler
+        )
 
     load_button.on_click(on_load_click)
     save_button.on_click(on_save_click)
@@ -360,11 +393,13 @@ def create_loading_tab():
     return tab_content
 
 
-tabs_content = {
-    "Loading": create_loading_tab()
-}
-
-loadingdata_main_area = MainArea(tabs_content=tabs_content)
-
-layout = pn.Column(loadingdata_header, loadingdata_main_area)
-
+def create_loadingdata_main_area(output_box, warning_box):
+    warning_handler = create_warning_handler()
+    tabs_content = {
+        "Loading": create_loading_tab(
+            output_box_container=output_box,
+            warning_box_container=warning_box,
+            warning_handler=warning_handler,
+        )
+    }
+    return MainArea(tabs_content=tabs_content)

@@ -11,20 +11,14 @@ from utils.DashboardClasses import (
 )
 
 
-# Header section
-heading_input = pn.widgets.TextInput(name="Heading", value="QuickLook Light Curve")
-lightcurve_header = MainHeader(heading=heading_input)
 
 
-# Main Area section
-tab1_content = pn.pane.Markdown("alkjd")
-tab2_content = pn.pane.Markdown("aldl")
-tab3_content = pn.pane.Markdown("ald")
+def create_quicklook_lightcurve_header():
+    home_heading_input = pn.widgets.TextInput(
+        name="Heading", value="QuickLook Light Curve"
+    )
+    home_subheading_input = pn.widgets.TextInput(
+        name="Subheading", value=""
+    )
 
-tabs_content = {
-    "adfas?": tab1_content,
-    "adafs": tab2_content,
-    "adfas": tab3_content,
-}
-
-lightcurve_main_area = MainArea(tabs_content=tabs_content)
+    return MainHeader(heading=home_heading_input, subheading=home_subheading_input)
