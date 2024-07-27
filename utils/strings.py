@@ -251,11 +251,12 @@ ev.write("events.hdf5", "hdf5")
 
 ### Functionality
 
-The "Creation" tab allows you to create new event lists or simulate event lists from light curves. Here is a detailed explanation of each component and its functionality:
+The "Creation" tab allows you to create new event lists. Here is a detailed explanation of each component and its functionality:
 
 - **Photon Arrival Times**: Enter photon arrival times in seconds from a reference MJD.
 - **MJDREF**: Enter the MJD reference for the photon arrival times.
 - **Energy (optional)**: Enter the energy values associated with the photons.
+Default is 
 - **GTIs (optional)**: Enter the Good Time Intervals (GTIs) for the event list.
 - **Event List Name**: Specify a name for the new event list.
 - **Create Event List**: Create a new event list with the specified parameters.

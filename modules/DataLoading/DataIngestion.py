@@ -1,5 +1,3 @@
-# component_factories.py
-
 import panel as pn
 from stingray.events import EventList
 from stingray import Lightcurve
@@ -17,51 +15,76 @@ from utils.DashboardClasses import (
     PlotsContainer,
     HelpBox,
     Footer,
+    WarningHandler,
 )
 import param
 from utils.strings import LOADING_DATA_HELP_BOX_STRING
 
-# Path to the topmost directory for loaded-data
+# Path to the topmost directory for loaded data
 loaded_data_path = os.path.join(os.getcwd(), "files", "loaded-data")
 
 # Create the loaded-data directory if it doesn't exist
 os.makedirs(loaded_data_path, exist_ok=True)
 
 
-# Custom warning handler
-class WarningHandler:
-    def __init__(self):
-        self.warnings = []
-
-    def warn(
-        self, message, category=None, filename=None, lineno=None, file=None, line=None
-    ):
-        warning_message = f"Message: {message}\nCategory: {category.__name__ if category else 'N/A'}\nFile: {filename if filename else 'N/A'}\nLine: {lineno if lineno else 'N/A'}\n"
-        self.warnings.append(warning_message)
-
-
+# Create a warning handler
 def create_warning_handler():
-    # Create an instance of the warning handler
+    """
+    Create an instance of WarningHandler and redirect warnings to this custom handler.
+
+    Returns:
+        warning_handler (WarningHandler): An instance of WarningHandler to handle warnings.
+    """
     warning_handler = WarningHandler()
-
-    # Redirect warnings to the custom handler
     warnings.showwarning = warning_handler.warn
-
     return warning_handler
 
 
+""" Header Section """
+
+
 def create_loadingdata_header():
+    """
+    Create the header for the data loading section.
+
+    Returns:
+        MainHeader: An instance of MainHeader with the specified heading.
+    """
     home_heading_input = pn.widgets.TextInput(
         name="Heading", value="Data Ingestion and creation"
     )
     return MainHeader(heading=home_heading_input)
 
 
+""" Output Box Section """
+
+
 def create_loadingdata_output_box(content):
+    """
+    Create an output box to display messages.
+
+    Args:
+        content (str): The content to be displayed in the output box.
+
+    Returns:
+        OutputBox: An instance of OutputBox with the specified content.
+    """
     return OutputBox(output_content=content)
 
 
+""" Warning Box Section """
+
+
 def create_loadingdata_warning_box(content):
+    """
+    Create a warning box to display warnings.
+
+    Args:
+        content (str): The content to be displayed in the warning box.
+
+    Returns:
+        WarningBox: An instance of WarningBox with the specified content.
+    """
     return WarningBox(warning_content=content)
 
 
@@ -75,6 +98,19 @@ def load_event_data(
     warning_box_container,
     warning_handler,
 ):
+    """
+    Load event data from selected files.
+
+    Args:
+        event: The event object triggering the function.
+        file_selector (FileSelector): The file selector widget.
+        filename_input (TextInput): The input widget for filenames.
+        format_input (TextInput): The input widget for formats.
+        format_checkbox (Checkbox): The checkbox for default format.
+        output_box_container (OutputBox): The container for output messages.
+        warning_box_container (WarningBox): The container for warning messages.
+        warning_handler (WarningHandler): The handler for warnings.
+    """
     if not file_selector.value:
         output_box_container[:] = [
             create_loadingdata_output_box(
@@ -156,6 +192,18 @@ def save_loaded_files(
     warning_box_container,
     warning_handler,
 ):
+    """
+    Save loaded event data to specified file formats.
+
+    Args:
+        event: The event object triggering the function.
+        filename_input (TextInput): The input widget for filenames.
+        format_input (TextInput): The input widget for formats.
+        format_checkbox (Checkbox): The checkbox for default format.
+        output_box_container (OutputBox): The container for output messages.
+        warning_box_container (WarningBox): The container for warning messages.
+        warning_handler (WarningHandler): The handler for warnings.
+    """
     if not loaded_event_data:
         output_box_container[:] = [
             create_loadingdata_output_box("No files loaded to save.")
@@ -248,6 +296,16 @@ def delete_selected_files(
     warning_box_container,
     warning_handler,
 ):
+    """
+    Delete selected files from the file system.
+
+    Args:
+        event: The event object triggering the function.
+        file_selector (FileSelector): The file selector widget.
+        output_box_container (OutputBox): The container for output messages.
+        warning_box_container (WarningBox): The container for warning messages.
+        warning_handler (WarningHandler): The handler for warnings.
+    """
     if not file_selector.value:
         output_box_container[:] = [
             create_loadingdata_output_box(
@@ -290,6 +348,16 @@ def preview_loaded_files(
     warning_handler,
     time_limit=10,
 ):
+    """
+    Preview the loaded event data files.
+
+    Args:
+        event: The event object triggering the function.
+        output_box_container (OutputBox): The container for output messages.
+        warning_box_container (WarningBox): The container for warning messages.
+        warning_handler (WarningHandler): The handler for warnings.
+        time_limit (int): The number of time entries to preview.
+    """
     if not loaded_event_data:
         output_box_container[:] = [
             create_loadingdata_output_box("No files loaded to preview.")
@@ -325,10 +393,33 @@ def preview_loaded_files(
     warning_handler.warnings.clear()
 
 
+def clear_loaded_files(event, output_box_container, warning_box_container):
+    """
+    Clear all loaded event data files from memory.
+
+    Args:
+        event: The event object triggering the function.
+        output_box_container (OutputBox): The container for output messages.
+        warning_box_container (WarningBox): The container for warning messages.
+    """
+    global loaded_event_data
+    if not loaded_event_data:
+        output_box_container[:] = [
+            create_loadingdata_output_box("No files loaded to clear.")
+        ]
+    else:
+        loaded_event_data.clear()
+        output_box_container[:] = [
+            create_loadingdata_output_box("Loaded files have been cleared.")
+        ]
+    warning_box_container[:] = [create_loadingdata_warning_box("No warnings.")]
+
+
 def create_event_list(
     event,
     times_input,
     energy_input,
+    pi_input,
     gti_input,
     mjdref_input,
     name_input,
@@ -336,6 +427,21 @@ def create_event_list(
     warning_box_container,
     warning_handler,
 ):
+    """
+    Create an event list from user input.
+
+    Args:
+        event: The event object triggering the function.
+        times_input (TextInput): The input widget for photon arrival times.
+        energy_input (TextInput): The input widget for energy values (optional).
+        pi_input (TextInput): The input widget for PI values (optional).
+        gti_input (TextInput): The input widget for GTIs (optional).
+        mjdref_input (TextInput): The input widget for MJDREF value.
+        name_input (TextInput): The input widget for the event list name.
+        output_box_container (OutputBox): The container for output messages.
+        warning_box_container (WarningBox): The container for warning messages.
+        warning_handler (WarningHandler): The handler for warnings.
+    """
     # Clear previous warnings
     warning_handler.warnings.clear()
     warnings.resetwarnings()
@@ -356,6 +462,7 @@ def create_event_list(
             if energy_input.value
             else None
         )
+        pi = [int(p) for p in pi_input.value.split(",")] if pi_input.value else None
         gti = (
             [
                 [float(g) for g in interval.split()]
@@ -377,13 +484,13 @@ def create_event_list(
         else:
             name = f"event_list_{len(loaded_event_data)}"
 
-        event_list = EventList(times, energy=energy, gti=gti, mjdref=mjdref)
+        event_list = EventList(times, energy=energy, pi=pi, gti=gti, mjdref=mjdref)
 
         loaded_event_data.append((name, event_list))
 
         output_box_container[:] = [
             create_loadingdata_output_box(
-                f"Event List created successfully!\nSaved as: {name}\nTimes: {event_list.time}\nMJDREF: {event_list.mjdref}\nGTI: {event_list.gti}\nEnergy: {event_list.energy if energy else 'Not provided'}"
+                f"Event List created successfully!\nSaved as: {name}\nTimes: {event_list.time}\nMJDREF: {event_list.mjdref}\nGTI: {event_list.gti}\nEnergy: {event_list.energy if energy else 'Not provided'}\nPI: {event_list.pi if pi else 'Not provided'}"
             )
         ]
     except ValueError as ve:
@@ -412,6 +519,20 @@ def simulate_event_list(
     warning_box_container,
     warning_handler,
 ):
+    """
+    Simulate an event list based on user-defined parameters.
+
+    Args:
+        event: The event object triggering the function.
+        time_slider (IntSlider): The slider for the number of time bins.
+        count_slider (IntSlider): The slider for the maximum counts per bin.
+        dt_input (FloatSlider): The slider for delta time (dt).
+        name_input (TextInput): The input widget for the simulated event list name.
+        method_selector (Select): The selector for the simulation method.
+        output_box_container (OutputBox): The container for output messages.
+        warning_box_container (WarningBox): The container for warning messages.
+        warning_handler (WarningHandler): The handler for warnings.
+    """
     # Clear previous warnings
     warning_handler.warnings.clear()
     warnings.resetwarnings()
@@ -467,6 +588,17 @@ def simulate_event_list(
 
 
 def create_loading_tab(output_box_container, warning_box_container, warning_handler):
+    """
+    Create the tab for loading event data files.
+
+    Args:
+        output_box_container (OutputBox): The container for output messages.
+        warning_box_container (WarningBox): The container for warning messages.
+        warning_handler (WarningHandler): The handler for warnings.
+
+    Returns:
+        tab_content (Column): A Panel Column containing the widgets and layout for the loading tab.
+    """
     file_selector = pn.widgets.FileSelector(
         os.getcwd(), only_files=True, name="Select File", show_hidden=True
     )
@@ -491,6 +623,7 @@ def create_loading_tab(output_box_container, warning_box_container, warning_hand
     preview_button = pn.widgets.Button(
         name="Preview Loaded Files", button_type="default"
     )
+    clear_button = pn.widgets.Button(name="Clear Loaded Files", button_type="warning")
 
     tooltip_format = pn.widgets.TooltipIcon(
         value=Tooltip(
@@ -508,8 +641,8 @@ def create_loading_tab(output_box_container, warning_box_container, warning_hand
 
     def on_load_click(event):
         # Clear previous outputs and warnings
-        output_box_container[:] = [create_loadingdata_output_box("")]
-        warning_box_container[:] = [create_loadingdata_warning_box("")]
+        output_box_container[:] = [create_loadingdata_output_box("N.A.")]
+        warning_box_container[:] = [create_loadingdata_warning_box("N.A.")]
         warning_handler.warnings.clear()
         warnings.resetwarnings()
 
@@ -526,8 +659,8 @@ def create_loading_tab(output_box_container, warning_box_container, warning_hand
 
     def on_save_click(event):
         # Clear previous outputs and warnings
-        output_box_container[:] = [create_loadingdata_output_box("")]
-        warning_box_container[:] = [create_loadingdata_warning_box("")]
+        output_box_container[:] = [create_loadingdata_output_box("N.A.")]
+        warning_box_container[:] = [create_loadingdata_warning_box("N.A.")]
         warning_handler.warnings.clear()
         warnings.resetwarnings()
 
@@ -543,8 +676,8 @@ def create_loading_tab(output_box_container, warning_box_container, warning_hand
 
     def on_delete_click(event):
         # Clear previous outputs and warnings
-        warning_box_container[:] = [create_loadingdata_warning_box("")]
-        output_box_container[:] = [create_loadingdata_output_box("")]
+        warning_box_container[:] = [create_loadingdata_warning_box("N.A.")]
+        output_box_container[:] = [create_loadingdata_output_box("N.A.")]
         warning_handler.warnings.clear()
         warnings.resetwarnings()
 
@@ -558,8 +691,8 @@ def create_loading_tab(output_box_container, warning_box_container, warning_hand
 
     def on_preview_click(event):
         # Clear previous outputs and warnings
-        output_box_container[:] = [create_loadingdata_output_box("")]
-        warning_box_container[:] = [create_loadingdata_warning_box("")]
+        output_box_container[:] = [create_loadingdata_output_box("N.A.")]
+        warning_box_container[:] = [create_loadingdata_warning_box("N.A.")]
         warning_handler.warnings.clear()
         warnings.resetwarnings()
 
@@ -567,10 +700,19 @@ def create_loading_tab(output_box_container, warning_box_container, warning_hand
             event, output_box_container, warning_box_container, warning_handler
         )
 
+    def on_clear_click(event):
+        # Clear the loaded files list
+        output_box_container[:] = [create_loadingdata_output_box("N.A.")]
+        warning_box_container[:] = [create_loadingdata_warning_box("N.A.")]
+        warning_handler.warnings.clear()
+        warnings.resetwarnings()
+        clear_loaded_files(event, output_box_container, warning_box_container)
+
     load_button.on_click(on_load_click)
     save_button.on_click(on_save_click)
     delete_button.on_click(on_delete_click)
     preview_button.on_click(on_preview_click)
+    clear_button.on_click(on_clear_click)
 
     first_column = pn.Column(
         pn.pane.Markdown("# Load Files"),
@@ -578,7 +720,8 @@ def create_loading_tab(output_box_container, warning_box_container, warning_hand
         pn.Row(filename_input, tooltip_file),
         pn.Row(format_input, tooltip_format),
         format_checkbox,
-        pn.Row(load_button, save_button, delete_button, preview_button),
+        pn.Row(load_button, save_button, delete_button, preview_button, clear_button),
+        pn.pane.Markdown("<br/>"),
         width_policy="min",
     )
 
@@ -591,19 +734,26 @@ def create_loading_tab(output_box_container, warning_box_container, warning_hand
 
 
 def create_event_list_tab(output_box_container, warning_box_container, warning_handler):
-    output = pn.widgets.TextAreaInput(
-        name="Output", value="", disabled=True, height=200
-    )
-    warning_output = pn.widgets.TextAreaInput(
-        name="Warnings", value="", disabled=True, height=200
-    )
+    """
+    Create the tab for creating an event list.
 
+    Args:
+        output_box_container (OutputBox): The container for output messages.
+        warning_box_container (WarningBox): The container for warning messages.
+        warning_handler (WarningHandler): The handler for warnings.
+
+    Returns:
+        tab_content (Column): A Panel Column containing the widgets and layout for the event list creation tab.
+    """
     times_input = pn.widgets.TextInput(
         name="Photon Arrival Times", placeholder="e.g., 0.5, 1.1, 2.2, 3.7"
     )
     mjdref_input = pn.widgets.TextInput(name="MJDREF", placeholder="e.g., 58000.")
     energy_input = pn.widgets.TextInput(
         name="Energy (optional)", placeholder="e.g., 0., 3., 4., 20."
+    )
+    pi_input = pn.widgets.TextInput(
+        name="PI (optional)", placeholder="e.g., 100, 200, 300, 400"
     )
     gti_input = pn.widgets.TextInput(
         name="GTIs (optional)", placeholder="e.g., 0 4; 5 10"
@@ -613,11 +763,18 @@ def create_event_list_tab(output_box_container, warning_box_container, warning_h
     )
     create_button = pn.widgets.Button(name="Create Event List", button_type="primary")
 
-    create_button.on_click(
-        lambda event: create_event_list(
+    def on_create_button_click(event):
+        # Clear previous output and warnings
+        output_box_container.clear()
+        warning_box_container.clear()
+        warning_handler.warnings.clear()
+        warnings.resetwarnings()
+
+        create_event_list(
             event,
             times_input,
             energy_input,
+            pi_input,
             gti_input,
             mjdref_input,
             name_input,
@@ -625,13 +782,15 @@ def create_event_list_tab(output_box_container, warning_box_container, warning_h
             warning_box_container,
             warning_handler,
         )
-    )
+
+    create_button.on_click(on_create_button_click)
 
     tab_content = pn.Column(
         pn.pane.Markdown("# Create Event List"),
         times_input,
         mjdref_input,
         energy_input,
+        pi_input,
         gti_input,
         name_input,
         create_button,
@@ -642,7 +801,17 @@ def create_event_list_tab(output_box_container, warning_box_container, warning_h
 def create_simulate_event_list_tab(
     output_box_container, warning_box_container, warning_handler
 ):
+    """
+    Create the tab for simulating event lists.
 
+    Args:
+        output_box_container (OutputBox): The container for output messages.
+        warning_box_container (WarningBox): The container for warning messages.
+        warning_handler (WarningHandler): The handler for warnings.
+
+    Returns:
+        tab_content (Column): A Panel Column containing the widgets and layout for the event list simulation tab.
+    """
     simulation_title = pn.pane.Markdown("# Simulating Event Lists")
     time_slider = pn.widgets.IntSlider(
         name="Number of Time Bins", start=1, end=10000, value=10
@@ -663,8 +832,15 @@ def create_simulate_event_list_tab(
         name="Simulate Event List", button_type="primary"
     )
 
-    simulate_button.on_click(
-        lambda event: simulate_event_list(
+    def on_simulate_button_click(event):
+        # Clear previous output and warnings
+        output_box_container[:] = [create_loadingdata_output_box("N.A.")]
+        warning_box_container[:] = [create_loadingdata_warning_box("N.A.")]
+        warning_handler.warnings.clear()
+        warnings.resetwarnings()
+
+        # Simulate the event list
+        simulate_event_list(
             event,
             time_slider,
             count_slider,
@@ -675,7 +851,8 @@ def create_simulate_event_list_tab(
             warning_box_container,
             warning_handler,
         )
-    )
+
+    simulate_button.on_click(on_simulate_button_click)
 
     tab_content = pn.Column(
         simulation_title,
@@ -690,6 +867,16 @@ def create_simulate_event_list_tab(
 
 
 def create_loadingdata_main_area(output_box, warning_box):
+    """
+    Create the main area for the data loading tab, including all sub-tabs.
+
+    Args:
+        output_box (OutputBox): The container for output messages.
+        warning_box (WarningBox): The container for warning messages.
+
+    Returns:
+        MainArea: An instance of MainArea with all the necessary tabs for data loading.
+    """
     warning_handler = create_warning_handler()
     tabs_content = {
         "Load Event List": create_loading_tab(
@@ -712,6 +899,11 @@ def create_loadingdata_main_area(output_box, warning_box):
 
 
 def create_loadingdata_help_area():
+    """
+    Create the help area for the data loading tab.
+
+    Returns:
+        HelpBox: An instance of HelpBox with the help content.
+    """
     help_content = LOADING_DATA_HELP_BOX_STRING
     return HelpBox(help_content=help_content, title="Help Section")
-

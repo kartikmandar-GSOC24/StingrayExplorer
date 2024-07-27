@@ -530,3 +530,15 @@ class Footer(pn.viewable.Viewer):
         )
 
         return footer
+
+
+# Custom warning handler
+class WarningHandler:
+    def __init__(self):
+        self.warnings = []
+
+    def warn(
+        self, message, category=None, filename=None, lineno=None, file=None, line=None
+    ):
+        warning_message = f"Message: {message}\nCategory: {category.__name__ if category else 'N/A'}\nFile: {filename if filename else 'N/A'}\nLine: {lineno if lineno else 'N/A'}\n"
+        self.warnings.append(warning_message)
