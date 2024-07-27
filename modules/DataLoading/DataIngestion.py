@@ -43,7 +43,15 @@ def create_warning_handler():
 """ Header Section """
 
 
-def create_loadingdata_header():
+def create_loadingdata_header(
+    header_container,
+    main_area_container,
+    output_box_container,
+    warning_box_container,
+    plots_container,
+    help_box_container,
+    footer_container,
+):
     """
     Create the header for the data loading section.
 
@@ -866,7 +874,15 @@ def create_simulate_event_list_tab(
     return tab_content
 
 
-def create_loadingdata_main_area(output_box, warning_box):
+def create_loadingdata_main_area(
+    header_container,
+    main_area_container,
+    output_box_container,
+    warning_box_container,
+    plots_container,
+    help_box_container,
+    footer_container,
+):
     """
     Create the main area for the data loading tab, including all sub-tabs.
 
@@ -880,18 +896,18 @@ def create_loadingdata_main_area(output_box, warning_box):
     warning_handler = create_warning_handler()
     tabs_content = {
         "Load Event List": create_loading_tab(
-            output_box_container=output_box,
-            warning_box_container=warning_box,
+            output_box_container=output_box_container,
+            warning_box_container=warning_box_container,
             warning_handler=warning_handler,
         ),
         "Create Event List": create_event_list_tab(
-            output_box_container=output_box,
-            warning_box_container=warning_box,
+            output_box_container=output_box_container,
+            warning_box_container=warning_box_container,
             warning_handler=warning_handler,
         ),
         "Simulate Event List": create_simulate_event_list_tab(
-            output_box_container=output_box,
-            warning_box_container=warning_box,
+            output_box_container=output_box_container,
+            warning_box_container=warning_box_container,
             warning_handler=warning_handler,
         ),
     }

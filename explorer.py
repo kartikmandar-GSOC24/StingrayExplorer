@@ -32,7 +32,7 @@ output_box = create_home_output_box()
 warning_box = create_home_warning_box()
 
 # Create the plots container
-bokeh_plots = create_home_plots_area()
+plots_area = create_home_plots_area()
 
 # Create the help box
 help_box = create_home_help_area()
@@ -45,7 +45,7 @@ header_container = pn.Column(header)
 main_area_container = pn.Column(main_area)
 output_box_container = pn.Column(output_box)
 warning_box_container = pn.Column(warning_box)
-bokeh_plots_container = pn.Column(bokeh_plots)
+plots_container = pn.Column(plots_area)
 help_box_container = pn.Column(help_box)
 footer_container = pn.Column(footer)
 
@@ -56,6 +56,7 @@ sidebar = create_sidebar(
     output_box=output_box_container,
     warning_box=warning_box_container,
     help_box=help_box_container,
+    plots_area=plots_container,
 )
 
 
@@ -115,7 +116,7 @@ layout.main[0:10, 0:12] = header_container
 layout.main[10:45, 0:8] = main_area_container
 layout.main[10:27, 8:12] = output_box_container
 layout.main[27:45, 8:12] = warning_box_container
-layout.main[45:85, 0:12] = bokeh_plots_container
+layout.main[45:85, 0:12] = plots_container
 layout.main[85:120, 0:12] = help_box_container
 layout.main[120:150, 0:12] = footer_container
 

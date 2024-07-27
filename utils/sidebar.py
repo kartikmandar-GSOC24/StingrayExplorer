@@ -17,11 +17,16 @@ from modules.DataLoading.DataIngestion import (
     create_loadingdata_warning_box,
     create_loadingdata_help_area,
 )
-from modules.QuickLook.LightCurve import create_quicklook_lightcurve_header
+from modules.QuickLook.LightCurve import (
+    create_quicklook_lightcurve_header,
+    create_quicklook_lightcurve_main_area,
+)
 from assets.icons.svg import HOME_ICON_SVG, LOAD_DATA_ICON_SVG
 
 
-def create_sidebar(main_area, header, footer, output_box, warning_box, help_box):
+def create_sidebar(
+    main_area, header, footer, output_box, warning_box, help_box, plots_area
+):
     menu_items_quicklook_stingray = [
         ("Light Curve", "QuickLookLightCurve"),
         ("Power spectra", "QuickLookPowerspectra"),
@@ -68,8 +73,28 @@ def create_sidebar(main_area, header, footer, output_box, warning_box, help_box)
 
     # Load Button changing main content
     def load_data(event):
-        header[:] = [create_loadingdata_header()]
-        main_area[:] = [create_loadingdata_main_area(output_box, warning_box)]
+        header[:] = [
+            create_loadingdata_header(
+                header_container=header,
+                main_area_container=main_area,
+                output_box_container=output_box,
+                warning_box_container=warning_box,
+                plots_container=plots_area,
+                help_box_container=help_box,
+                footer_container=footer,
+            )
+        ]
+        main_area[:] = [
+            create_loadingdata_main_area(
+                header_container=header,
+                main_area_container=main_area,
+                output_box_container=output_box,
+                warning_box_container=warning_box,
+                plots_container=plots_area,
+                help_box_container=help_box,
+                footer_container=footer,
+            )
+        ]
         output_box[:] = [create_home_output_box()]
         warning_box[:] = [create_home_warning_box()]
         help_box[:] = [create_loadingdata_help_area()]
@@ -80,7 +105,28 @@ def create_sidebar(main_area, header, footer, output_box, warning_box, help_box)
     def handle_quicklook_button_selection(event):
         clicked = event.new
         if clicked == "QuickLookLightCurve":
-            header[:] = [create_quicklook_lightcurve_header()]
+            header[:] = [
+                create_quicklook_lightcurve_header(
+                    header_container=header,
+                    main_area_container=main_area,
+                    output_box_container=output_box,
+                    warning_box_container=warning_box,
+                    plots_container=plots_area,
+                    help_box_container=help_box,
+                    footer_container=footer,
+                )
+            ]
+            main_area[:] = [
+                create_quicklook_lightcurve_main_area(
+                    header_container=header,
+                    main_area_container=main_area,
+                    output_box_container=output_box,
+                    warning_box_container=warning_box,
+                    plots_container=plots_area,
+                    help_box_container=help_box,
+                    footer_container=footer,
+                )
+            ]
 
     quicklook_stingray_button.on_click(handle_quicklook_button_selection)
 

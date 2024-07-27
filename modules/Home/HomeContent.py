@@ -21,6 +21,8 @@ from utils.strings import (
 )
 
 """ Header Section """
+
+
 def create_home_header():
     home_heading_input = pn.widgets.TextInput(
         name="Heading", value="Welcome to Stingray Explorer"
@@ -31,7 +33,10 @@ def create_home_header():
 
     return MainHeader(heading=home_heading_input, subheading=home_subheading_input)
 
+
 """ Main Area Section """
+
+
 def create_home_main_area():
     tab1_content = pn.pane.Markdown(HOME_STINGRAY_TAB_STRING)
     tab2_content = pn.pane.Markdown(HOME_HOLOVIZ_TAB_STRING)
@@ -45,34 +50,44 @@ def create_home_main_area():
 
     return MainArea(tabs_content=tabs_content)
 
+
 """ Output Box Section """
+
+
 def create_home_output_box():
     return OutputBox(output_content=HOME_OUTPUT_BOX_STRING)
 
+
 """ Warning Box Section """
+
+
 def create_home_warning_box():
     return WarningBox(warning_content=HOME_WARNING_BOX_STRING)
 
+
 """ Plots Area Section """
+
+
 def create_home_plots_area():
-    p1 = pn.pane.Markdown(" Plot 1")
-    p2 = pn.pane.Markdown(" Plot 2")
-    p3 = pn.pane.Markdown(" Plot 3")
-    p4 = pn.pane.Markdown("Plot 4")
-    p5 = pn.pane.Markdown("Plot 5")
 
     return PlotsContainer(
-        flexbox_contents=[p1, p2, p3, p4, p5],
-        titles=["Heading 1", "Heading 2", "Heading 3", "Heading 4", "Heading 5"],
-        sizes=[(300, 300), (300, 300), (300, 300), (300, 300), (300, 300)],
+        flexbox_contents=[],
+        titles=[],
+        sizes=[],
     )
 
+
 """ Help Area Section """
+
+
 def create_home_help_area():
     help_content = HOME_HELP_BOX_STRING
     return HelpBox(help_content=help_content, title="Help Section")
 
+
 """ Footer Section """
+
+
 def create_home_footer():
     icon_buttons = [
         pn.widgets.Button(name="Icon 1", button_type="default"),
