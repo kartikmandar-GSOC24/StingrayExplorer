@@ -21,6 +21,7 @@ import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import ContactSupportIcon from '@mui/icons-material/ContactSupport';
 import GitHubIcon from '@mui/icons-material/GitHub';
 import StorageIcon from '@mui/icons-material/Storage';
+import SettingsIcon from '@mui/icons-material/Settings';
 import { useUIStore } from '@/store/uiStore';
 import { useBackendContext } from '@/App';
 
@@ -54,36 +55,51 @@ const Footer: React.FC = () => {
     getVersion();
   }, []);
 
-  // Fetch system resources from backend periodically
-  useEffect(() => {
-    const fetchResources = async (): Promise<void> => {
-      if (!backendReady || !backendPort) return;
+  // Resource monitoring state
+  const [monitoringActive, setMonitoringActive] = useState<boolean>(false);
 
-      try {
-        const response = await fetch(`http://127.0.0.1:${backendPort}/api/status`);
-        if (response.ok) {
-          const data = await response.json();
-          if (data.memory_usage) {
-            setSystemResources({
-              cpuPercent: data.memory_usage.cpu_percent || 0,
-              memoryUsedGb: (data.memory_usage.memory_used_mb || 0) / 1024,
-              memoryTotalGb: (data.memory_usage.memory_total_mb || 0) / 1024,
-              memoryPercent: data.memory_usage.memory_percent || 0,
-            });
-          }
+  // Fetch system resources from backend
+  const fetchResources = async (): Promise<void> => {
+    if (!backendReady || !backendPort) return;
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${backendPort}/api/status`);
+      if (response.ok) {
+        const data = await response.json();
+        if (data.memory_usage) {
+          setSystemResources({
+            cpuPercent: data.memory_usage.cpu_percent || 0,
+            memoryUsedGb: (data.memory_usage.memory_used_mb || 0) / 1024,
+            memoryTotalGb: (data.memory_usage.memory_total_mb || 0) / 1024,
+            memoryPercent: data.memory_usage.memory_percent || 0,
+          });
         }
-      } catch {
-        // Backend might not be ready
       }
-    };
+    } catch {
+      // Backend might not be ready
+    }
+  };
 
-    // Initial fetch
+  // Poll resources only when monitoring is active
+  useEffect(() => {
+    if (!monitoringActive) return;
+
+    // Initial fetch when monitoring starts
     fetchResources();
 
-    // Poll every 5 seconds
-    const interval = setInterval(fetchResources, 5000);
+    // Poll every 10 seconds
+    const interval = setInterval(fetchResources, 10000);
     return () => clearInterval(interval);
-  }, [backendReady, backendPort, setSystemResources]);
+  }, [monitoringActive, backendReady, backendPort]);
+
+  // Toggle monitoring on/off
+  const handleToggleMonitoring = (): void => {
+    if (!monitoringActive) {
+      // Starting monitoring - fetch immediately
+      fetchResources();
+    }
+    setMonitoringActive((prev) => !prev);
+  };
 
   const handleOpenExternal = async (url: string): Promise<void> => {
     if (window.electronAPI) {
@@ -105,35 +121,60 @@ const Footer: React.FC = () => {
       <Box
         component="footer"
         sx={{
-          height: FOOTER_HEIGHT,
           minHeight: FOOTER_HEIGHT,
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
           px: 2,
+          py: 0.5,
           borderTop: '1px solid',
           borderColor: 'divider',
           backgroundColor: 'background.paper',
           flexShrink: 0,
-          gap: 2,
+          gap: 1,
+          flexWrap: 'nowrap',
+          overflow: 'hidden',
         }}
       >
         {/* Left side - System Resources */}
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-          <Tooltip title="System Resources">
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexShrink: 0 }}>
+          <Tooltip title={monitoringActive ? 'Click to stop monitoring (updates every 10s)' : 'Click to start resource monitoring'}>
             <Button
               size="small"
-              startIcon={<MemoryIcon sx={{ fontSize: 16 }} />}
-              onClick={(e) => setResourcesAnchor(e.currentTarget)}
+              startIcon={
+                <MemoryIcon
+                  sx={{
+                    fontSize: 16,
+                    animation: monitoringActive ? 'pulse 2s infinite' : 'none',
+                    '@keyframes pulse': {
+                      '0%, 100%': { opacity: 1 },
+                      '50%': { opacity: 0.5 },
+                    },
+                  }}
+                />
+              }
+              onClick={handleToggleMonitoring}
               sx={{
                 textTransform: 'none',
                 fontSize: '0.75rem',
-                color: 'text.secondary',
-                '&:hover': { color: 'text.primary' },
+                color: monitoringActive ? 'primary.main' : 'text.secondary',
+                '&:hover': { color: monitoringActive ? 'primary.dark' : 'text.primary' },
+                whiteSpace: 'nowrap',
+                minWidth: 'auto',
               }}
             >
-              {formatResourceDisplay()}
+              {monitoringActive ? formatResourceDisplay() : 'Monitor'}
             </Button>
+          </Tooltip>
+
+          <Tooltip title="Configure resource limits">
+            <IconButton
+              size="small"
+              onClick={(e) => setResourcesAnchor(e.currentTarget)}
+              sx={{ color: 'text.secondary', p: 0.5 }}
+            >
+              <SettingsIcon sx={{ fontSize: 14 }} />
+            </IconButton>
           </Tooltip>
 
           <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
@@ -152,12 +193,22 @@ const Footer: React.FC = () => {
         </Box>
 
         {/* Center - Copyright */}
-        <Typography variant="caption" color="text.secondary" sx={{ flexShrink: 0 }}>
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{
+            flexShrink: 1,
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            minWidth: 0,
+          }}
+        >
           Stingray Explorer {version && `v${version}`} | © {new Date().getFullYear()} Kartik Mandar
         </Typography>
 
         {/* Right side - Links */}
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexShrink: 0 }}>
           <Tooltip title="Acknowledgements">
             <IconButton
               size="small"

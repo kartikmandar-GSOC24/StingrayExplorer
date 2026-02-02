@@ -67,7 +67,7 @@ class LightcurveService(BaseService):
                 "counts": lc.counts.tolist(),
                 "dt": float(lc.dt),
                 "n_bins": len(lc.time),
-                "time_range": [float(lc.time[0]), float(lc.time[-1])],
+                "time_range": [float(lc.time.min()), float(lc.time.max())],
                 "count_rate_mean": float(np.mean(lc.counts / lc.dt)),
             }
 
@@ -205,7 +205,7 @@ class LightcurveService(BaseService):
                 "counts": lc.counts.tolist(),
                 "dt": float(lc.dt),
                 "n_bins": len(lc.time),
-                "time_range": [float(lc.time[0]), float(lc.time[-1])],
+                "time_range": [float(lc.time.min()), float(lc.time.max())],
                 "count_stats": {
                     "mean": float(np.mean(lc.counts)),
                     "std": float(np.std(lc.counts)),
@@ -234,7 +234,7 @@ class LightcurveService(BaseService):
                     "name": name,
                     "n_bins": len(lc.time),
                     "dt": float(lc.dt),
-                    "time_range": [float(lc.time[0]), float(lc.time[-1])],
+                    "time_range": [float(lc.time.min()), float(lc.time.max())],
                 })
 
             return self.create_result(

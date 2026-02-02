@@ -15,15 +15,17 @@ export function setupIpcHandlers(getPythonManager: PythonManagerGetter): void {
 
   ipcMain.handle(
     'dialog:openFile',
-    async (
-      _event,
+    (
+      event,
       options?: {
         title?: string;
         filters?: { name: string; extensions: string[] }[];
         multiple?: boolean;
       }
     ) => {
-      const result = await dialog.showOpenDialog({
+      const parentWindow = BrowserWindow.fromWebContents(event.sender);
+
+      const dialogOptions = {
         title: options?.title || 'Open File',
         filters: options?.filters || [
           { name: 'FITS Files', extensions: ['fits', 'fit', 'fts'] },
@@ -31,28 +33,34 @@ export function setupIpcHandlers(getPythonManager: PythonManagerGetter): void {
           { name: 'Text Files', extensions: ['txt', 'csv', 'dat', 'ascii'] },
           { name: 'All Files', extensions: ['*'] },
         ],
-        properties: options?.multiple ? ['openFile', 'multiSelections'] : ['openFile'],
-      });
+        properties: options?.multiple ? ['openFile', 'multiSelections'] as const : ['openFile'] as const,
+      };
 
-      if (result.canceled) {
+      const result = parentWindow
+        ? dialog.showOpenDialogSync(parentWindow, dialogOptions)
+        : dialog.showOpenDialogSync(dialogOptions);
+
+      if (!result || result.length === 0) {
         return null;
       }
 
-      return result.filePaths;
+      return result;
     }
   );
 
   ipcMain.handle(
     'dialog:saveFile',
-    async (
-      _event,
+    (
+      event,
       options?: {
         title?: string;
         defaultPath?: string;
         filters?: { name: string; extensions: string[] }[];
       }
     ) => {
-      const result = await dialog.showSaveDialog({
+      const parentWindow = BrowserWindow.fromWebContents(event.sender);
+
+      const dialogOptions = {
         title: options?.title || 'Save File',
         defaultPath: options?.defaultPath,
         filters: options?.filters || [
@@ -61,27 +69,33 @@ export function setupIpcHandlers(getPythonManager: PythonManagerGetter): void {
           { name: 'CSV Files', extensions: ['csv'] },
           { name: 'All Files', extensions: ['*'] },
         ],
-      });
+      };
 
-      if (result.canceled) {
-        return null;
-      }
+      const result = parentWindow
+        ? dialog.showSaveDialogSync(parentWindow, dialogOptions)
+        : dialog.showSaveDialogSync(dialogOptions);
 
-      return result.filePath;
+      return result || null;
     }
   );
 
-  ipcMain.handle('dialog:openDirectory', async () => {
-    const result = await dialog.showOpenDialog({
-      title: 'Select Directory',
-      properties: ['openDirectory'],
-    });
+  ipcMain.handle('dialog:openDirectory', (event) => {
+    const parentWindow = BrowserWindow.fromWebContents(event.sender);
 
-    if (result.canceled) {
+    const dialogOptions = {
+      title: 'Select Directory',
+      properties: ['openDirectory'] as const,
+    };
+
+    const result = parentWindow
+      ? dialog.showOpenDialogSync(parentWindow, dialogOptions)
+      : dialog.showOpenDialogSync(dialogOptions);
+
+    if (!result || result.length === 0) {
       return null;
     }
 
-    return result.filePaths[0];
+    return result[0];
   });
 
   // ============================================
@@ -183,6 +197,13 @@ export function setupIpcHandlers(getPythonManager: PythonManagerGetter): void {
     const window = BrowserWindow.fromWebContents(event.sender);
     if (window) {
       window.setFullScreen(!window.isFullScreen());
+    }
+  });
+
+  ipcMain.on('window:openDevTools', (event) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (window) {
+      window.webContents.openDevTools();
     }
   });
 

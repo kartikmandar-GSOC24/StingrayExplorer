@@ -43,5 +43,11 @@ export default defineConfig({
         '@': resolve(__dirname, 'src'),
       },
     },
+    server: {
+      watch: {
+        // Ignore large directories to prevent ENOSPC errors on Linux
+        ignored: ['**/.pixi/**', '**/node_modules/**', '**/.git/**'],
+      },
+    },
   },
 });

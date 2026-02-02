@@ -55,6 +55,8 @@ export interface ElectronAPI {
 
   toggleFullscreen: () => void;
 
+  openDevTools: () => void;
+
   // Shell Operations
   openExternal: (url: string) => Promise<void>;
 

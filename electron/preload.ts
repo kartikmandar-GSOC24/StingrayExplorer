@@ -142,6 +142,11 @@ const electronAPI = {
    */
   toggleFullscreen: (): void => ipcRenderer.send('window:toggleFullscreen'),
 
+  /**
+   * Open Chrome DevTools
+   */
+  openDevTools: (): void => ipcRenderer.send('window:openDevTools'),
+
   // ============================================
   // Shell Operations
   // ============================================

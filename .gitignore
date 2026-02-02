@@ -14,6 +14,9 @@ files/data/data_small*.hdf5
 files/data/data_smaller*.hdf5
 files/data/test.rmf
 
+# Large NICER event file (2.4 GB) - download from https://zenodo.org/record/6785435
+files/data/ni1200120106_0mpu7_cl_bary.evt.gz
+
 # Node.js
 node_modules/
 npm-debug.log*

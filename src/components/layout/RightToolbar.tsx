@@ -14,6 +14,11 @@ import {
   List,
   ListItem,
   ListItemButton,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  Button,
 } from '@mui/material';
 import TerminalIcon from '@mui/icons-material/Terminal';
 import BugReportIcon from '@mui/icons-material/BugReport';
@@ -24,7 +29,6 @@ import AccountCircleIcon from '@mui/icons-material/AccountCircle';
 import LogoutIcon from '@mui/icons-material/Logout';
 import HourglassEmptyIcon from '@mui/icons-material/HourglassEmpty';
 import SettingsIcon from '@mui/icons-material/Settings';
-import CloseIcon from '@mui/icons-material/Close';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import ErrorIcon from '@mui/icons-material/Error';
 import WarningIcon from '@mui/icons-material/Warning';
@@ -61,6 +65,9 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
   const [profileAnchor, setProfileAnchor] = useState<null | HTMLElement>(null);
   const [debugAnchor, setDebugAnchor] = useState<null | HTMLElement>(null);
 
+  // Notification detail dialog state
+  const [selectedNotification, setSelectedNotification] = useState<Notification | null>(null);
+
   const handleOpenDocs = async (): Promise<void> => {
     if (window.electronAPI) {
       await window.electronAPI.openExternal('https://docs.stingray.science/');
@@ -74,11 +81,9 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
   };
 
   const handleOpenDevTools = (): void => {
-    addNotification({
-      type: 'info',
-      title: 'Developer Mode',
-      message: 'Developer tools opened. Use Ctrl+Shift+I for full DevTools.',
-    });
+    if (window.electronAPI) {
+      window.electronAPI.openDevTools();
+    }
   };
 
   const handleToggleTerminal = (): void => {
@@ -93,6 +98,11 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
 
   const handleNotificationClick = (notification: Notification): void => {
     markNotificationRead(notification.id);
+    setSelectedNotification(notification);
+  };
+
+  const handleCloseNotificationDetail = (): void => {
+    setSelectedNotification(null);
   };
 
   const getNotificationIcon = (type: Notification['type']): React.ReactNode => {
@@ -217,13 +227,6 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
         </IconButton>
       </Tooltip>
 
-      {/* Settings */}
-      <Tooltip title="Settings" placement="left">
-        <IconButton size="small">
-          <SettingsIcon fontSize="small" />
-        </IconButton>
-      </Tooltip>
-
       {/* Spacer */}
       <Box sx={{ flex: 1 }} />
 
@@ -260,9 +263,9 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
         <Box sx={{ px: 2, py: 1, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
           <Typography variant="subtitle2">Notifications</Typography>
           {notifications.length > 0 && (
-            <IconButton size="small" onClick={clearNotifications}>
-              <CloseIcon fontSize="small" />
-            </IconButton>
+            <Button size="small" onClick={clearNotifications} sx={{ textTransform: 'none' }}>
+              Clear All
+            </Button>
           )}
         </Box>
         <Divider />
@@ -350,6 +353,36 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
           <ListItemText>Quit</ListItemText>
         </MenuItem>
       </Menu>
+
+      {/* Notification Detail Dialog */}
+      <Dialog
+        open={Boolean(selectedNotification)}
+        onClose={handleCloseNotificationDetail}
+        maxWidth="sm"
+        fullWidth
+      >
+        {selectedNotification && (
+          <>
+            <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+              {getNotificationIcon(selectedNotification.type)}
+              <Typography variant="h6" component="span">
+                {selectedNotification.title}
+              </Typography>
+            </DialogTitle>
+            <DialogContent dividers>
+              <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {selectedNotification.message}
+              </Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 2 }}>
+                {new Date(selectedNotification.timestamp).toLocaleString()}
+              </Typography>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={handleCloseNotificationDetail}>Close</Button>
+            </DialogActions>
+          </>
+        )}
+      </Dialog>
     </Box>
   );
 };

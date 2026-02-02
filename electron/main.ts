@@ -74,6 +74,49 @@ async function createWindow(): Promise<void> {
     return { action: 'deny' };
   });
 
+  // Add right-click context menu for copy/paste
+  mainWindow.webContents.on('context-menu', (_event, params) => {
+    const { Menu, MenuItem } = require('electron');
+    const menu = new Menu();
+
+    // Add "Copy" if text is selected
+    if (params.selectionText) {
+      menu.append(new MenuItem({
+        label: 'Copy',
+        role: 'copy',
+      }));
+    }
+
+    // Add "Paste" if in an editable field
+    if (params.isEditable) {
+      menu.append(new MenuItem({
+        label: 'Paste',
+        role: 'paste',
+      }));
+    }
+
+    // Add "Cut" if text is selected and in editable field
+    if (params.selectionText && params.isEditable) {
+      menu.insert(0, new MenuItem({
+        label: 'Cut',
+        role: 'cut',
+      }));
+    }
+
+    // Add "Select All" for editable fields
+    if (params.isEditable) {
+      menu.append(new MenuItem({
+        label: 'Select All',
+        role: 'selectAll',
+      }));
+    }
+
+    // Only show menu if it has items
+    if (menu.items.length > 0) {
+      menu.popup();
+    }
+  });
+
   // Load the app
   if (isDev) {
     await mainWindow.loadURL('http://localhost:5173');

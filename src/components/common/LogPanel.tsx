@@ -268,6 +268,8 @@ const LogPanel: React.FC = () => {
         zIndex: 1200,
         borderRadius: '12px 12px 0 0',
         overflow: 'hidden',
+        borderTop: '1px solid',
+        borderColor: 'divider',
       }}
     >
       {/* Header */}

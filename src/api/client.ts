@@ -23,11 +23,12 @@ class ApiClient {
     if (window.electronAPI?.getBackendPort) {
       try {
         const port = await window.electronAPI.getBackendPort();
-        if (port) {
+        if (port && port !== this.port) {
+          console.log(`[ApiClient] Port updated: ${this.port} -> ${port}`);
           await this.setPort(port);
         }
       } catch (error) {
-        console.warn('Failed to get backend port from Electron:', error);
+        console.warn('[ApiClient] Failed to get backend port from Electron:', error);
       }
     }
     return this.port;
@@ -37,7 +38,11 @@ class ApiClient {
     endpoint: string,
     options: RequestInit = {}
   ): Promise<ApiResponse<T>> {
+    // Always sync port before request
+    await this.getPort();
     const url = `${this.baseUrl}${endpoint}`;
+
+    console.log(`[ApiClient] ${options.method || 'GET'} ${url}`);
 
     const defaultHeaders: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -56,6 +61,7 @@ class ApiClient {
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
+        console.error(`[ApiClient] HTTP ${response.status}:`, errorData);
         return {
           success: false,
           data: null,
@@ -64,9 +70,12 @@ class ApiClient {
         };
       }
 
-      return await response.json();
+      const data = await response.json();
+      console.log(`[ApiClient] Response:`, data.success ? 'success' : 'failed');
+      return data;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error(`[ApiClient] Fetch error:`, error);
       return {
         success: false,
         data: null,

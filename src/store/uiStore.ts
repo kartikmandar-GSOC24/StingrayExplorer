@@ -41,7 +41,7 @@ interface UIState {
 
   setSystemResources: (resources: SystemResources | null) => void;
 
-  addNotification: (notification: Omit<Notification, 'id' | 'timestamp'>) => void;
+  addNotification: (notification: Omit<Notification, 'id' | 'timestamp' | 'read'>) => void;
   markNotificationRead: (id: string) => void;
   clearNotifications: () => void;
 

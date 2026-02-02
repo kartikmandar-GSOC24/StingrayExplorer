@@ -6,6 +6,7 @@ import Header from './Header';
 import Footer, { FOOTER_HEIGHT } from './Footer';
 import RightToolbar, { TOOLBAR_WIDTH } from './RightToolbar';
 import LogPanel from '@/components/common/LogPanel';
+import NotificationToast from '@/components/common/NotificationToast';
 import { useUIStore } from '@/store/uiStore';
 
 // Sidebar widths
@@ -88,17 +89,17 @@ const MainLayout: React.FC = () => {
               flex: 1,
               overflow: 'auto',
               p: 3,
-              pb: `${FOOTER_HEIGHT + 16}px`, // Extra padding for footer
+              pb: `${FOOTER_HEIGHT + 40 + 16}px`, // Extra padding for footer + LogPanel header
             }}
           >
             <Outlet />
           </Box>
 
-          {/* Footer - fixed at bottom of main content area */}
+          {/* Footer - fixed above the LogPanel */}
           <Box
             sx={{
               position: 'fixed',
-              bottom: 0,
+              bottom: 40, // Height of LogPanel collapsed header
               left: `${leftOffset}px`,
               right: `${rightOffset}px`,
               transition: (theme) =>
@@ -119,6 +120,9 @@ const MainLayout: React.FC = () => {
 
       {/* Log Panel - above footer */}
       <LogPanel />
+
+      {/* Toast notifications - auto-popup for new notifications */}
+      <NotificationToast />
     </Box>
   );
 };
