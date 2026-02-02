@@ -51,28 +51,52 @@ export interface FileSizeInfo {
   memory_info?: MemoryInfo;
 }
 
-export interface LoadingInfo {
-  method: 'standard' | 'standard_risky';
+// Lazy loading types
+export interface LazyLoadingInfo {
+  method: 'time_range' | 'event_count';
+  // For time_range method
+  requested_range?: [number, number];
+  actual_range?: [number, number];
+  loaded_duration?: number;
+  // For event_count method
+  start_index?: number;
+  end_index?: number;
+  events_requested?: number;
+  events_loaded?: number;
+  // Common fields
+  total_file_duration: number;
+  total_file_events: number;
+  events_loaded_percent: number;
+}
+
+export interface EventListLazyLoadedSummary extends EventListSummary {
+  lazy_loading_info?: LazyLoadingInfo;
+}
+
+export interface LoadingRecommendation {
+  can_load_full: boolean;
+  recommend_lazy: boolean;
+  suggested_chunk_size: number | null;
+  suggested_time_chunk: number | null;
+  strategy: 'full' | 'preview_first' | 'time_range' | 'chunked';
+}
+
+export interface FileMetadata {
+  file_path: string;
   file_size_mb: number;
   file_size_gb: number;
-  estimated_memory_mb: number;
-  memory_safe: boolean;
-  available_memory_mb: number;
-}
-
-export interface EventListLazySummary extends EventListSummary {
-  loading_info?: LoadingInfo;
-}
-
-export interface PreviewInfo {
-  preview_duration: number;
-  total_duration: number;
-  file_size_mb: number;
-  is_preview: boolean;
-}
-
-export interface EventListPreviewSummary extends EventListSummary {
-  preview_info?: PreviewInfo;
+  risk_level: 'safe' | 'caution' | 'risky' | 'critical';
+  total_events: number;
+  time_range: [number | null, number | null];
+  duration: number;
+  gti_count: number;
+  total_gti_time: number | null;
+  gti_list: [number, number][] | null;
+  mjdref: number | null;
+  mission: string | null;
+  instrument: string | null;
+  available_columns: string[];
+  recommended_loading: LoadingRecommendation;
 }
 
 export interface EventListFullPreview {
@@ -123,6 +147,8 @@ export const dataApi = {
     fmt?: string;
     rmf_file?: string;
     additional_columns?: string[];
+    high_precision?: boolean;
+    skip_checks?: boolean;
   }): Promise<ApiResponse<EventListSummary>> {
     return apiClient.post('/api/data/load', {
       file_path: params.file_path,
@@ -130,6 +156,8 @@ export const dataApi = {
       fmt: params.fmt || 'ogip',
       rmf_file: params.rmf_file,
       additional_columns: params.additional_columns,
+      high_precision: params.high_precision || false,
+      skip_checks: params.skip_checks || false,
     });
   },
 
@@ -140,11 +168,19 @@ export const dataApi = {
     url: string;
     name: string;
     fmt?: string;
+    rmf_file?: string;
+    additional_columns?: string[];
+    high_precision?: boolean;
+    skip_checks?: boolean;
   }): Promise<ApiResponse<EventListSummary>> {
     return apiClient.post('/api/data/load-url', {
       url: params.url,
       name: params.name,
       fmt: params.fmt || 'ogip',
+      rmf_file: params.rmf_file,
+      additional_columns: params.additional_columns,
+      high_precision: params.high_precision || false,
+      skip_checks: params.skip_checks || false,
     });
   },
 
@@ -199,44 +235,6 @@ export const dataApi = {
   },
 
   /**
-   * Load an EventList using lazy loading for large files
-   */
-  async loadEventListLazy(params: {
-    file_path: string;
-    name: string;
-    fmt?: string;
-    rmf_file?: string;
-    additional_columns?: string[];
-    safety_margin?: number;
-  }): Promise<ApiResponse<EventListLazySummary>> {
-    return apiClient.post('/api/data/load-lazy', {
-      file_path: params.file_path,
-      name: params.name,
-      fmt: params.fmt || 'ogip',
-      rmf_file: params.rmf_file,
-      additional_columns: params.additional_columns,
-      safety_margin: params.safety_margin ?? 0.5,
-    });
-  },
-
-  /**
-   * Load only the first segment of a large file as a preview
-   */
-  async loadEventListPreview(params: {
-    file_path: string;
-    name: string;
-    preview_duration?: number;
-    fmt?: string;
-  }): Promise<ApiResponse<EventListPreviewSummary>> {
-    return apiClient.post('/api/data/load-preview', {
-      file_path: params.file_path,
-      name: params.name,
-      preview_duration: params.preview_duration ?? 100.0,
-      fmt: params.fmt || 'ogip',
-    });
-  },
-
-  /**
    * Get full preview of an EventList with all attributes
    */
   async getEventListFullPreview(
@@ -245,6 +243,65 @@ export const dataApi = {
   ): Promise<ApiResponse<EventListFullPreview>> {
     const params = timeLimit ? `?time_limit=${timeLimit}` : '';
     return apiClient.get(`/api/data/${name}/full-preview${params}`);
+  },
+
+  // =========================================================================
+  // TRUE LAZY LOADING API FUNCTIONS
+  // These use FITSTimeseriesReader for genuine lazy/streaming I/O
+  // =========================================================================
+
+  /**
+   * Load events within a specific time range using true lazy loading.
+   * Only reads the events within the time window from disk.
+   */
+  async loadEventListByTimeRange(params: {
+    file_path: string;
+    name: string;
+    start_time: number;
+    end_time: number;
+    fmt?: string;
+  }): Promise<ApiResponse<EventListLazyLoadedSummary>> {
+    return apiClient.post('/api/data/load-by-time-range', {
+      file_path: params.file_path,
+      name: params.name,
+      start_time: params.start_time,
+      end_time: params.end_time,
+      fmt: params.fmt || 'ogip',
+    });
+  },
+
+  /**
+   * Load a specific number of events using true lazy loading.
+   * Only reads the requested event range from disk.
+   */
+  async loadEventListByEventCount(params: {
+    file_path: string;
+    name: string;
+    start_index?: number;
+    count?: number;
+    fmt?: string;
+  }): Promise<ApiResponse<EventListLazyLoadedSummary>> {
+    return apiClient.post('/api/data/load-by-event-count', {
+      file_path: params.file_path,
+      name: params.name,
+      start_index: params.start_index ?? 0,
+      count: params.count ?? 10000,
+      fmt: params.fmt || 'ogip',
+    });
+  },
+
+  /**
+   * Get file metadata without loading the full data.
+   * Returns event count, time range, GTI, and loading recommendations.
+   */
+  async getFileMetadata(params: {
+    file_path: string;
+    fmt?: string;
+  }): Promise<ApiResponse<FileMetadata>> {
+    return apiClient.post('/api/data/metadata', {
+      file_path: params.file_path,
+      fmt: params.fmt || 'ogip',
+    });
   },
 };
 

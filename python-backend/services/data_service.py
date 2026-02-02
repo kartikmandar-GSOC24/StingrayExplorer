@@ -108,6 +108,8 @@ class DataService(BaseService):
         fmt: str = "ogip",
         rmf_file: Optional[str] = None,
         additional_columns: Optional[List[str]] = None,
+        high_precision: bool = False,
+        skip_checks: bool = False,
     ) -> Dict[str, Any]:
         """
         Load an EventList from a file.
@@ -118,6 +120,8 @@ class DataService(BaseService):
             fmt: File format (ogip, hdf5, hea, etc.)
             rmf_file: Optional path to RMF file
             additional_columns: Optional list of additional columns to read
+            high_precision: Use numpy.float128 for time array (pulsar timing)
+            skip_checks: Skip time ordering and GTI validation (performance)
 
         Returns:
             Result dictionary with the EventList data
@@ -138,6 +142,8 @@ class DataService(BaseService):
                 fmt=fmt,
                 rmf_file=rmf_file,
                 additional_columns=additional_columns,
+                high_precision=high_precision,
+                skip_checks=skip_checks,
             )
 
             # Add to state manager
@@ -181,6 +187,10 @@ class DataService(BaseService):
         url: str,
         name: str,
         fmt: str = "ogip",
+        rmf_file: Optional[str] = None,
+        additional_columns: Optional[List[str]] = None,
+        high_precision: bool = False,
+        skip_checks: bool = False,
     ) -> Dict[str, Any]:
         """
         Load an EventList from a URL.
@@ -189,6 +199,10 @@ class DataService(BaseService):
             url: URL to download the event file from
             name: Name to assign to the loaded event list
             fmt: File format
+            rmf_file: Optional path to local RMF file for energy calibration
+            additional_columns: Optional list of additional columns to read
+            high_precision: Use numpy.float128 for time array (pulsar timing)
+            skip_checks: Skip time ordering and GTI validation (performance)
 
         Returns:
             Result dictionary
@@ -216,7 +230,14 @@ class DataService(BaseService):
 
             # Load the event list with guaranteed temp file cleanup
             try:
-                event_list = EventList.read(temp_filename, fmt)
+                event_list = EventList.read(
+                    temp_filename,
+                    fmt=fmt,
+                    rmf_file=rmf_file,
+                    additional_columns=additional_columns,
+                    high_precision=high_precision,
+                    skip_checks=skip_checks,
+                )
             finally:
                 # Clean up temporary file even if loading fails
                 if os.path.exists(temp_filename):
@@ -546,445 +567,6 @@ class DataService(BaseService):
         safe_limit = available_ram * safety_margin
         return needed_ram < safe_limit
 
-    def load_event_list_lazy(
-        self,
-        file_path: str,
-        name: str,
-        fmt: str = "ogip",
-        rmf_file: Optional[str] = None,
-        additional_columns: Optional[List[str]] = None,
-        safety_margin: float = 0.5,
-    ) -> Dict[str, Any]:
-        """
-        Load EventList using lazy loading for large files.
-
-        This method intelligently decides whether to use lazy loading
-        or standard loading based on file size and available memory.
-
-        Args:
-            file_path: Path to the event file
-            name: Name to assign to the loaded event list
-            fmt: File format (ogip, hdf5, hea, etc.)
-            rmf_file: Optional path to RMF file
-            additional_columns: Optional list of additional columns to read
-            safety_margin: Fraction of available RAM to use (0.0-1.0)
-
-        Returns:
-            Result dictionary with the EventList data
-        """
-        try:
-            # Validate the name doesn't already exist
-            if self.state.has_event_data(name):
-                return self.create_result(
-                    success=False,
-                    data=None,
-                    message=f"An event list with the name '{name}' already exists.",
-                    error=None,
-                )
-
-            file_size = os.path.getsize(file_path)
-            file_size_mb = file_size / (1024**2)
-            file_size_gb = file_size / (1024**3)
-
-            # Check if we can load safely
-            can_load_safe = self._can_load_safely(file_path, safety_margin, fmt)
-            memory_info = self._get_memory_info()
-            estimated_memory_mb = self._estimate_memory_usage(file_size, fmt) / (1024**2)
-
-            # Load the event list
-            event_list = EventList.read(
-                file_path,
-                fmt=fmt,
-                rmf_file=rmf_file,
-                additional_columns=additional_columns,
-            )
-
-            # Add to state manager
-            self.state.add_event_data(name, event_list)
-
-            # Validate GTI and collect warnings
-            gti_warnings = self._validate_gti(event_list)
-
-            # Determine loading method used
-            method = "standard" if can_load_safe else "standard_risky"
-
-            # Prepare summary (use helper for numpy type conversion)
-            summary = {
-                "name": name,
-                "n_events": len(event_list.time),
-                "time_range": [
-                    _to_python_float(event_list.time.min()),
-                    _to_python_float(event_list.time.max())
-                ],
-                "has_energy": event_list.energy is not None,
-                "has_pi": event_list.pi is not None,
-                "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
-                "gti_warnings": gti_warnings if gti_warnings else None,
-                "loading_info": {
-                    "method": method,
-                    "file_size_mb": file_size_mb,
-                    "file_size_gb": file_size_gb,
-                    "estimated_memory_mb": estimated_memory_mb,
-                    "memory_safe": can_load_safe,
-                    "available_memory_mb": memory_info["available_mb"],
-                },
-            }
-
-            # Build message with all warnings
-            message = f"EventList '{name}' loaded via lazy loading ({len(event_list.time)} events)"
-            warnings_parts = []
-            if not can_load_safe:
-                warnings_parts.append("memory risk")
-            if gti_warnings:
-                warnings_parts.append(f"GTI: {len(gti_warnings)}")
-            if warnings_parts:
-                message += f" [Warnings: {', '.join(warnings_parts)}]"
-
-            return self.create_result(
-                success=True,
-                data=summary,
-                message=message,
-            )
-
-        except MemoryError as e:
-            return self.create_result(
-                success=False,
-                data=None,
-                message="Out of memory loading file. File is too large for available RAM.",
-                error=str(e),
-            )
-        except Exception as e:
-            return self.handle_error(
-                e, "Loading event list with lazy loading", file_path=file_path, name=name
-            )
-
-    def load_event_list_preview(
-        self,
-        file_path: str,
-        name: str,
-        preview_duration: float = 100.0,
-        fmt: str = "ogip",
-    ) -> Dict[str, Any]:
-        """
-        Load only the first segment of a file as a preview.
-
-        For FITS files, uses FITSTimeseriesReader for efficient lazy access:
-        1. Reads only the time column first (memory efficient)
-        2. Sorts times to handle unsorted event files
-        3. Filters to preview window using sorted indices
-        4. Reads full data only for events in the preview window
-
-        For other formats, falls back to full EventList.read() with filtering.
-
-        Args:
-            file_path: Path to the event file
-            name: Name to assign to the loaded event list
-            preview_duration: Duration in seconds to preview (default: 100s)
-            fmt: File format
-
-        Returns:
-            Result dictionary with preview EventList
-        """
-        try:
-            # Validate the name doesn't already exist
-            if self.state.has_event_data(name):
-                return self.create_result(
-                    success=False,
-                    data=None,
-                    message=f"An event list with the name '{name}' already exists.",
-                    error=None,
-                )
-
-            file_size = os.path.getsize(file_path)
-            file_size_mb = file_size / (1024**2)
-
-            # Check if this is a FITS file format
-            is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
-
-            if is_fits:
-                # Use FITSTimeseriesReader for efficient lazy access
-                return self._load_preview_fits(
-                    file_path, name, preview_duration, file_size_mb
-                )
-            else:
-                # For non-FITS formats, use full EventList.read() with filtering
-                return self._load_preview_generic(
-                    file_path, name, preview_duration, fmt, file_size_mb
-                )
-
-        except StopIteration:
-            return self.create_result(
-                success=False,
-                data=None,
-                message="File has no data in the specified preview duration",
-                error="No segments available",
-            )
-        except Exception as e:
-            return self.handle_error(
-                e, "Loading event list preview", file_path=file_path, name=name
-            )
-
-    def _load_preview_fits(
-        self,
-        file_path: str,
-        name: str,
-        preview_duration: float,
-        file_size_mb: float,
-    ) -> Dict[str, Any]:
-        """
-        Load preview from FITS file using FITSTimeseriesReader.
-
-        This method:
-        1. Uses FITSTimeseriesReader to get metadata (GTI, mjdref) without loading all data
-        2. Reads only the TIME column first (much smaller than full EventList)
-        3. Sorts times to handle unsorted files (FITSTimeseriesReader assumes sorted)
-        4. Finds events within the preview window
-        5. Reads full data (time, energy, PI) only for preview events
-        """
-        # Step 1: Initialize reader for metadata access
-        reader = FITSTimeseriesReader(file_path, output_class=EventList, data_kind="events")
-        original_gti = reader.gti
-        mjdref = getattr(reader, 'mjdref', 0.0)
-        mission = getattr(reader, 'mission', None)
-        instr = getattr(reader, 'instr', None)
-
-        if original_gti is None or len(original_gti) == 0:
-            return self.create_result(
-                success=False,
-                data=None,
-                message="File has no GTI information",
-                error="No GTI found",
-            )
-
-        # Step 2: Read only the time column (memory efficient)
-        # data_kind="times" returns just the time array
-        times_reader = FITSTimeseriesReader(file_path, data_kind="times")
-        all_times = times_reader[:]  # Returns just the time array
-
-        total_events = len(all_times)
-
-        # Step 3: Sort times to handle unsorted event files
-        # FITSTimeseriesReader.filter_at_time_intervals uses searchsorted which
-        # requires sorted data. Many FITS files have unsorted events.
-        sort_indices = np.argsort(all_times)
-        sorted_times = all_times[sort_indices]
-
-        # Step 4: Calculate preview window
-        preview_start = float(original_gti[0, 0])
-        preview_end = min(preview_start + preview_duration, float(original_gti[0, 1]))
-
-        # Step 5: Find events within preview window (using sorted times for efficiency)
-        # Use searchsorted on the now-sorted array
-        start_idx = np.searchsorted(sorted_times, preview_start, side='left')
-        end_idx = np.searchsorted(sorted_times, preview_end, side='right')
-
-        # Get the original file indices for events in preview window
-        preview_sorted_indices = slice(start_idx, end_idx)
-        original_indices = sort_indices[preview_sorted_indices]
-
-        if len(original_indices) == 0:
-            return self.create_result(
-                success=False,
-                data=None,
-                message=f"No events found in the first {preview_duration}s of the file",
-                error="Empty preview segment",
-            )
-
-        # Step 6: Read full event data only for preview events
-        # We need to read the FITS file directly to get energy/PI for specific indices
-        preview_times = sorted_times[start_idx:end_idx]
-        preview_energy = None
-        preview_pi = None
-
-        # Read energy and PI columns for the preview events
-        with fits.open(file_path) as hdulist:
-            # Find the events HDU
-            events_hdu = None
-            for hdu in hdulist:
-                if hdu.name.upper() in ['EVENTS', 'EVT']:
-                    events_hdu = hdu
-                    break
-
-            if events_hdu is not None and events_hdu.data is not None:
-                # Get column names
-                col_names = [col.name.upper() for col in events_hdu.columns]
-
-                # Read energy if available
-                if 'ENERGY' in col_names:
-                    all_energy = events_hdu.data['ENERGY']
-                    preview_energy = all_energy[original_indices]
-                    # Sort to match sorted times
-                    preview_energy = preview_energy[np.argsort(original_indices.argsort())]
-
-                # Read PI if available
-                if 'PI' in col_names:
-                    all_pi = events_hdu.data['PI']
-                    preview_pi = all_pi[original_indices]
-                    # Sort to match sorted times
-                    preview_pi = preview_pi[np.argsort(original_indices.argsort())]
-                elif 'PHA' in col_names:
-                    all_pi = events_hdu.data['PHA']
-                    preview_pi = all_pi[original_indices]
-                    preview_pi = preview_pi[np.argsort(original_indices.argsort())]
-
-        # Step 7: Create preview EventList
-        preview_gti = np.array([[preview_start, preview_end]])
-        mjdref_float = _to_python_float(mjdref) or 0.0
-
-        event_list = EventList(
-            time=preview_times,
-            energy=preview_energy,
-            pi=preview_pi,
-            gti=preview_gti,
-            mjdref=mjdref_float,
-            mission=mission,
-            instr=instr,
-        )
-
-        # Add to state manager
-        self.state.add_event_data(name, event_list)
-
-        # Validate GTI and collect warnings
-        gti_warnings = self._validate_gti(event_list)
-
-        # Calculate durations for info
-        total_duration = float(np.sum(original_gti[:, 1] - original_gti[:, 0]))
-        preview_actual_duration = float(preview_times.max() - preview_times.min()) if len(preview_times) > 1 else 0.0
-
-        summary = {
-            "name": name,
-            "n_events": len(preview_times),
-            "time_range": [
-                _to_python_float(preview_times.min()),
-                _to_python_float(preview_times.max())
-            ],
-            "has_energy": preview_energy is not None,
-            "has_pi": preview_pi is not None,
-            "gti_count": 1,
-            "gti_warnings": gti_warnings if gti_warnings else None,
-            "preview_info": {
-                "preview_duration": preview_duration,
-                "actual_duration": preview_actual_duration,
-                "total_file_duration": total_duration,
-                "total_gti_count": len(original_gti),
-                "file_size_mb": file_size_mb,
-                "is_preview": True,
-                "full_event_count": total_events,
-                "loading_method": "FITSTimeseriesReader",
-            },
-        }
-
-        # Build message with warnings if present
-        message = f"Preview loaded: '{name}' - First {preview_duration}s ({len(preview_times)} events of {total_events} total)"
-        if gti_warnings:
-            message += f" [GTI warnings: {len(gti_warnings)}]"
-
-        return self.create_result(
-            success=True,
-            data=summary,
-            message=message,
-        )
-
-    def _load_preview_generic(
-        self,
-        file_path: str,
-        name: str,
-        preview_duration: float,
-        fmt: str,
-        file_size_mb: float,
-    ) -> Dict[str, Any]:
-        """
-        Load preview from non-FITS file formats using full EventList.read().
-
-        For HDF5, ECSV, and other formats, we load the full EventList
-        and filter it using numpy masking.
-        """
-        # Load the full EventList
-        full_event_list = EventList.read(file_path, fmt=fmt)
-
-        # Get the original GTI
-        original_gti = full_event_list.gti
-        if original_gti is None or len(original_gti) == 0:
-            original_gti = np.array([[full_event_list.time.min(), full_event_list.time.max()]])
-
-        # Calculate the preview interval
-        preview_start = float(original_gti[0, 0])
-        preview_end = min(preview_start + preview_duration, float(original_gti[0, 1]))
-        preview_gti = np.array([[preview_start, preview_end]])
-
-        # Filter times using numpy masking
-        mask = (full_event_list.time >= preview_start) & (full_event_list.time <= preview_end)
-        preview_times = full_event_list.time[mask]
-
-        if len(preview_times) == 0:
-            return self.create_result(
-                success=False,
-                data=None,
-                message=f"No events found in the first {preview_duration}s of the file",
-                error="Empty preview segment",
-            )
-
-        # Filter energy and PI
-        preview_energy = full_event_list.energy[mask] if full_event_list.energy is not None else None
-        preview_pi = full_event_list.pi[mask] if full_event_list.pi is not None else None
-
-        # Create preview EventList
-        mjdref_float = _to_python_float(full_event_list.mjdref) or 0.0
-        event_list = EventList(
-            time=preview_times,
-            energy=preview_energy,
-            pi=preview_pi,
-            gti=preview_gti,
-            mjdref=mjdref_float,
-            mission=getattr(full_event_list, 'mission', None),
-            instr=getattr(full_event_list, 'instr', None),
-        )
-
-        # Add to state manager
-        self.state.add_event_data(name, event_list)
-
-        # Validate GTI and collect warnings
-        gti_warnings = self._validate_gti(event_list)
-
-        # Calculate durations
-        total_duration = float(np.sum(original_gti[:, 1] - original_gti[:, 0]))
-        preview_actual_duration = float(preview_times.max() - preview_times.min()) if len(preview_times) > 1 else 0.0
-
-        summary = {
-            "name": name,
-            "n_events": len(preview_times),
-            "time_range": [
-                _to_python_float(preview_times.min()),
-                _to_python_float(preview_times.max())
-            ],
-            "has_energy": preview_energy is not None,
-            "has_pi": preview_pi is not None,
-            "gti_count": 1,
-            "gti_warnings": gti_warnings if gti_warnings else None,
-            "preview_info": {
-                "preview_duration": preview_duration,
-                "actual_duration": preview_actual_duration,
-                "total_file_duration": total_duration,
-                "total_gti_count": len(original_gti),
-                "file_size_mb": file_size_mb,
-                "is_preview": True,
-                "full_event_count": len(full_event_list.time),
-                "loading_method": "EventList.read",
-            },
-        }
-
-        # Build message with warnings if present
-        message = f"Preview loaded: '{name}' - First {preview_duration}s ({len(preview_times)} events of {len(full_event_list.time)} total)"
-        if gti_warnings:
-            message += f" [GTI warnings: {len(gti_warnings)}]"
-
-        return self.create_result(
-            success=True,
-            data=summary,
-            message=message,
-        )
-
-
     def get_event_list_full_preview(self, name: str, time_limit: int = 10) -> Dict[str, Any]:
         """
         Get full preview of an EventList with all attributes.
@@ -1116,3 +698,492 @@ class DataService(BaseService):
 
         except Exception as e:
             return self.handle_error(e, "Getting event list full preview", name=name)
+
+    # =========================================================================
+    # PARTIAL LOADING METHODS
+    # These methods use FITSTimeseriesReader to load only a portion of the file
+    # =========================================================================
+    #
+    # TODO: Implement true chunk-based lazy loading for streaming analysis
+    #
+    # FITSTimeseriesReader supports genuine lazy/streaming I/O via:
+    # - reader.split_by_number_of_samples(N) -> Generator yielding N-event chunks
+    # - reader.filter_at_time_intervals(intervals) -> Generator for time ranges
+    # - reader.apply_gti_lists(gti_lists) -> Generator for GTI-based splits
+    #
+    # This would allow processing huge files without loading them fully:
+    #   for chunk in reader.split_by_number_of_samples(100000):
+    #       ps = AveragedPowerspectrum(chunk, segment_size=128)
+    #       # Aggregate results...
+    #
+    # Implementation would require:
+    # 1. Store FITSTimeseriesReader objects in StateManager (not just EventLists)
+    # 2. Create generator-based iteration endpoints
+    # 3. Implement chunked analysis methods (works well with Averaged* classes)
+    #
+    # Note: Only "averaged" analysis methods (AveragedPowerspectrum, etc.) benefit
+    # from chunking. Single-FFT methods need all data at once.
+    # =========================================================================
+
+    def load_event_list_by_time_range(
+        self,
+        file_path: str,
+        name: str,
+        start_time: float,
+        end_time: float,
+        fmt: str = "ogip",
+    ) -> Dict[str, Any]:
+        """
+        Load events within a specific time range using true lazy loading.
+
+        Uses FITSTimeseriesReader.filter_at_time_intervals() to load only
+        events within the specified time window without reading the entire file.
+
+        Args:
+            file_path: Path to the FITS event file
+            name: Name to assign to the loaded event list
+            start_time: Start time (in seconds from file start or absolute)
+            end_time: End time (in seconds from file start or absolute)
+            fmt: File format (only FITS formats supported for lazy loading)
+
+        Returns:
+            Result dictionary with the filtered EventList
+        """
+        try:
+            # Validate the name doesn't already exist
+            if self.state.has_event_data(name):
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"An event list with the name '{name}' already exists.",
+                    error=None,
+                )
+
+            # Check format - only FITS supports true lazy loading
+            is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+            if not is_fits:
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"True lazy loading only supports FITS formats. Got: {fmt}",
+                    error="Unsupported format for lazy loading",
+                )
+
+            # Create the reader
+            reader = FITSTimeseriesReader(
+                file_path, output_class=EventList, data_kind="events"
+            )
+
+            # Get file metadata
+            original_gti = reader.gti
+            mjdref = getattr(reader, 'mjdref', 0.0)
+            mission = getattr(reader, 'mission', None)
+            instr = getattr(reader, 'instr', None)
+
+            # Get total event count for reporting
+            times_reader = FITSTimeseriesReader(file_path, data_kind="times")
+            total_events = len(times_reader[:])
+
+            # Calculate absolute times if relative times are provided
+            # If start_time is small (< 1000), treat as relative to GTI start
+            if original_gti is not None and len(original_gti) > 0:
+                gti_start = float(original_gti[0, 0])
+                gti_end = float(original_gti[-1, 1])
+                total_duration = float(np.sum(original_gti[:, 1] - original_gti[:, 0]))
+
+                # If times look relative (small values), convert to absolute
+                if start_time < 1000 and end_time < 1000:
+                    abs_start = gti_start + start_time
+                    abs_end = gti_start + end_time
+                else:
+                    abs_start = start_time
+                    abs_end = end_time
+
+                # Clamp to valid range
+                abs_start = max(abs_start, gti_start)
+                abs_end = min(abs_end, gti_end)
+            else:
+                abs_start = start_time
+                abs_end = end_time
+                total_duration = 0.0
+
+            if abs_start >= abs_end:
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"Invalid time range: start ({abs_start}) >= end ({abs_end})",
+                    error="Invalid time range",
+                )
+
+            # Use filter_at_time_intervals to get events in the time range
+            # This returns a generator - we get the first (and only) result
+            time_intervals = [[abs_start, abs_end]]
+            event_list = None
+
+            for filtered_events in reader.filter_at_time_intervals(time_intervals):
+                event_list = filtered_events
+                break  # Only one interval
+
+            if event_list is None or len(event_list.time) == 0:
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"No events found in time range [{start_time}, {end_time}]",
+                    error="Empty time range",
+                )
+
+            # Set metadata that might not be transferred
+            event_list.mjdref = _to_python_float(mjdref) or 0.0
+            if mission:
+                event_list.mission = mission
+            if instr:
+                event_list.instr = instr
+
+            # Add to state manager
+            self.state.add_event_data(name, event_list)
+
+            # Validate GTI and collect warnings
+            gti_warnings = self._validate_gti(event_list)
+
+            # Calculate loaded duration
+            loaded_duration = abs_end - abs_start
+
+            summary = {
+                "name": name,
+                "n_events": len(event_list.time),
+                "time_range": [
+                    _to_python_float(event_list.time.min()),
+                    _to_python_float(event_list.time.max())
+                ],
+                "has_energy": event_list.energy is not None,
+                "has_pi": event_list.pi is not None,
+                "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
+                "gti_warnings": gti_warnings if gti_warnings else None,
+                "lazy_loading_info": {
+                    "method": "time_range",
+                    "requested_range": [start_time, end_time],
+                    "actual_range": [abs_start, abs_end],
+                    "loaded_duration": loaded_duration,
+                    "total_file_duration": total_duration,
+                    "total_file_events": total_events,
+                    "events_loaded_percent": (len(event_list.time) / total_events * 100) if total_events > 0 else 0,
+                },
+            }
+
+            message = (
+                f"Lazy loaded '{name}': {len(event_list.time)} events "
+                f"({summary['lazy_loading_info']['events_loaded_percent']:.1f}% of file) "
+                f"from time range [{start_time:.1f}s - {end_time:.1f}s]"
+            )
+            if gti_warnings:
+                message += f" [GTI warnings: {len(gti_warnings)}]"
+
+            return self.create_result(
+                success=True,
+                data=summary,
+                message=message,
+            )
+
+        except Exception as e:
+            return self.handle_error(
+                e, "Loading event list by time range",
+                file_path=file_path, name=name, start_time=start_time, end_time=end_time
+            )
+
+    def load_event_list_by_event_count(
+        self,
+        file_path: str,
+        name: str,
+        start_index: int = 0,
+        count: int = 10000,
+        fmt: str = "ogip",
+    ) -> Dict[str, Any]:
+        """
+        Load a specific number of events using true lazy loading.
+
+        Uses FITSTimeseriesReader slicing to load only the requested events
+        without reading the entire file into memory.
+
+        Args:
+            file_path: Path to the FITS event file
+            name: Name to assign to the loaded event list
+            start_index: Starting event index (0-based)
+            count: Number of events to load
+            fmt: File format (only FITS formats supported for lazy loading)
+
+        Returns:
+            Result dictionary with the sliced EventList
+        """
+        try:
+            # Validate the name doesn't already exist
+            if self.state.has_event_data(name):
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"An event list with the name '{name}' already exists.",
+                    error=None,
+                )
+
+            # Check format
+            is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+            if not is_fits:
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"True lazy loading only supports FITS formats. Got: {fmt}",
+                    error="Unsupported format for lazy loading",
+                )
+
+            # Create the reader
+            reader = FITSTimeseriesReader(
+                file_path, output_class=EventList, data_kind="events"
+            )
+
+            # Get file metadata
+            original_gti = reader.gti
+            mjdref = getattr(reader, 'mjdref', 0.0)
+            mission = getattr(reader, 'mission', None)
+            instr = getattr(reader, 'instr', None)
+
+            # Get total event count
+            times_reader = FITSTimeseriesReader(file_path, data_kind="times")
+            all_times = times_reader[:]
+            total_events = len(all_times)
+
+            if original_gti is not None and len(original_gti) > 0:
+                total_duration = float(np.sum(original_gti[:, 1] - original_gti[:, 0]))
+            else:
+                total_duration = float(all_times.max() - all_times.min()) if total_events > 0 else 0.0
+
+            # Validate indices
+            if start_index < 0:
+                start_index = 0
+            if start_index >= total_events:
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"Start index {start_index} exceeds total events {total_events}",
+                    error="Invalid start index",
+                )
+
+            end_index = min(start_index + count, total_events)
+            actual_count = end_index - start_index
+
+            # Use slice to load only requested events
+            event_list = reader[start_index:end_index]
+
+            if event_list is None or len(event_list.time) == 0:
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"No events found in range [{start_index}:{end_index}]",
+                    error="Empty event range",
+                )
+
+            # Set metadata that might not be transferred
+            event_list.mjdref = _to_python_float(mjdref) or 0.0
+            if mission:
+                event_list.mission = mission
+            if instr:
+                event_list.instr = instr
+
+            # Add to state manager
+            self.state.add_event_data(name, event_list)
+
+            # Validate GTI and collect warnings
+            gti_warnings = self._validate_gti(event_list)
+
+            summary = {
+                "name": name,
+                "n_events": len(event_list.time),
+                "time_range": [
+                    _to_python_float(event_list.time.min()),
+                    _to_python_float(event_list.time.max())
+                ],
+                "has_energy": event_list.energy is not None,
+                "has_pi": event_list.pi is not None,
+                "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
+                "gti_warnings": gti_warnings if gti_warnings else None,
+                "lazy_loading_info": {
+                    "method": "event_count",
+                    "start_index": start_index,
+                    "end_index": end_index,
+                    "events_requested": count,
+                    "events_loaded": actual_count,
+                    "total_file_events": total_events,
+                    "total_file_duration": total_duration,
+                    "events_loaded_percent": (actual_count / total_events * 100) if total_events > 0 else 0,
+                },
+            }
+
+            message = (
+                f"Lazy loaded '{name}': {actual_count} events "
+                f"({summary['lazy_loading_info']['events_loaded_percent']:.1f}% of file) "
+                f"from indices [{start_index}:{end_index}]"
+            )
+            if gti_warnings:
+                message += f" [GTI warnings: {len(gti_warnings)}]"
+
+            return self.create_result(
+                success=True,
+                data=summary,
+                message=message,
+            )
+
+        except Exception as e:
+            return self.handle_error(
+                e, "Loading event list by event count",
+                file_path=file_path, name=name, start_index=start_index, count=count
+            )
+
+    def get_file_metadata(self, file_path: str, fmt: str = "ogip") -> Dict[str, Any]:
+        """
+        Get metadata from a FITS file without loading the full data.
+
+        Uses FITSTimeseriesReader to efficiently read only metadata:
+        - Total event count
+        - Time range
+        - GTI information
+        - Mission/instrument info
+        - Available columns
+
+        This is useful for previewing large files before deciding
+        what portion to load.
+
+        Args:
+            file_path: Path to the FITS event file
+            fmt: File format
+
+        Returns:
+            Result dictionary with file metadata
+        """
+        try:
+            # Check format
+            is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+            if not is_fits:
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"Metadata preview only supports FITS formats. Got: {fmt}",
+                    error="Unsupported format",
+                )
+
+            file_size = os.path.getsize(file_path)
+            file_size_mb = file_size / (1024**2)
+            file_size_gb = file_size / (1024**3)
+
+            # Create reader for metadata access
+            reader = FITSTimeseriesReader(
+                file_path, output_class=EventList, data_kind="events"
+            )
+
+            # Get GTI and other metadata
+            original_gti = reader.gti
+            mjdref = getattr(reader, 'mjdref', 0.0)
+            mission = getattr(reader, 'mission', None)
+            instr = getattr(reader, 'instr', None)
+
+            # Get time data efficiently
+            times_reader = FITSTimeseriesReader(file_path, data_kind="times")
+            all_times = times_reader[:]
+            total_events = len(all_times)
+
+            # Calculate time statistics
+            time_min = _to_python_float(all_times.min()) if total_events > 0 else None
+            time_max = _to_python_float(all_times.max()) if total_events > 0 else None
+            duration = _to_python_float(all_times.max() - all_times.min()) if total_events > 1 else 0.0
+
+            # GTI info
+            gti_count = len(original_gti) if original_gti is not None else 0
+            total_gti_time = None
+            if original_gti is not None and len(original_gti) > 0:
+                total_gti_time = float(np.sum(original_gti[:, 1] - original_gti[:, 0]))
+
+            # Get available columns from FITS file
+            available_columns = []
+            with fits.open(file_path) as hdulist:
+                for hdu in hdulist:
+                    if hdu.name.upper() in ['EVENTS', 'EVT']:
+                        available_columns = [col.name for col in hdu.columns]
+                        break
+
+            # Determine risk level for loading
+            if file_size_gb > 10:
+                risk_level = "critical"
+            elif file_size_gb > 5:
+                risk_level = "risky"
+            elif file_size_gb > 1:
+                risk_level = "caution"
+            else:
+                risk_level = "safe"
+
+            metadata = {
+                "file_path": file_path,
+                "file_size_mb": file_size_mb,
+                "file_size_gb": file_size_gb,
+                "risk_level": risk_level,
+                "total_events": total_events,
+                "time_range": [time_min, time_max],
+                "duration": duration,
+                "gti_count": gti_count,
+                "total_gti_time": total_gti_time,
+                "gti_list": (
+                    [[_to_python_float(g[0]), _to_python_float(g[1])] for g in original_gti]
+                    if original_gti is not None
+                    else None
+                ),
+                "mjdref": _to_python_float(mjdref),
+                "mission": mission,
+                "instrument": instr,
+                "available_columns": available_columns,
+                "recommended_loading": self._recommend_loading_strategy(
+                    total_events, file_size_gb, risk_level
+                ),
+            }
+
+            return self.create_result(
+                success=True,
+                data=metadata,
+                message=f"Metadata retrieved: {total_events} events, {file_size_mb:.1f} MB, {gti_count} GTI",
+            )
+
+        except Exception as e:
+            return self.handle_error(
+                e, "Getting file metadata", file_path=file_path
+            )
+
+    def _recommend_loading_strategy(
+        self,
+        total_events: int,
+        file_size_gb: float,
+        risk_level: str,
+    ) -> Dict[str, Any]:
+        """
+        Recommend a loading strategy based on file characteristics.
+
+        Returns recommendations for how to load the file efficiently.
+        """
+        recommendations = {
+            "can_load_full": risk_level in ["safe", "caution"],
+            "recommend_lazy": risk_level in ["caution", "risky", "critical"],
+            "suggested_chunk_size": None,
+            "suggested_time_chunk": None,
+            "strategy": "full",
+        }
+
+        if risk_level == "critical":
+            recommendations["strategy"] = "chunked"
+            recommendations["suggested_chunk_size"] = min(100000, total_events // 10)
+            recommendations["suggested_time_chunk"] = 100.0  # seconds
+        elif risk_level == "risky":
+            recommendations["strategy"] = "time_range"
+            recommendations["suggested_chunk_size"] = min(500000, total_events // 5)
+            recommendations["suggested_time_chunk"] = 500.0
+        elif risk_level == "caution":
+            recommendations["strategy"] = "preview_first"
+            recommendations["suggested_chunk_size"] = min(1000000, total_events // 2)
+            recommendations["suggested_time_chunk"] = 1000.0
+        else:
+            recommendations["strategy"] = "full"
+
+        return recommendations

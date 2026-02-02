@@ -36,7 +36,6 @@ import {
   LinearProgress,
   FormControlLabel,
   Checkbox,
-  Slider,
   Tabs,
   Tab,
 } from '@mui/material';
@@ -56,9 +55,13 @@ import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import SaveIcon from '@mui/icons-material/Save';
 import ClearAllIcon from '@mui/icons-material/ClearAll';
 import VisibilityIcon from '@mui/icons-material/Visibility';
-import SpeedIcon from '@mui/icons-material/Speed';
 import MemoryIcon from '@mui/icons-material/Memory';
-import { dataApi, EventListSummary, EventListInfo, FileSizeInfo, EventListFullPreview } from '@/api/dataApi';
+import PrecisionManufacturingIcon from '@mui/icons-material/PrecisionManufacturing';
+import BoltIcon from '@mui/icons-material/Bolt';
+import AccessTimeIcon from '@mui/icons-material/AccessTime';
+import NumbersIcon from '@mui/icons-material/Numbers';
+import QueryStatsIcon from '@mui/icons-material/QueryStats';
+import { dataApi, EventListSummary, EventListInfo, FileSizeInfo, EventListFullPreview, FileMetadata } from '@/api/dataApi';
 import { apiClient } from '@/api/client';
 import { useUIStore } from '@/store/uiStore';
 
@@ -87,10 +90,20 @@ const DataIngestionPage: React.FC = () => {
   const [fileSizeInfo, setFileSizeInfo] = useState<FileSizeInfo | null>(null);
   const [isCheckingFileSize, setIsCheckingFileSize] = useState<boolean>(false);
 
-  // Lazy loading options
-  const [useLazyLoading, setUseLazyLoading] = useState<boolean>(false);
-  const [usePreviewMode, setUsePreviewMode] = useState<boolean>(false);
-  const [previewDuration, setPreviewDuration] = useState<number>(100);
+
+  // Advanced loading options
+  const [highPrecision, setHighPrecision] = useState<boolean>(false);
+  const [skipChecks, setSkipChecks] = useState<boolean>(false);
+
+  // True lazy loading options
+  const [useTrueLazyLoading, setUseTrueLazyLoading] = useState<boolean>(false);
+  const [trueLazyMode, setTrueLazyMode] = useState<'time_range' | 'event_count'>('time_range');
+  const [timeRangeStart, setTimeRangeStart] = useState<number>(0);
+  const [timeRangeEnd, setTimeRangeEnd] = useState<number>(100);
+  const [eventCountStart, setEventCountStart] = useState<number>(0);
+  const [eventCount, setEventCount] = useState<number>(10000);
+  const [fileMetadata, setFileMetadata] = useState<FileMetadata | null>(null);
+  const [isLoadingMetadata, setIsLoadingMetadata] = useState<boolean>(false);
 
   // Form state - URL Loading
   const [urlInput, setUrlInput] = useState<string>('');
@@ -166,13 +179,9 @@ const DataIngestionPage: React.FC = () => {
       const response = await dataApi.checkFileSize(filePath);
       if (response.success && response.data) {
         setFileSizeInfo(response.data);
-        // Auto-enable lazy loading if recommended
-        if (response.data.recommend_lazy && !useLazyLoading) {
-          setUseLazyLoading(true);
-        }
-        // Auto-enable preview mode for critical files
-        if (response.data.risk_level === 'critical' && !usePreviewMode) {
-          setUsePreviewMode(true);
+        // Auto-enable lazy loading if recommended for large files
+        if (response.data.recommend_lazy && !useTrueLazyLoading) {
+          setUseTrueLazyLoading(true);
         }
       }
     } catch (error) {
@@ -180,6 +189,47 @@ const DataIngestionPage: React.FC = () => {
       setFileSizeInfo(null);
     } finally {
       setIsCheckingFileSize(false);
+    }
+  };
+
+  // Fetch file metadata for true lazy loading
+  const fetchFileMetadata = async (): Promise<void> => {
+    if (selectedFiles.length === 0) {
+      showAlert('Please select a file first', 'warning');
+      return;
+    }
+
+    setIsLoadingMetadata(true);
+    try {
+      await apiClient.getPort();
+      const response = await dataApi.getFileMetadata({
+        file_path: selectedFiles[0],
+        fmt: fileFormat,
+      });
+      if (response.success && response.data) {
+        setFileMetadata(response.data);
+        // Auto-populate time range with full file duration
+        if (response.data.time_range[0] !== null && response.data.time_range[1] !== null) {
+          setTimeRangeStart(0);
+          setTimeRangeEnd(Math.min(response.data.duration, 100));
+        }
+        // Auto-populate event count with recommendation
+        if (response.data.recommended_loading.suggested_chunk_size) {
+          setEventCount(response.data.recommended_loading.suggested_chunk_size);
+        }
+        showAlert(
+          `File has ${response.data.total_events.toLocaleString()} events over ${response.data.duration.toFixed(1)}s`,
+          'success',
+          'File Metadata'
+        );
+      } else {
+        showAlert(response.message || 'Failed to fetch file metadata', 'error', 'Metadata Error');
+      }
+    } catch (error) {
+      console.error('Failed to fetch file metadata:', error);
+      showAlert('Failed to fetch file metadata', 'error', 'Metadata Error');
+    } finally {
+      setIsLoadingMetadata(false);
     }
   };
 
@@ -260,24 +310,29 @@ const DataIngestionPage: React.FC = () => {
         : undefined;
 
       let response;
+      let loadMethod = '';
 
-      if (usePreviewMode) {
-        // Use preview mode for extremely large files
-        response = await dataApi.loadEventListPreview({
-          file_path: selectedFiles[0],
-          name: eventListName.trim(),
-          preview_duration: previewDuration,
-          fmt: fileFormat,
-        });
-      } else if (useLazyLoading) {
-        // Use lazy loading for large files
-        response = await dataApi.loadEventListLazy({
-          file_path: selectedFiles[0],
-          name: eventListName.trim(),
-          fmt: fileFormat,
-          rmf_file: rmfFile || undefined,
-          additional_columns: additionalColumnsArray,
-        });
+      if (useTrueLazyLoading) {
+        // True lazy loading - only reads requested portion from disk
+        if (trueLazyMode === 'time_range') {
+          response = await dataApi.loadEventListByTimeRange({
+            file_path: selectedFiles[0],
+            name: eventListName.trim(),
+            start_time: timeRangeStart,
+            end_time: timeRangeEnd,
+            fmt: fileFormat,
+          });
+          loadMethod = ` (Time Range: ${timeRangeStart}s - ${timeRangeEnd}s)`;
+        } else {
+          response = await dataApi.loadEventListByEventCount({
+            file_path: selectedFiles[0],
+            name: eventListName.trim(),
+            start_index: eventCountStart,
+            count: eventCount,
+            fmt: fileFormat,
+          });
+          loadMethod = ` (Events: ${eventCountStart} - ${eventCountStart + eventCount})`;
+        }
       } else {
         // Standard loading
         response = await dataApi.loadEventList({
@@ -286,11 +341,12 @@ const DataIngestionPage: React.FC = () => {
           fmt: fileFormat,
           rmf_file: rmfFile || undefined,
           additional_columns: additionalColumnsArray,
+          high_precision: highPrecision,
+          skip_checks: skipChecks,
         });
       }
 
       if (response.success) {
-        const loadMethod = usePreviewMode ? ' (Preview Mode)' : useLazyLoading ? ' (Lazy Loading)' : '';
         showAlert(response.message || `Event List loaded successfully!${loadMethod}`, 'success', 'Data Loaded');
         // Reset form
         setSelectedFiles([]);
@@ -298,8 +354,14 @@ const DataIngestionPage: React.FC = () => {
         setRmfFile('');
         setAdditionalColumns('');
         setFileSizeInfo(null);
-        setUseLazyLoading(false);
-        setUsePreviewMode(false);
+        setFileMetadata(null);
+        setUseTrueLazyLoading(false);
+        setHighPrecision(false);
+        setSkipChecks(false);
+        setTimeRangeStart(0);
+        setTimeRangeEnd(100);
+        setEventCountStart(0);
+        setEventCount(10000);
         // Refresh the list
         await fetchEventLists();
       } else {
@@ -432,6 +494,8 @@ const DataIngestionPage: React.FC = () => {
         url: urlInput.trim(),
         name: urlEventListName.trim(),
         fmt: urlFormat,
+        high_precision: highPrecision,
+        skip_checks: skipChecks,
       });
 
       if (response.success) {
@@ -632,12 +696,12 @@ const DataIngestionPage: React.FC = () => {
                     )}
                     {fileSizeInfo.recommend_lazy && (
                       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-                        Large file detected. Lazy loading has been auto-enabled.
+                        Large file detected. Partial loading has been auto-enabled.
                       </Typography>
                     )}
                     {fileSizeInfo.risk_level === 'critical' && (
                       <Typography variant="caption" color="error" sx={{ display: 'block', mt: 0.5 }}>
-                        Critical: File may be too large to load. Consider using Preview Mode.
+                        Critical: File may be too large to load. Consider using Partial Loading.
                       </Typography>
                     )}
                   </Box>
@@ -737,79 +801,254 @@ const DataIngestionPage: React.FC = () => {
                     Loading Options
                   </Typography>
 
-                  {/* Lazy Loading */}
-                  <Tooltip title="Recommended for files >1GB. Uses memory-efficient loading that checks available RAM before loading.">
+                  {/* High Precision */}
+                  <Tooltip
+                    title={
+                      <Box>
+                        <Typography variant="body2" fontWeight="bold" gutterBottom>High Precision Timing</Typography>
+                        <Typography variant="caption" component="p" gutterBottom>
+                          Uses numpy.float128 (128-bit) instead of float64 for time arrays, providing ~18 more decimal digits of precision.
+                        </Typography>
+                        <Typography variant="caption" component="p" sx={{ mt: 1 }}>
+                          <strong>Use when:</strong> Pulsar timing analysis, millisecond pulsars, phase-coherent timing, or any analysis requiring nanosecond-level accuracy.
+                        </Typography>
+                        <Typography variant="caption" component="p" sx={{ mt: 1 }}>
+                          <strong>Avoid when:</strong> General spectral/timing analysis, large files (increases memory ~2x), or when float64 precision is sufficient.
+                        </Typography>
+                      </Box>
+                    }
+                    arrow
+                    placement="right"
+                  >
                     <FormControlLabel
                       control={
                         <Checkbox
-                          checked={useLazyLoading}
-                          onChange={(e) => {
-                            setUseLazyLoading(e.target.checked);
-                            if (e.target.checked) setUsePreviewMode(false);
-                          }}
+                          checked={highPrecision}
+                          onChange={(e) => setHighPrecision(e.target.checked)}
                           size="small"
                         />
                       }
                       label={
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                          <SpeedIcon fontSize="small" color="primary" />
-                          <Typography variant="body2">Use lazy loading (recommended for large files)</Typography>
+                          <PrecisionManufacturingIcon fontSize="small" color="info" />
+                          <Typography variant="body2">High precision timing</Typography>
                         </Box>
                       }
                     />
                   </Tooltip>
 
-                  {/* Preview Mode */}
-                  <Tooltip title="Load only the first segment of data. Useful for extremely large files that cannot fit in memory.">
+                  {/* Skip Checks */}
+                  <Tooltip
+                    title={
+                      <Box>
+                        <Typography variant="body2" fontWeight="bold" gutterBottom>Skip Validation Checks</Typography>
+                        <Typography variant="caption" component="p" gutterBottom>
+                          Bypasses time ordering verification and GTI (Good Time Interval) validation during loading.
+                        </Typography>
+                        <Typography variant="caption" component="p" sx={{ mt: 1 }}>
+                          <strong>Use when:</strong> Loading trusted/verified data, re-loading previously validated files, or when you need faster loading and will validate manually.
+                        </Typography>
+                        <Typography variant="caption" component="p" sx={{ mt: 1 }}>
+                          <strong>Avoid when:</strong> Loading new/untrusted data, data from unfamiliar sources, or when data integrity is critical for your analysis.
+                        </Typography>
+                      </Box>
+                    }
+                    arrow
+                    placement="right"
+                  >
                     <FormControlLabel
                       control={
                         <Checkbox
-                          checked={usePreviewMode}
-                          onChange={(e) => {
-                            setUsePreviewMode(e.target.checked);
-                            if (e.target.checked) setUseLazyLoading(false);
-                          }}
+                          checked={skipChecks}
+                          onChange={(e) => setSkipChecks(e.target.checked)}
                           size="small"
                         />
                       }
                       label={
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
-                          <VisibilityIcon fontSize="small" color="secondary" />
-                          <Typography variant="body2">Preview mode (load only first segment)</Typography>
+                          <BoltIcon fontSize="small" color="warning" />
+                          <Typography variant="body2">Skip validation checks</Typography>
                         </Box>
                       }
                     />
                   </Tooltip>
 
-                  {/* Preview Duration Slider */}
-                  {usePreviewMode && (
-                    <Box sx={{ mt: 2, px: 1 }}>
-                      <Typography variant="caption" color="text.secondary" gutterBottom>
-                        Preview Duration: {previewDuration}s
-                      </Typography>
-                      <Slider
-                        value={previewDuration}
-                        onChange={(_, value) => setPreviewDuration(value as number)}
-                        min={10}
-                        max={1000}
-                        step={10}
-                        marks={[
-                          { value: 10, label: '10s' },
-                          { value: 100, label: '100s' },
-                          { value: 500, label: '500s' },
-                          { value: 1000, label: '1000s' },
-                        ]}
+                  {/* Partial Loading */}
+                  <Tooltip
+                    title={
+                      <Box>
+                        <Typography variant="body2" fontWeight="bold" gutterBottom>Partial Loading</Typography>
+                        <Typography variant="caption" component="p" gutterBottom>
+                          Loads only a specific portion of the file (by time range or event count) without reading the entire file into memory.
+                        </Typography>
+                        <Typography variant="caption" component="p" sx={{ mt: 1 }}>
+                          <strong>Use when:</strong> Working with large FITS files (&gt;1GB), exploring data before full analysis, or when you only need a specific time segment.
+                        </Typography>
+                        <Typography variant="caption" component="p" sx={{ mt: 1 }}>
+                          <strong>Avoid when:</strong> Using non-FITS formats (HDF5, CSV), or when you need the complete dataset for analysis.
+                        </Typography>
+                        <Typography variant="caption" component="p" sx={{ mt: 1, fontStyle: 'italic' }}>
+                          Note: Only FITS formats are supported.
+                        </Typography>
+                      </Box>
+                    }
+                    arrow
+                    placement="right"
+                  >
+                    <FormControlLabel
+                      control={
+                        <Checkbox
+                          checked={useTrueLazyLoading}
+                          onChange={(e) => setUseTrueLazyLoading(e.target.checked)}
+                          size="small"
+                          color="secondary"
+                        />
+                      }
+                      label={
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                          <QueryStatsIcon fontSize="small" color="secondary" />
+                          <Typography variant="body2">Partial loading</Typography>
+                        </Box>
+                      }
+                    />
+                  </Tooltip>
+
+                  {/* True Lazy Loading Options */}
+                  {useTrueLazyLoading && (
+                    <Box sx={{ mt: 2, p: 2, bgcolor: 'secondary.50', borderRadius: 1, border: '1px solid', borderColor: 'secondary.main' }}>
+                      {/* Get Metadata Button */}
+                      <Button
+                        variant="outlined"
+                        color="secondary"
                         size="small"
-                      />
+                        onClick={fetchFileMetadata}
+                        disabled={isLoadingMetadata || selectedFiles.length === 0}
+                        startIcon={isLoadingMetadata ? <CircularProgress size={16} /> : <QueryStatsIcon />}
+                        sx={{ mb: 2 }}
+                        fullWidth
+                      >
+                        {isLoadingMetadata ? 'Loading...' : 'Get File Metadata'}
+                      </Button>
+
+                      {/* File Metadata Display */}
+                      {fileMetadata && (
+                        <Box sx={{ mb: 2, p: 1.5, bgcolor: 'background.paper', borderRadius: 1 }}>
+                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                            <strong>Total Events:</strong> {fileMetadata.total_events.toLocaleString()}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                            <strong>Duration:</strong> {fileMetadata.duration.toFixed(2)}s
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                            <strong>File Size:</strong> {fileMetadata.file_size_mb.toFixed(1)} MB
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                            <strong>GTIs:</strong> {fileMetadata.gti_count}
+                          </Typography>
+                          {fileMetadata.mission && (
+                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                              <strong>Mission:</strong> {fileMetadata.mission}
+                            </Typography>
+                          )}
+                          <Chip
+                            label={`Recommended: ${fileMetadata.recommended_loading.strategy}`}
+                            size="small"
+                            color="secondary"
+                            variant="outlined"
+                            sx={{ mt: 1 }}
+                          />
+                        </Box>
+                      )}
+
+                      {/* Mode Selection */}
+                      <FormControl fullWidth size="small" sx={{ mb: 2 }}>
+                        <InputLabel>Loading Mode</InputLabel>
+                        <Select
+                          value={trueLazyMode}
+                          label="Loading Mode"
+                          onChange={(e) => setTrueLazyMode(e.target.value as 'time_range' | 'event_count')}
+                        >
+                          <MenuItem value="time_range">
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                              <AccessTimeIcon fontSize="small" />
+                              Load by Time Range
+                            </Box>
+                          </MenuItem>
+                          <MenuItem value="event_count">
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                              <NumbersIcon fontSize="small" />
+                              Load by Event Count
+                            </Box>
+                          </MenuItem>
+                        </Select>
+                      </FormControl>
+
+                      {/* Time Range Mode */}
+                      {trueLazyMode === 'time_range' && (
+                        <Box sx={{ display: 'flex', gap: 1 }}>
+                          <TextField
+                            label="Start Time (s)"
+                            type="number"
+                            value={timeRangeStart}
+                            onChange={(e) => setTimeRangeStart(parseFloat(e.target.value) || 0)}
+                            size="small"
+                            fullWidth
+                            inputProps={{ min: 0, step: 1 }}
+                          />
+                          <TextField
+                            label="End Time (s)"
+                            type="number"
+                            value={timeRangeEnd}
+                            onChange={(e) => setTimeRangeEnd(parseFloat(e.target.value) || 100)}
+                            size="small"
+                            fullWidth
+                            inputProps={{ min: 0, step: 1 }}
+                          />
+                        </Box>
+                      )}
+
+                      {/* Event Count Mode */}
+                      {trueLazyMode === 'event_count' && (
+                        <Box sx={{ display: 'flex', gap: 1 }}>
+                          <TextField
+                            label="Start Index"
+                            type="number"
+                            value={eventCountStart}
+                            onChange={(e) => setEventCountStart(parseInt(e.target.value) || 0)}
+                            size="small"
+                            fullWidth
+                            inputProps={{ min: 0, step: 1000 }}
+                          />
+                          <TextField
+                            label="Event Count"
+                            type="number"
+                            value={eventCount}
+                            onChange={(e) => setEventCount(parseInt(e.target.value) || 10000)}
+                            size="small"
+                            fullWidth
+                            inputProps={{ min: 1, step: 1000 }}
+                          />
+                        </Box>
+                      )}
+
+                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
+                        {trueLazyMode === 'time_range'
+                          ? `Will load events from ${timeRangeStart}s to ${timeRangeEnd}s (${timeRangeEnd - timeRangeStart}s duration)`
+                          : `Will load ${eventCount.toLocaleString()} events starting from index ${eventCountStart.toLocaleString()}`}
+                      </Typography>
                     </Box>
                   )}
 
                   {/* Loading mode indicator */}
-                  {(useLazyLoading || usePreviewMode) && (
-                    <Alert severity="info" sx={{ mt: 2 }} icon={useLazyLoading ? <SpeedIcon /> : <VisibilityIcon />}>
-                      {useLazyLoading
-                        ? 'Lazy loading enabled: Memory usage will be checked before loading.'
-                        : `Preview mode: Only the first ${previewDuration}s of data will be loaded.`}
+                  {useTrueLazyLoading && (
+                    <Alert
+                      severity="success"
+                      sx={{ mt: 2 }}
+                      icon={<QueryStatsIcon />}
+                    >
+                      {trueLazyMode === 'time_range'
+                        ? `Partial loading: Only events in [${timeRangeStart}s - ${timeRangeEnd}s] will be loaded.`
+                        : `Partial loading: Only ${eventCount.toLocaleString()} events starting at index ${eventCountStart} will be loaded.`}
                     </Alert>
                   )}
                 </Box>

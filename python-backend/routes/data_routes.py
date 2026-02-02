@@ -28,12 +28,18 @@ class LoadEventListRequest(BaseModel):
     fmt: str = "ogip"
     rmf_file: Optional[str] = None
     additional_columns: Optional[List[str]] = None
+    high_precision: bool = False
+    skip_checks: bool = False
 
 
 class LoadEventListFromUrlRequest(BaseModel):
     url: str
     name: str
     fmt: str = "ogip"
+    rmf_file: Optional[str] = None
+    additional_columns: Optional[List[str]] = None
+    high_precision: bool = False
+    skip_checks: bool = False
 
 
 class SaveEventListRequest(BaseModel):
@@ -46,19 +52,27 @@ class CheckFileSizeRequest(BaseModel):
     file_path: str
 
 
-class LoadEventListLazyRequest(BaseModel):
+class LoadByTimeRangeRequest(BaseModel):
+    """Request model for true lazy loading by time range."""
     file_path: str
     name: str
+    start_time: float
+    end_time: float
     fmt: str = "ogip"
-    rmf_file: Optional[str] = None
-    additional_columns: Optional[List[str]] = None
-    safety_margin: float = 0.5
 
 
-class LoadEventListPreviewRequest(BaseModel):
+class LoadByEventCountRequest(BaseModel):
+    """Request model for true lazy loading by event count."""
     file_path: str
     name: str
-    preview_duration: float = 100.0
+    start_index: int = 0
+    count: int = 10000
+    fmt: str = "ogip"
+
+
+class GetFileMetadataRequest(BaseModel):
+    """Request model for getting file metadata without loading."""
+    file_path: str
     fmt: str = "ogip"
 
 
@@ -75,6 +89,8 @@ async def load_event_list(
         fmt=request.fmt,
         rmf_file=request.rmf_file,
         additional_columns=request.additional_columns,
+        high_precision=request.high_precision,
+        skip_checks=request.skip_checks,
     )
 
 
@@ -88,6 +104,10 @@ async def load_event_list_from_url(
         url=request.url,
         name=request.name,
         fmt=request.fmt,
+        rmf_file=request.rmf_file,
+        additional_columns=request.additional_columns,
+        high_precision=request.high_precision,
+        skip_checks=request.skip_checks,
     )
 
 
@@ -147,36 +167,6 @@ async def clear_all_event_lists(
     return service.clear_all_event_lists()
 
 
-@router.post("/load-lazy")
-async def load_event_list_lazy(
-    request: LoadEventListLazyRequest,
-    service: DataService = Depends(get_data_service),
-):
-    """Load an EventList using lazy loading for large files."""
-    return service.load_event_list_lazy(
-        file_path=request.file_path,
-        name=request.name,
-        fmt=request.fmt,
-        rmf_file=request.rmf_file,
-        additional_columns=request.additional_columns,
-        safety_margin=request.safety_margin,
-    )
-
-
-@router.post("/load-preview")
-async def load_event_list_preview(
-    request: LoadEventListPreviewRequest,
-    service: DataService = Depends(get_data_service),
-):
-    """Load only the first segment of a large file as a preview."""
-    return service.load_event_list_preview(
-        file_path=request.file_path,
-        name=request.name,
-        preview_duration=request.preview_duration,
-        fmt=request.fmt,
-    )
-
-
 @router.get("/{name}/full-preview")
 async def get_event_list_full_preview(
     name: str,
@@ -185,3 +175,66 @@ async def get_event_list_full_preview(
 ):
     """Get full preview of an EventList with all attributes."""
     return service.get_event_list_full_preview(name=name, time_limit=time_limit)
+
+
+# =========================================================================
+# PARTIAL LOADING ROUTES
+# These endpoints use FITSTimeseriesReader to load only a portion of the file
+# =========================================================================
+
+
+@router.post("/load-by-time-range")
+async def load_event_list_by_time_range(
+    request: LoadByTimeRangeRequest,
+    service: DataService = Depends(get_data_service),
+):
+    """
+    Load events within a specific time range using true lazy loading.
+
+    Uses FITSTimeseriesReader to load only events within the specified
+    time window without reading the entire file into memory.
+    """
+    return service.load_event_list_by_time_range(
+        file_path=request.file_path,
+        name=request.name,
+        start_time=request.start_time,
+        end_time=request.end_time,
+        fmt=request.fmt,
+    )
+
+
+@router.post("/load-by-event-count")
+async def load_event_list_by_event_count(
+    request: LoadByEventCountRequest,
+    service: DataService = Depends(get_data_service),
+):
+    """
+    Load a specific number of events using true lazy loading.
+
+    Uses FITSTimeseriesReader slicing to load only the requested events
+    without reading the entire file into memory.
+    """
+    return service.load_event_list_by_event_count(
+        file_path=request.file_path,
+        name=request.name,
+        start_index=request.start_index,
+        count=request.count,
+        fmt=request.fmt,
+    )
+
+
+@router.post("/metadata")
+async def get_file_metadata(
+    request: GetFileMetadataRequest,
+    service: DataService = Depends(get_data_service),
+):
+    """
+    Get metadata from a FITS file without loading the full data.
+
+    Returns file info, event count, time range, GTI, and loading recommendations
+    without loading any event data into memory.
+    """
+    return service.get_file_metadata(
+        file_path=request.file_path,
+        fmt=request.fmt,
+    )
