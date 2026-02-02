@@ -48,6 +48,59 @@ class DataService(BaseService):
     Handles loading, saving, and managing event lists without any UI dependencies.
     """
 
+    def _validate_gti(self, event_list: EventList) -> List[str]:
+        """
+        Validate GTI (Good Time Intervals) for an EventList.
+
+        Checks for:
+        - Empty or missing GTI
+        - Invalid GTI intervals (stop <= start)
+        - Events falling outside GTI boundaries
+
+        Args:
+            event_list: The EventList to validate
+
+        Returns:
+            List of warning messages (empty if no issues found)
+        """
+        warnings: List[str] = []
+
+        # Check 1: Empty or missing GTI
+        if event_list.gti is None or len(event_list.gti) == 0:
+            warnings.append("GTI is empty or missing - no valid observation intervals defined")
+            return warnings  # Can't do further checks without GTI
+
+        # Check 2: Invalid GTI intervals (stop <= start)
+        invalid_intervals = []
+        for i, (start, stop) in enumerate(event_list.gti):
+            if stop <= start:
+                invalid_intervals.append(i)
+        if invalid_intervals:
+            warnings.append(
+                f"Found {len(invalid_intervals)} invalid GTI interval(s) where stop <= start "
+                f"(indices: {invalid_intervals[:5]}{'...' if len(invalid_intervals) > 5 else ''})"
+            )
+
+        # Check 3: Events outside GTI boundaries
+        if event_list.time is not None and len(event_list.time) > 0:
+            times = event_list.time
+            gti = event_list.gti
+
+            # Check if each event falls within at least one GTI
+            inside_gti = np.zeros(len(times), dtype=bool)
+            for start, stop in gti:
+                inside_gti |= (times >= start) & (times <= stop)
+
+            events_outside = np.sum(~inside_gti)
+            if events_outside > 0:
+                total_events = len(times)
+                percent_outside = (events_outside / total_events) * 100
+                warnings.append(
+                    f"{events_outside} events ({percent_outside:.2f}%) fall outside GTI boundaries"
+                )
+
+        return warnings
+
     def load_event_list(
         self,
         file_path: str,
@@ -90,6 +143,9 @@ class DataService(BaseService):
             # Add to state manager
             self.state.add_event_data(name, event_list)
 
+            # Validate GTI and collect warnings
+            gti_warnings = self._validate_gti(event_list)
+
             # Prepare serializable summary (use helper for numpy type conversion)
             summary = {
                 "name": name,
@@ -101,12 +157,18 @@ class DataService(BaseService):
                 "has_energy": event_list.energy is not None,
                 "has_pi": event_list.pi is not None,
                 "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
+                "gti_warnings": gti_warnings if gti_warnings else None,
             }
+
+            # Build message with warnings if present
+            message = f"EventList '{name}' loaded successfully ({len(event_list.time)} events)"
+            if gti_warnings:
+                message += f" [GTI warnings: {len(gti_warnings)}]"
 
             return self.create_result(
                 success=True,
                 data=summary,
-                message=f"EventList '{name}' loaded successfully ({len(event_list.time)} events)",
+                message=message,
             )
 
         except Exception as e:
@@ -152,14 +214,19 @@ class DataService(BaseService):
                         tmp_file.write(chunk)
                 temp_filename = tmp_file.name
 
-            # Load the event list
-            event_list = EventList.read(temp_filename, fmt)
-
-            # Clean up temporary file
-            os.remove(temp_filename)
+            # Load the event list with guaranteed temp file cleanup
+            try:
+                event_list = EventList.read(temp_filename, fmt)
+            finally:
+                # Clean up temporary file even if loading fails
+                if os.path.exists(temp_filename):
+                    os.remove(temp_filename)
 
             # Add to state manager
             self.state.add_event_data(name, event_list)
+
+            # Validate GTI and collect warnings
+            gti_warnings = self._validate_gti(event_list)
 
             summary = {
                 "name": name,
@@ -168,12 +235,21 @@ class DataService(BaseService):
                     _to_python_float(event_list.time.min()),
                     _to_python_float(event_list.time.max())
                 ],
+                "has_energy": event_list.energy is not None,
+                "has_pi": event_list.pi is not None,
+                "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
+                "gti_warnings": gti_warnings if gti_warnings else None,
             }
+
+            # Build message with warnings if present
+            message = f"EventList '{name}' loaded successfully from URL"
+            if gti_warnings:
+                message += f" [GTI warnings: {len(gti_warnings)}]"
 
             return self.create_result(
                 success=True,
                 data=summary,
-                message=f"EventList '{name}' loaded successfully from URL",
+                message=message,
             )
 
         except requests.RequestException as e:
@@ -216,13 +292,20 @@ class DataService(BaseService):
 
             event_list = self.state.get_event_data(name)
 
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            # Ensure directory exists (handle case where file_path has no directory)
+            dirname = os.path.dirname(file_path)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
 
             # Save based on format
-            if fmt == "hdf5":
+            # For FITS formats, use to_astropy_table() for better OGIP compliance
+            # Stingray's direct write() may not preserve all metadata correctly
+            if fmt in ["fits", "ogip", "hea"]:
+                table = event_list.to_astropy_table()
+                table.write(file_path, format="fits", overwrite=True)
+            elif fmt == "hdf5":
                 event_list.to_astropy_table().write(
-                    file_path, format=fmt, path="data"
+                    file_path, format="hdf5", path="data", overwrite=True
                 )
             else:
                 event_list.write(file_path, fmt)
@@ -519,6 +602,9 @@ class DataService(BaseService):
             # Add to state manager
             self.state.add_event_data(name, event_list)
 
+            # Validate GTI and collect warnings
+            gti_warnings = self._validate_gti(event_list)
+
             # Determine loading method used
             method = "standard" if can_load_safe else "standard_risky"
 
@@ -533,6 +619,7 @@ class DataService(BaseService):
                 "has_energy": event_list.energy is not None,
                 "has_pi": event_list.pi is not None,
                 "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
+                "gti_warnings": gti_warnings if gti_warnings else None,
                 "loading_info": {
                     "method": method,
                     "file_size_mb": file_size_mb,
@@ -543,14 +630,20 @@ class DataService(BaseService):
                 },
             }
 
-            warning = ""
+            # Build message with all warnings
+            message = f"EventList '{name}' loaded via lazy loading ({len(event_list.time)} events)"
+            warnings_parts = []
             if not can_load_safe:
-                warning = " (Warning: Large file loaded despite memory risk)"
+                warnings_parts.append("memory risk")
+            if gti_warnings:
+                warnings_parts.append(f"GTI: {len(gti_warnings)}")
+            if warnings_parts:
+                message += f" [Warnings: {', '.join(warnings_parts)}]"
 
             return self.create_result(
                 success=True,
                 data=summary,
-                message=f"EventList '{name}' loaded via lazy loading ({len(event_list.time)} events){warning}",
+                message=message,
             )
 
         except MemoryError as e:
@@ -751,6 +844,9 @@ class DataService(BaseService):
         # Add to state manager
         self.state.add_event_data(name, event_list)
 
+        # Validate GTI and collect warnings
+        gti_warnings = self._validate_gti(event_list)
+
         # Calculate durations for info
         total_duration = float(np.sum(original_gti[:, 1] - original_gti[:, 0]))
         preview_actual_duration = float(preview_times.max() - preview_times.min()) if len(preview_times) > 1 else 0.0
@@ -765,6 +861,7 @@ class DataService(BaseService):
             "has_energy": preview_energy is not None,
             "has_pi": preview_pi is not None,
             "gti_count": 1,
+            "gti_warnings": gti_warnings if gti_warnings else None,
             "preview_info": {
                 "preview_duration": preview_duration,
                 "actual_duration": preview_actual_duration,
@@ -777,10 +874,15 @@ class DataService(BaseService):
             },
         }
 
+        # Build message with warnings if present
+        message = f"Preview loaded: '{name}' - First {preview_duration}s ({len(preview_times)} events of {total_events} total)"
+        if gti_warnings:
+            message += f" [GTI warnings: {len(gti_warnings)}]"
+
         return self.create_result(
             success=True,
             data=summary,
-            message=f"Preview loaded: '{name}' - First {preview_duration}s ({len(preview_times)} events of {total_events} total)",
+            message=message,
         )
 
     def _load_preview_generic(
@@ -841,6 +943,9 @@ class DataService(BaseService):
         # Add to state manager
         self.state.add_event_data(name, event_list)
 
+        # Validate GTI and collect warnings
+        gti_warnings = self._validate_gti(event_list)
+
         # Calculate durations
         total_duration = float(np.sum(original_gti[:, 1] - original_gti[:, 0]))
         preview_actual_duration = float(preview_times.max() - preview_times.min()) if len(preview_times) > 1 else 0.0
@@ -855,6 +960,7 @@ class DataService(BaseService):
             "has_energy": preview_energy is not None,
             "has_pi": preview_pi is not None,
             "gti_count": 1,
+            "gti_warnings": gti_warnings if gti_warnings else None,
             "preview_info": {
                 "preview_duration": preview_duration,
                 "actual_duration": preview_actual_duration,
@@ -867,10 +973,15 @@ class DataService(BaseService):
             },
         }
 
+        # Build message with warnings if present
+        message = f"Preview loaded: '{name}' - First {preview_duration}s ({len(preview_times)} events of {len(full_event_list.time)} total)"
+        if gti_warnings:
+            message += f" [GTI warnings: {len(gti_warnings)}]"
+
         return self.create_result(
             success=True,
             data=summary,
-            message=f"Preview loaded: '{name}' - First {preview_duration}s ({len(preview_times)} events of {len(full_event_list.time)} total)",
+            message=message,
         )
 
 

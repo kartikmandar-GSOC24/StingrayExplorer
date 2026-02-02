@@ -12,6 +12,7 @@ export interface EventListSummary {
   has_energy?: boolean;
   has_pi?: boolean;
   gti_count?: number;
+  gti_warnings?: string[] | null;
 }
 
 export interface EventListInfo extends EventListSummary {

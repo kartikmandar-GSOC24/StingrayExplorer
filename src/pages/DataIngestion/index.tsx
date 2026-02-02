@@ -945,6 +945,16 @@ const DataIngestionPage: React.FC = () => {
                         {eventList.has_pi && (
                           <Chip label="PI" size="small" color="secondary" variant="outlined" />
                         )}
+                        {eventList.gti_warnings && eventList.gti_warnings.length > 0 && (
+                          <Tooltip title={eventList.gti_warnings.join('\n')}>
+                            <Chip
+                              label={`${eventList.gti_warnings.length} GTI warning${eventList.gti_warnings.length > 1 ? 's' : ''}`}
+                              size="small"
+                              color="warning"
+                              icon={<WarningAmberIcon />}
+                            />
+                          </Tooltip>
+                        )}
                       </Box>
                     }
                     secondary={
