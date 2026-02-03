@@ -4,6 +4,27 @@
 
 import { create } from 'zustand';
 
+export interface ProcessResources {
+  memoryMb: number;
+  cpuPercent: number;
+}
+
+export interface AppResources {
+  // Individual process resources
+  backend: ProcessResources | null;
+  electronMain: ProcessResources | null;
+  electronRenderer: ProcessResources | null;
+  // Combined totals (what the app is actually using)
+  totalMemoryMb: number;
+  totalCpuPercent: number;
+  // System reference info
+  systemMemoryTotalMb: number;
+  systemMemoryAvailableMb: number;
+  // Calculated app percentage of system
+  appMemoryPercent: number;
+}
+
+// Legacy interface for backwards compatibility
 export interface SystemResources {
   cpuPercent: number;
   memoryUsedGb: number;
@@ -21,8 +42,10 @@ interface UIState {
   processingMessage: string;
   processingProgress: number | null; // null = indeterminate
 
-  // System resources
+  // System resources (legacy)
   systemResources: SystemResources | null;
+  // App-specific resources (new)
+  appResources: AppResources | null;
 
   // Notifications
   notifications: Notification[];
@@ -40,6 +63,7 @@ interface UIState {
   setProcessing: (isProcessing: boolean, message?: string, progress?: number | null) => void;
 
   setSystemResources: (resources: SystemResources | null) => void;
+  setAppResources: (resources: AppResources | null) => void;
 
   addNotification: (notification: Omit<Notification, 'id' | 'timestamp' | 'read'>) => void;
   markNotificationRead: (id: string) => void;
@@ -66,6 +90,7 @@ export const useUIStore = create<UIState>((set) => ({
   processingMessage: '',
   processingProgress: null,
   systemResources: null,
+  appResources: null,
   notifications: [],
   unreadNotificationCount: 0,
   searchOpen: false,
@@ -80,6 +105,7 @@ export const useUIStore = create<UIState>((set) => ({
     set({ isProcessing, processingMessage: message, processingProgress: progress }),
 
   setSystemResources: (resources) => set({ systemResources: resources }),
+  setAppResources: (resources) => set({ appResources: resources }),
 
   addNotification: (notification) => set((state) => {
     const newNotification: Notification = {

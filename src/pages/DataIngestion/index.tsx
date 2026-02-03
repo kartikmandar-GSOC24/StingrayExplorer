@@ -74,8 +74,8 @@ interface AlertState {
 }
 
 const DataIngestionPage: React.FC = () => {
-  // Global notification store
-  const { addNotification } = useUIStore();
+  // Global notification store and processing state
+  const { addNotification, setProcessing } = useUIStore();
 
   // Form state - Local File
   const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
@@ -298,6 +298,7 @@ const DataIngestionPage: React.FC = () => {
     }
 
     setIsLoading(true);
+    setProcessing(true, `Loading ${eventListName.trim()}...`);
     setAlert({ open: false, message: '', severity: 'info' });
 
     try {
@@ -372,6 +373,7 @@ const DataIngestionPage: React.FC = () => {
       showAlert(`Error: ${errorMessage}`, 'error', 'Load Error');
     } finally {
       setIsLoading(false);
+      setProcessing(false);
     }
   };
 
@@ -485,6 +487,7 @@ const DataIngestionPage: React.FC = () => {
     }
 
     setIsLoadingUrl(true);
+    setProcessing(true, `Fetching from URL...`);
     setAlert({ open: false, message: '', severity: 'info' });
 
     try {
@@ -513,6 +516,7 @@ const DataIngestionPage: React.FC = () => {
       showAlert(`Error: ${errorMessage}`, 'error', 'URL Load Error');
     } finally {
       setIsLoadingUrl(false);
+      setProcessing(false);
     }
   };
 
@@ -690,18 +694,27 @@ const DataIngestionPage: React.FC = () => {
                           Est. Memory: ~{fileSizeInfo.estimated_memory_mb.toFixed(0)} MB
                         </Typography>
                         <Typography variant="caption" color="text.secondary">
-                          Available RAM: {fileSizeInfo.memory_info.available_mb.toFixed(0)} MB ({(100 - fileSizeInfo.memory_info.percent).toFixed(0)}% free)
+                          Available RAM: {fileSizeInfo.memory_info.available_mb.toFixed(0)} MB
                         </Typography>
+                        {fileSizeInfo.ram_usage_percent !== undefined && (
+                          <Typography
+                            variant="caption"
+                            color={fileSizeInfo.ram_usage_percent > 50 ? 'error' : fileSizeInfo.ram_usage_percent > 30 ? 'warning.main' : 'success.main'}
+                            fontWeight="medium"
+                          >
+                            Would use {fileSizeInfo.ram_usage_percent.toFixed(0)}% of free RAM
+                          </Typography>
+                        )}
                       </Box>
                     )}
                     {fileSizeInfo.recommend_lazy && (
                       <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-                        Large file detected. Partial loading has been auto-enabled.
+                        Would use &gt;30% of available RAM. Partial loading auto-enabled.
                       </Typography>
                     )}
                     {fileSizeInfo.risk_level === 'critical' && (
                       <Typography variant="caption" color="error" sx={{ display: 'block', mt: 0.5 }}>
-                        Critical: File may be too large to load. Consider using Partial Loading.
+                        Critical: Would use &gt;80% of available RAM. Partial loading strongly recommended.
                       </Typography>
                     )}
                   </Box>

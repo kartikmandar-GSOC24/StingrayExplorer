@@ -79,6 +79,21 @@ export interface ElectronAPI {
   sendLog: (log: { level: 'info' | 'warn' | 'error' | 'debug'; message: string }) => void;
 
   signalLogReady: () => void;
+
+  // Resource Monitoring
+  getElectronResources: () => Promise<{
+    main: {
+      memory_mb: number;
+      heap_used_mb: number;
+      heap_total_mb: number;
+      cpu_percent?: number;
+    };
+    renderer: {
+      memory_mb: number;
+      cpu_percent: number;
+    } | null;
+    timestamp: number;
+  }>;
 }
 
 declare global {

@@ -15,11 +15,23 @@ cleanup() {
     echo "Cleaning up..."
     if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
         echo "Stopping backend (PID: $BACKEND_PID)..."
+        # Try graceful shutdown first
         kill "$BACKEND_PID" 2>/dev/null
-        wait "$BACKEND_PID" 2>/dev/null
+        # Wait up to 2 seconds for graceful shutdown
+        for i in {1..4}; do
+            sleep 0.5
+            if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+                break
+            fi
+        done
+        # Force kill if still running (e.g., stuck in I/O operation)
+        if kill -0 "$BACKEND_PID" 2>/dev/null; then
+            echo "Backend didn't stop gracefully, force killing..."
+            kill -9 "$BACKEND_PID" 2>/dev/null
+        fi
     fi
     # Also kill any orphaned python processes on our port range
-    pkill -f "python main.py" 2>/dev/null || true
+    pkill -9 -f "python main.py" 2>/dev/null || true
     echo "Cleanup complete."
     exit 0
 }

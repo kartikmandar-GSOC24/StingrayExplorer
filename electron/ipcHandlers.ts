@@ -230,4 +230,59 @@ export function setupIpcHandlers(getPythonManager: PythonManagerGetter): void {
   ipcMain.handle('clipboard:read', () => {
     return clipboard.readText();
   });
+
+  // ============================================
+  // Resource Monitoring Handlers
+  // ============================================
+
+  ipcMain.handle('resources:getElectronUsage', (event) => {
+    // Get main process metrics
+    const mainProcessMemory = process.memoryUsage();
+    const mainCpuUsage = process.cpuUsage();
+
+    // Get renderer process metrics
+    const window = BrowserWindow.fromWebContents(event.sender);
+    let rendererMetrics = null;
+
+    if (window) {
+      // Get all app metrics which includes renderer processes
+      const appMetrics = app.getAppMetrics();
+
+      // Find the renderer process for this window
+      const rendererPid = window.webContents.getOSProcessId();
+      const rendererProcess = appMetrics.find(m => m.pid === rendererPid);
+
+      if (rendererProcess) {
+        rendererMetrics = {
+          memory_mb: rendererProcess.memory.workingSetSize / (1024 * 1024),
+          cpu_percent: rendererProcess.cpu.percentCPUUsage,
+        };
+      }
+    }
+
+    // Main process metrics
+    const mainMetrics = {
+      memory_mb: mainProcessMemory.rss / (1024 * 1024),
+      heap_used_mb: mainProcessMemory.heapUsed / (1024 * 1024),
+      heap_total_mb: mainProcessMemory.heapTotal / (1024 * 1024),
+      // CPU usage is cumulative, convert to approximate percent
+      // Note: This is microseconds since process start, not a percentage
+      cpu_user_ms: mainCpuUsage.user / 1000,
+      cpu_system_ms: mainCpuUsage.system / 1000,
+    };
+
+    // Get main process CPU percentage from app metrics
+    const appMetrics = app.getAppMetrics();
+    const mainPid = process.pid;
+    const mainAppMetric = appMetrics.find(m => m.pid === mainPid);
+    if (mainAppMetric) {
+      mainMetrics['cpu_percent'] = mainAppMetric.cpu.percentCPUUsage;
+    }
+
+    return {
+      main: mainMetrics,
+      renderer: rendererMetrics,
+      timestamp: Date.now(),
+    };
+  });
 }

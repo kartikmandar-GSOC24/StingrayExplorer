@@ -48,6 +48,7 @@ export interface FileSizeInfo {
   risk_level: 'safe' | 'caution' | 'risky' | 'critical';
   recommend_lazy: boolean;
   estimated_memory_mb?: number;
+  ram_usage_percent?: number;
   memory_info?: MemoryInfo;
 }
 
@@ -78,7 +79,7 @@ export interface LoadingRecommendation {
   recommend_lazy: boolean;
   suggested_chunk_size: number | null;
   suggested_time_chunk: number | null;
-  strategy: 'full' | 'preview_first' | 'time_range' | 'chunked';
+  strategy: 'full' | 'time_range' | 'event_count';
 }
 
 export interface FileMetadata {

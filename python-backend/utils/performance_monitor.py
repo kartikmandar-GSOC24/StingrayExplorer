@@ -117,11 +117,15 @@ class PerformanceMonitor:
 
         Returns:
             Dictionary with CPU usage metrics
+
+        Note:
+            Using interval=0.1 for cpu_percent() to get accurate readings.
+            Without an interval, the first call returns 0.0 (psutil quirk).
         """
         try:
             return {
-                "process_percent": self._process.cpu_percent(),
-                "system_percent": psutil.cpu_percent(),
+                "process_percent": self._process.cpu_percent(interval=0.1),
+                "system_percent": psutil.cpu_percent(interval=None),
                 "cpu_count": psutil.cpu_count(),
             }
         except Exception:

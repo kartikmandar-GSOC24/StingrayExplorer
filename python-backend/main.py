@@ -5,6 +5,7 @@ FastAPI server providing REST API endpoints for X-ray timing analysis
 using the Stingray library.
 """
 
+import logging
 import os
 import signal
 import socket
@@ -18,6 +19,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from routes import data_routes, lightcurve_routes, spectrum_routes, timing_routes, export_routes
 from services.state_manager import StateManager
 from utils.performance_monitor import PerformanceMonitor
+
+
+# Filter to suppress /api/status access logs (polled every 2s, would flood logs)
+class StatusEndpointFilter(logging.Filter):
+    """Filter out /api/status requests from uvicorn access logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/api/status" not in record.getMessage()
 
 # Global instances
 state_manager: StateManager = None
@@ -99,24 +108,28 @@ def create_app() -> FastAPI:
 
     @app.get("/api/status")
     async def get_status():
-        """Get current application status including system resources."""
-        memory_usage = None
+        """Get current application status including process-specific resources."""
+        backend_resources = None
 
         if performance_monitor:
             mem_info = performance_monitor.get_memory_usage()
             cpu_info = performance_monitor.get_cpu_usage()
 
-            memory_usage = {
-                "memory_used_mb": mem_info.get("process_mb", 0),
-                "memory_total_mb": mem_info.get("system_total_gb", 0) * 1024,
-                "memory_percent": mem_info.get("system_percent", 0),
-                "cpu_percent": cpu_info.get("system_percent", 0),
+            backend_resources = {
+                # Process-specific metrics (Python backend only)
+                "memory_mb": mem_info.get("process_mb", 0),
+                "memory_percent": mem_info.get("process_percent", 0),
+                "cpu_percent": cpu_info.get("process_percent", 0),
+                # System totals (for reference and percentage calculations)
+                "system_memory_total_mb": mem_info.get("system_total_gb", 0) * 1024,
+                "system_memory_available_mb": mem_info.get("system_available_gb", 0) * 1024,
+                "system_cpu_count": cpu_info.get("cpu_count", 1),
             }
 
         return {
             "event_lists_loaded": len(state_manager.get_event_data()) if state_manager else 0,
             "lightcurves_loaded": len(state_manager.get_lightcurve_data()) if state_manager else 0,
-            "memory_usage": memory_usage,
+            "backend_resources": backend_resources,
         }
 
     @app.post("/api/shutdown")
@@ -141,6 +154,9 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
+
+    # Suppress /api/status access logs to avoid log flooding during polling
+    logging.getLogger("uvicorn.access").addFilter(StatusEndpointFilter())
 
     # Get port from environment or command line, or find a free one
     requested_port = os.environ.get("PORT") or (sys.argv[1] if len(sys.argv) > 1 else None)

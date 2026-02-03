@@ -471,27 +471,36 @@ class DataService(BaseService):
             return self.handle_error(e, "Listing event lists")
 
     def check_file_size(self, file_path: str) -> Dict[str, Any]:
-        """Check file size and provide loading recommendations."""
+        """Check file size and provide loading recommendations based on available RAM."""
         try:
             file_size = os.path.getsize(file_path)
             file_size_mb = file_size / (1024**2)
             file_size_gb = file_size / (1024**3)
 
-            # Determine risk level
-            if file_size_gb > 10:
-                risk_level = "critical"
-            elif file_size_gb > 5:
-                risk_level = "risky"
-            elif file_size_gb > 1:
-                risk_level = "caution"
-            else:
-                risk_level = "safe"
-
-            recommend_lazy = file_size_gb > 1.0 or risk_level in ["caution", "risky", "critical"]
-
-            # Get memory info
+            # Get memory info first - we need this for smart recommendations
             memory_info = self._get_memory_info()
+            available_ram_mb = memory_info["available_mb"]
+
+            # Estimate memory needed to load the EventList
+            # FITS files typically expand to ~3x file size in memory
             estimated_memory_mb = self._estimate_memory_usage(file_size, "fits") / (1024**2)
+
+            # Calculate what percentage of available RAM this would use
+            ram_usage_percent = (estimated_memory_mb / available_ram_mb) * 100 if available_ram_mb > 0 else 100
+
+            # Determine risk level based on RAM usage percentage
+            # This is smarter than just file size - adapts to user's system
+            if ram_usage_percent > 80:
+                risk_level = "critical"  # Would use >80% of available RAM
+            elif ram_usage_percent > 50:
+                risk_level = "risky"     # Would use >50% of available RAM
+            elif ram_usage_percent > 30:
+                risk_level = "caution"   # Would use >30% of available RAM
+            else:
+                risk_level = "safe"      # Would use <30% of available RAM
+
+            # Recommend lazy loading if it would use more than 30% of available RAM
+            recommend_lazy = ram_usage_percent > 30
 
             return self.create_result(
                 success=True,
@@ -502,9 +511,10 @@ class DataService(BaseService):
                     "risk_level": risk_level,
                     "recommend_lazy": recommend_lazy,
                     "estimated_memory_mb": estimated_memory_mb,
+                    "ram_usage_percent": round(ram_usage_percent, 1),
                     "memory_info": memory_info,
                 },
-                message=f"File size: {file_size_mb:.2f} MB, Risk: {risk_level}",
+                message=f"File size: {file_size_mb:.2f} MB, Est. RAM usage: {ram_usage_percent:.1f}% of available",
             )
 
         except Exception as e:
@@ -1072,40 +1082,76 @@ class DataService(BaseService):
             file_size_mb = file_size / (1024**2)
             file_size_gb = file_size / (1024**3)
 
-            # Create reader for metadata access
-            reader = FITSTimeseriesReader(
-                file_path, output_class=EventList, data_kind="events"
-            )
+            # Read metadata directly from FITS headers - NO full data loading!
+            # This is much faster than using FITSTimeseriesReader for large files
+            total_events = 0
+            time_min = None
+            time_max = None
+            available_columns = []
+            mjdref = 0.0
+            mission = None
+            instr = None
+            original_gti = None
 
-            # Get GTI and other metadata
-            original_gti = reader.gti
-            mjdref = getattr(reader, 'mjdref', 0.0)
-            mission = getattr(reader, 'mission', None)
-            instr = getattr(reader, 'instr', None)
+            with fits.open(file_path) as hdulist:
+                # Find the EVENTS or EVT extension
+                events_hdu = None
+                for hdu in hdulist:
+                    if hdu.name.upper() in ['EVENTS', 'EVT']:
+                        events_hdu = hdu
+                        break
 
-            # Get time data efficiently
-            times_reader = FITSTimeseriesReader(file_path, data_kind="times")
-            all_times = times_reader[:]
-            total_events = len(all_times)
+                if events_hdu is not None:
+                    # Get row count from header (NAXIS2) - no data loading!
+                    total_events = events_hdu.header.get('NAXIS2', 0)
+                    available_columns = [col.name for col in events_hdu.columns]
 
-            # Calculate time statistics
-            time_min = _to_python_float(all_times.min()) if total_events > 0 else None
-            time_max = _to_python_float(all_times.max()) if total_events > 0 else None
-            duration = _to_python_float(all_times.max() - all_times.min()) if total_events > 1 else 0.0
+                    # Get MJDREF from header
+                    mjdref = events_hdu.header.get('MJDREF', 0.0)
+                    if mjdref == 0.0:
+                        # Some files split MJDREF into integer and fractional parts
+                        mjdrefi = events_hdu.header.get('MJDREFI', 0)
+                        mjdreff = events_hdu.header.get('MJDREFF', 0.0)
+                        mjdref = mjdrefi + mjdreff
+
+                    # Get mission/instrument from header
+                    mission = events_hdu.header.get('TELESCOP', None) or events_hdu.header.get('MISSION', None)
+                    instr = events_hdu.header.get('INSTRUME', None)
+
+                    # Get time range from header keywords if available (fast!)
+                    tstart = events_hdu.header.get('TSTART', None)
+                    tstop = events_hdu.header.get('TSTOP', None)
+
+                    if tstart is not None and tstop is not None:
+                        time_min = float(tstart)
+                        time_max = float(tstop)
+                    elif total_events > 0:
+                        # Fallback: read only first and last few rows (much faster than full load)
+                        time_col = events_hdu.data['TIME']
+                        time_min = float(time_col[0])
+                        time_max = float(time_col[-1])
+
+                # Read GTI extension (usually small, OK to load fully)
+                gti_hdu = None
+                for hdu in hdulist:
+                    if hdu.name.upper() in ['GTI', 'STDGTI']:
+                        gti_hdu = hdu
+                        break
+
+                if gti_hdu is not None and gti_hdu.data is not None:
+                    start_col = gti_hdu.data['START'] if 'START' in gti_hdu.columns.names else None
+                    stop_col = gti_hdu.data['STOP'] if 'STOP' in gti_hdu.columns.names else None
+                    if start_col is not None and stop_col is not None:
+                        original_gti = np.column_stack([start_col, stop_col])
+
+            # Calculate duration
+            duration = (time_max - time_min) if (time_min is not None and time_max is not None) else 0.0
 
             # GTI info
             gti_count = len(original_gti) if original_gti is not None else 0
             total_gti_time = None
             if original_gti is not None and len(original_gti) > 0:
                 total_gti_time = float(np.sum(original_gti[:, 1] - original_gti[:, 0]))
-
-            # Get available columns from FITS file
-            available_columns = []
-            with fits.open(file_path) as hdulist:
-                for hdu in hdulist:
-                    if hdu.name.upper() in ['EVENTS', 'EVT']:
-                        available_columns = [col.name for col in hdu.columns]
-                        break
 
             # Determine risk level for loading
             if file_size_gb > 10:
@@ -1162,9 +1208,14 @@ class DataService(BaseService):
         Recommend a loading strategy based on file characteristics.
 
         Returns recommendations for how to load the file efficiently.
+
+        Strategies:
+        - 'full': Safe to load the entire file
+        - 'time_range': Use partial loading by time range
+        - 'event_count': Use partial loading by event count (for very large files)
         """
         recommendations = {
-            "can_load_full": risk_level in ["safe", "caution"],
+            "can_load_full": risk_level in ["safe"],
             "recommend_lazy": risk_level in ["caution", "risky", "critical"],
             "suggested_chunk_size": None,
             "suggested_time_chunk": None,
@@ -1172,18 +1223,22 @@ class DataService(BaseService):
         }
 
         if risk_level == "critical":
-            recommendations["strategy"] = "chunked"
-            recommendations["suggested_chunk_size"] = min(100000, total_events // 10)
+            # Very large file (>10GB) - must use partial loading
+            recommendations["strategy"] = "event_count"
+            recommendations["suggested_chunk_size"] = min(100000, max(1000, total_events // 10))
             recommendations["suggested_time_chunk"] = 100.0  # seconds
         elif risk_level == "risky":
+            # Large file (5-10GB) - strongly recommend partial loading
             recommendations["strategy"] = "time_range"
-            recommendations["suggested_chunk_size"] = min(500000, total_events // 5)
+            recommendations["suggested_chunk_size"] = min(500000, max(10000, total_events // 5))
             recommendations["suggested_time_chunk"] = 500.0
         elif risk_level == "caution":
-            recommendations["strategy"] = "preview_first"
-            recommendations["suggested_chunk_size"] = min(1000000, total_events // 2)
+            # Medium file (1-5GB) - partial loading recommended
+            recommendations["strategy"] = "time_range"
+            recommendations["suggested_chunk_size"] = min(1000000, max(50000, total_events // 2))
             recommendations["suggested_time_chunk"] = 1000.0
         else:
+            # Small file (<1GB) - safe to load fully
             recommendations["strategy"] = "full"
 
         return recommendations

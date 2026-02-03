@@ -206,6 +206,27 @@ const electronAPI = {
   signalLogReady: (): void => {
     ipcRenderer.send('log:rendererReady');
   },
+
+  // ============================================
+  // Resource Monitoring
+  // ============================================
+
+  /**
+   * Get Electron process resource usage (main + renderer)
+   */
+  getElectronResources: (): Promise<{
+    main: {
+      memory_mb: number;
+      heap_used_mb: number;
+      heap_total_mb: number;
+      cpu_percent?: number;
+    };
+    renderer: {
+      memory_mb: number;
+      cpu_percent: number;
+    } | null;
+    timestamp: number;
+  }> => ipcRenderer.invoke('resources:getElectronUsage'),
 };
 
 // Expose the API to the renderer process

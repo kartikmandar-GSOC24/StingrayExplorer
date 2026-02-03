@@ -20,8 +20,6 @@ import {
   DialogActions,
   Button,
   Popover,
-  Stack,
-  Slider,
   Chip,
   Link,
 } from '@mui/material';
@@ -41,7 +39,7 @@ import StorageIcon from '@mui/icons-material/Storage';
 import GitHubIcon from '@mui/icons-material/GitHub';
 import MenuBookIcon from '@mui/icons-material/MenuBook';
 import ForumIcon from '@mui/icons-material/Forum';
-import { useUIStore, Notification } from '@/store/uiStore';
+import { useUIStore, Notification, AppResources } from '@/store/uiStore';
 import { useLogStore } from '@/store/logStore';
 import { useBackendContext } from '@/App';
 
@@ -67,8 +65,8 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
     markNotificationRead,
     clearNotifications,
     addNotification,
-    systemResources,
-    setSystemResources,
+    appResources,
+    setAppResources,
   } = useUIStore();
 
   const { togglePanel: toggleLogPanel, isOpen: logPanelOpen } = useLogStore();
@@ -89,8 +87,6 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
 
   // Resource monitoring state
   const [monitoringActive, setMonitoringActive] = useState<boolean>(false);
-  const [maxCpuThreads, setMaxCpuThreads] = useState<number>(4);
-  const [maxRamGb, setMaxRamGb] = useState<number>(8);
 
   // Get app version on mount
   useEffect(() => {
@@ -103,25 +99,87 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
     getVersion();
   }, []);
 
-  // Fetch system resources from backend
+  // Fetch app-specific resources from backend AND Electron
   const fetchResources = async (): Promise<void> => {
-    if (!backendReady || !backendPort) return;
-
     try {
-      const response = await fetch(`http://127.0.0.1:${backendPort}/api/status`);
-      if (response.ok) {
-        const data = await response.json();
-        if (data.memory_usage) {
-          setSystemResources({
-            cpuPercent: data.memory_usage.cpu_percent || 0,
-            memoryUsedGb: (data.memory_usage.memory_used_mb || 0) / 1024,
-            memoryTotalGb: (data.memory_usage.memory_total_mb || 0) / 1024,
-            memoryPercent: data.memory_usage.memory_percent || 0,
-          });
+      // Fetch backend resources
+      let backendRes = null;
+      let systemMemoryTotalMb = 16 * 1024; // Default 16GB
+      let systemMemoryAvailableMb = 8 * 1024; // Default 8GB
+
+      if (backendReady && backendPort) {
+        try {
+          const response = await fetch(`http://127.0.0.1:${backendPort}/api/status`);
+          if (response.ok) {
+            const data = await response.json();
+            if (data.backend_resources) {
+              backendRes = {
+                memoryMb: data.backend_resources.memory_mb || 0,
+                cpuPercent: data.backend_resources.cpu_percent || 0,
+              };
+              systemMemoryTotalMb = data.backend_resources.system_memory_total_mb || systemMemoryTotalMb;
+              systemMemoryAvailableMb = data.backend_resources.system_memory_available_mb || systemMemoryAvailableMb;
+            }
+          }
+        } catch {
+          // Backend might not be ready
         }
       }
+
+      // Fetch Electron resources
+      let electronMainRes = null;
+      let electronRendererRes = null;
+
+      if (window.electronAPI) {
+        try {
+          const electronRes = await window.electronAPI.getElectronResources();
+          if (electronRes.main) {
+            electronMainRes = {
+              memoryMb: electronRes.main.memory_mb || 0,
+              cpuPercent: electronRes.main.cpu_percent || 0,
+            };
+          }
+          if (electronRes.renderer) {
+            electronRendererRes = {
+              memoryMb: electronRes.renderer.memory_mb || 0,
+              cpuPercent: electronRes.renderer.cpu_percent || 0,
+            };
+          }
+        } catch {
+          // Electron API might not be available
+        }
+      }
+
+      // Calculate totals
+      const totalMemoryMb =
+        (backendRes?.memoryMb || 0) +
+        (electronMainRes?.memoryMb || 0) +
+        (electronRendererRes?.memoryMb || 0);
+
+      const totalCpuPercent =
+        (backendRes?.cpuPercent || 0) +
+        (electronMainRes?.cpuPercent || 0) +
+        (electronRendererRes?.cpuPercent || 0);
+
+      // Calculate app percentage of system memory
+      const appMemoryPercent = systemMemoryTotalMb > 0
+        ? (totalMemoryMb / systemMemoryTotalMb) * 100
+        : 0;
+
+      const combined: AppResources = {
+        backend: backendRes,
+        electronMain: electronMainRes,
+        electronRenderer: electronRendererRes,
+        totalMemoryMb,
+        totalCpuPercent,
+        systemMemoryTotalMb,
+        systemMemoryAvailableMb,
+        appMemoryPercent,
+      };
+
+      setAppResources(combined);
     } catch {
-      // Backend might not be ready
+      // Error fetching resources
     }
   };
 
@@ -130,7 +188,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
     if (!monitoringActive) return;
 
     fetchResources();
-    const interval = setInterval(fetchResources, 10000);
+    const interval = setInterval(fetchResources, 2000); // Poll every 2 seconds
     return () => clearInterval(interval);
   }, [monitoringActive, backendReady, backendPort]);
 
@@ -187,10 +245,11 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
   };
 
   const getResourceColor = (): 'success' | 'warning' | 'error' | 'default' => {
-    if (!systemResources || !monitoringActive) return 'default';
-    const memPercent = systemResources.memoryPercent;
-    if (memPercent > 90) return 'error';
-    if (memPercent > 70) return 'warning';
+    if (!appResources || !monitoringActive) return 'default';
+    // Use app's percentage of system memory
+    const memPercent = appResources.appMemoryPercent;
+    if (memPercent > 50) return 'error';    // App using >50% of system RAM
+    if (memPercent > 25) return 'warning';  // App using >25% of system RAM
     return 'success';
   };
 
@@ -373,10 +432,10 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
         onClose={() => setResourcesAnchor(null)}
         anchorOrigin={{ vertical: 'center', horizontal: 'left' }}
         transformOrigin={{ vertical: 'center', horizontal: 'right' }}
-        PaperProps={{ sx: { width: 300, p: 2 } }}
+        PaperProps={{ sx: { width: 340, p: 2 } }}
       >
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-          <Typography variant="subtitle2">System Resources</Typography>
+          <Typography variant="subtitle2">App Resources</Typography>
           <Chip
             label={monitoringActive ? 'Active' : 'Paused'}
             size="small"
@@ -386,21 +445,71 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
           />
         </Box>
 
-        {monitoringActive && systemResources ? (
-          <Box sx={{ mb: 2, p: 1.5, bgcolor: 'action.hover', borderRadius: 1 }}>
-            <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 1 }}>
-              <Typography variant="body2">CPU</Typography>
-              <Typography variant="body2" fontWeight="medium">
-                {systemResources.cpuPercent.toFixed(1)}%
+        {monitoringActive && appResources ? (
+          <Box sx={{ mb: 2 }}>
+            {/* Total App Usage */}
+            <Box sx={{ p: 1.5, bgcolor: 'primary.50', borderRadius: 1, mb: 1.5, border: '1px solid', borderColor: 'primary.200' }}>
+              <Typography variant="caption" color="primary.main" fontWeight="bold" sx={{ display: 'block', mb: 1 }}>
+                TOTAL APP USAGE
               </Typography>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.5 }}>
+                <Typography variant="body2">Memory</Typography>
+                <Typography variant="body2" fontWeight="medium">
+                  {appResources.totalMemoryMb >= 1024
+                    ? `${(appResources.totalMemoryMb / 1024).toFixed(2)} GB`
+                    : `${appResources.totalMemoryMb.toFixed(0)} MB`}
+                  <Typography component="span" variant="caption" color="text.secondary" sx={{ ml: 0.5 }}>
+                    ({appResources.appMemoryPercent.toFixed(1)}% of system)
+                  </Typography>
+                </Typography>
+              </Box>
+              <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
+                <Typography variant="body2">CPU</Typography>
+                <Typography variant="body2" fontWeight="medium">
+                  {appResources.totalCpuPercent.toFixed(1)}%
+                </Typography>
+              </Box>
             </Box>
-            <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
-              <Typography variant="body2">RAM</Typography>
-              <Typography variant="body2" fontWeight="medium">
-                {systemResources.memoryUsedGb.toFixed(1)} / {systemResources.memoryTotalGb.toFixed(0)} GB
-                ({systemResources.memoryPercent.toFixed(1)}%)
-              </Typography>
+
+            {/* Breakdown by Process */}
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+              Breakdown by Process
+            </Typography>
+            <Box sx={{ p: 1, bgcolor: 'action.hover', borderRadius: 1 }}>
+              {/* Python Backend */}
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 0.5 }}>
+                <Typography variant="caption" color="text.secondary">Python Backend</Typography>
+                <Typography variant="caption" fontWeight="medium">
+                  {appResources.backend
+                    ? `${appResources.backend.memoryMb.toFixed(0)} MB | ${appResources.backend.cpuPercent.toFixed(1)}%`
+                    : 'N/A'}
+                </Typography>
+              </Box>
+              {/* Electron Main */}
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 0.5 }}>
+                <Typography variant="caption" color="text.secondary">Electron Main</Typography>
+                <Typography variant="caption" fontWeight="medium">
+                  {appResources.electronMain
+                    ? `${appResources.electronMain.memoryMb.toFixed(0)} MB | ${appResources.electronMain.cpuPercent.toFixed(1)}%`
+                    : 'N/A'}
+                </Typography>
+              </Box>
+              {/* Electron Renderer */}
+              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <Typography variant="caption" color="text.secondary">Electron Renderer</Typography>
+                <Typography variant="caption" fontWeight="medium">
+                  {appResources.electronRenderer
+                    ? `${appResources.electronRenderer.memoryMb.toFixed(0)} MB | ${appResources.electronRenderer.cpuPercent.toFixed(1)}%`
+                    : 'N/A'}
+                </Typography>
+              </Box>
             </Box>
+
+            {/* System Info */}
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1.5 }}>
+              System: {(appResources.systemMemoryTotalMb / 1024).toFixed(0)} GB total |{' '}
+              {(appResources.systemMemoryAvailableMb / 1024).toFixed(1)} GB available
+            </Typography>
           </Box>
         ) : (
           <Box sx={{ mb: 2, p: 1.5, bgcolor: 'action.hover', borderRadius: 1, textAlign: 'center' }}>
@@ -410,43 +519,6 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
           </Box>
         )}
 
-        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
-          Resource Limits (for analysis tasks)
-        </Typography>
-
-        <Stack spacing={2}>
-          <Box>
-            <Typography variant="body2" gutterBottom>
-              Max CPU Threads: {maxCpuThreads}
-            </Typography>
-            <Slider
-              value={maxCpuThreads}
-              onChange={(_, value) => setMaxCpuThreads(value as number)}
-              step={1}
-              marks
-              min={1}
-              max={16}
-              size="small"
-              valueLabelDisplay="auto"
-            />
-          </Box>
-
-          <Box>
-            <Typography variant="body2" gutterBottom>
-              Max RAM (GB): {maxRamGb}
-            </Typography>
-            <Slider
-              value={maxRamGb}
-              onChange={(_, value) => setMaxRamGb(value as number)}
-              step={1}
-              marks
-              min={1}
-              max={32}
-              size="small"
-              valueLabelDisplay="auto"
-            />
-          </Box>
-        </Stack>
       </Popover>
 
       {/* Notifications Menu */}
