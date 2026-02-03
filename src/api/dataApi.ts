@@ -13,6 +13,7 @@ export interface EventListSummary {
   has_pi?: boolean;
   gti_count?: number;
   gti_warnings?: string[] | null;
+  stingray_warnings?: string[] | null;
 }
 
 export interface EventListInfo extends EventListSummary {
@@ -99,6 +100,124 @@ export interface FileMetadata {
   available_columns: string[];
   recommended_loading: LoadingRecommendation;
 }
+
+// Batch loading types
+export interface SingleFileConfig {
+  file_path: string;
+  name: string;
+  fmt?: string;
+  rmf_file?: string;
+  additional_columns?: string[];
+  high_precision?: boolean;
+  skip_checks?: boolean;
+  use_partial_loading?: boolean;
+  partial_mode?: 'time_range' | 'event_count';
+  time_range_start?: number;
+  time_range_end?: number;
+  event_start_index?: number;
+  event_count?: number;
+}
+
+export interface BatchLoadRequest {
+  files: SingleFileConfig[];
+  use_same_settings: boolean;
+  // Shared settings (used when use_same_settings=true)
+  shared_fmt?: string;
+  shared_rmf_file?: string;
+  shared_additional_columns?: string[];
+  shared_high_precision?: boolean;
+  shared_skip_checks?: boolean;
+  shared_use_partial_loading?: boolean;
+  shared_partial_mode?: 'time_range' | 'event_count';
+  shared_time_range_start?: number;
+  shared_time_range_end?: number;
+  shared_event_start_index?: number;
+  shared_event_count?: number;
+}
+
+export interface BatchLoadSuccessItem {
+  name: string;
+  file_path: string;
+  data: EventListSummary | null;
+  message?: string;
+}
+
+export interface BatchLoadFailedItem {
+  name: string;
+  file_path: string;
+  error: string;
+}
+
+export interface BatchLoadSummary {
+  total_files: number;
+  success_count: number;
+  failure_count: number;
+  total_events_loaded: number;
+  total_time_ms: number;
+  workers_used: number;
+}
+
+export interface BatchLoadResult {
+  successful: BatchLoadSuccessItem[];
+  failed: BatchLoadFailedItem[];
+  summary: BatchLoadSummary;
+}
+
+export interface BatchFileSizeInfo {
+  file_path: string;
+  file_name: string;
+  size_mb: number;
+  estimated_ram_mb: number;
+  ram_percent: number;
+  risk_level: 'safe' | 'caution' | 'risky' | 'critical';
+  error?: string;
+}
+
+export interface BatchSizeTotals {
+  size_mb: number;
+  estimated_ram_mb: number;
+  ram_percent: number;
+  risk_level: 'safe' | 'caution' | 'risky' | 'critical';
+}
+
+export interface BatchSizeResult {
+  files: BatchFileSizeInfo[];
+  total: BatchSizeTotals;
+  available_ram_mb: number;
+  file_count: number;
+  recommend_partial_loading: boolean;
+}
+
+// SSE Streaming types for batch loading
+export interface BatchStreamEventFileComplete {
+  type: 'file_complete';
+  name: string;
+  file_path: string;
+  success: boolean;
+  completed: number;
+  total: number;
+  data?: EventListSummary;
+  error?: string;
+}
+
+export interface BatchStreamEventComplete {
+  type: 'complete';
+  total_time_ms: number;
+  success_count: number;
+  failure_count: number;
+  total_events: number;
+  workers_used: number;
+}
+
+export interface BatchStreamEventError {
+  type: 'error';
+  error: string;
+}
+
+export type BatchStreamEvent =
+  | BatchStreamEventFileComplete
+  | BatchStreamEventComplete
+  | BatchStreamEventError;
 
 export interface EventListFullPreview {
   name: string;
@@ -303,6 +422,137 @@ export const dataApi = {
       file_path: params.file_path,
       fmt: params.fmt || 'ogip',
     });
+  },
+
+  // =========================================================================
+  // BATCH LOADING API FUNCTIONS
+  // Load multiple files in parallel
+  // =========================================================================
+
+  /**
+   * Check sizes of multiple files and estimate total memory usage.
+   * Returns per-file and total memory estimates with risk levels.
+   */
+  async checkBatchFileSize(
+    file_paths: string[]
+  ): Promise<ApiResponse<BatchSizeResult>> {
+    return apiClient.post('/api/data/check-batch-size', { file_paths });
+  },
+
+  /**
+   * Load multiple EventLists in parallel using threads.
+   *
+   * @param params.files - Array of file configurations
+   * @param params.use_same_settings - If true, use shared_* settings for all files
+   * @param params.shared_* - Shared settings applied when use_same_settings=true
+   */
+  async loadBatchEventLists(
+    params: BatchLoadRequest
+  ): Promise<ApiResponse<BatchLoadResult>> {
+    return apiClient.post('/api/data/load-batch', {
+      files: params.files,
+      use_same_settings: params.use_same_settings,
+      shared_fmt: params.shared_fmt || 'ogip',
+      shared_rmf_file: params.shared_rmf_file,
+      shared_additional_columns: params.shared_additional_columns,
+      shared_high_precision: params.shared_high_precision || false,
+      shared_skip_checks: params.shared_skip_checks || false,
+      shared_use_partial_loading: params.shared_use_partial_loading || false,
+      shared_partial_mode: params.shared_partial_mode || 'time_range',
+      shared_time_range_start: params.shared_time_range_start,
+      shared_time_range_end: params.shared_time_range_end,
+      shared_event_start_index: params.shared_event_start_index,
+      shared_event_count: params.shared_event_count,
+    });
+  },
+
+  /**
+   * Load multiple EventLists with SSE streaming for real-time progress.
+   *
+   * This function returns an async generator that yields BatchStreamEvent
+   * objects as each file completes loading. This allows the UI to update
+   * immediately when each file finishes rather than waiting for all files.
+   *
+   * @param params - Same parameters as loadBatchEventLists
+   * @yields BatchStreamEvent - Events for each file completion and final summary
+   */
+  async *loadBatchEventListsSSE(
+    params: BatchLoadRequest
+  ): AsyncGenerator<BatchStreamEvent, void, unknown> {
+    const port = await apiClient.getPort();
+    const url = `http://localhost:${port}/api/data/load-batch-stream`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        files: params.files,
+        use_same_settings: params.use_same_settings,
+        shared_fmt: params.shared_fmt || 'ogip',
+        shared_rmf_file: params.shared_rmf_file,
+        shared_additional_columns: params.shared_additional_columns,
+        shared_high_precision: params.shared_high_precision || false,
+        shared_skip_checks: params.shared_skip_checks || false,
+        shared_use_partial_loading: params.shared_use_partial_loading || false,
+        shared_partial_mode: params.shared_partial_mode || 'time_range',
+        shared_time_range_start: params.shared_time_range_start,
+        shared_time_range_end: params.shared_time_range_end,
+        shared_event_start_index: params.shared_event_start_index,
+        shared_event_count: params.shared_event_count,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('No response body available for streaming');
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE format: "data: {...}\n\n"
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || ''; // Keep incomplete chunk
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const jsonStr = line.slice(6);
+            try {
+              const event = JSON.parse(jsonStr) as BatchStreamEvent;
+              yield event;
+            } catch (parseError) {
+              console.error('Failed to parse SSE event:', parseError, jsonStr);
+            }
+          }
+        }
+      }
+
+      // Process any remaining data in the buffer
+      if (buffer.trim() && buffer.startsWith('data: ')) {
+        const jsonStr = buffer.slice(6).trim();
+        if (jsonStr) {
+          try {
+            const event = JSON.parse(jsonStr) as BatchStreamEvent;
+            yield event;
+          } catch (parseError) {
+            console.error('Failed to parse final SSE event:', parseError, jsonStr);
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
   },
 };
 

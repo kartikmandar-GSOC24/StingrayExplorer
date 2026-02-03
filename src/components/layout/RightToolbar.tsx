@@ -106,6 +106,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
       let backendRes = null;
       let systemMemoryTotalMb = 16 * 1024; // Default 16GB
       let systemMemoryAvailableMb = 8 * 1024; // Default 8GB
+      let systemCpuCount = 1; // Default to 1 core
 
       if (backendReady && backendPort) {
         try {
@@ -119,6 +120,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
               };
               systemMemoryTotalMb = data.backend_resources.system_memory_total_mb || systemMemoryTotalMb;
               systemMemoryAvailableMb = data.backend_resources.system_memory_available_mb || systemMemoryAvailableMb;
+              systemCpuCount = data.backend_resources.system_cpu_count || systemCpuCount;
             }
           }
         } catch {
@@ -156,6 +158,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
         (electronMainRes?.memoryMb || 0) +
         (electronRendererRes?.memoryMb || 0);
 
+      // Raw CPU sum (can exceed 100% on multi-core systems)
       const totalCpuPercent =
         (backendRes?.cpuPercent || 0) +
         (electronMainRes?.cpuPercent || 0) +
@@ -166,6 +169,12 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
         ? (totalMemoryMb / systemMemoryTotalMb) * 100
         : 0;
 
+      // Normalize CPU to total system capacity (0-100%)
+      // e.g., 200% on 8 cores = 25% of total system CPU
+      const appCpuPercent = systemCpuCount > 0
+        ? totalCpuPercent / systemCpuCount
+        : 0;
+
       const combined: AppResources = {
         backend: backendRes,
         electronMain: electronMainRes,
@@ -174,7 +183,9 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
         totalCpuPercent,
         systemMemoryTotalMb,
         systemMemoryAvailableMb,
+        systemCpuCount,
         appMemoryPercent,
+        appCpuPercent,
       };
 
       setAppResources(combined);
@@ -246,10 +257,12 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
 
   const getResourceColor = (): 'success' | 'warning' | 'error' | 'default' => {
     if (!appResources || !monitoringActive) return 'default';
-    // Use app's percentage of system memory
+    // Use app's percentage of system memory and CPU (whichever is higher)
     const memPercent = appResources.appMemoryPercent;
-    if (memPercent > 50) return 'error';    // App using >50% of system RAM
-    if (memPercent > 25) return 'warning';  // App using >25% of system RAM
+    const cpuPercent = appResources.appCpuPercent;
+    const maxPercent = Math.max(memPercent, cpuPercent);
+    if (maxPercent > 50) return 'error';    // App using >50% of system resources
+    if (maxPercent > 25) return 'warning';  // App using >25% of system resources
     return 'success';
   };
 
@@ -466,7 +479,10 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
               <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
                 <Typography variant="body2">CPU</Typography>
                 <Typography variant="body2" fontWeight="medium">
-                  {appResources.totalCpuPercent.toFixed(1)}%
+                  {appResources.appCpuPercent.toFixed(1)}%
+                  <Typography component="span" variant="caption" color="text.secondary" sx={{ ml: 0.5 }}>
+                    ({appResources.systemCpuCount} cores)
+                  </Typography>
                 </Typography>
               </Box>
             </Box>
@@ -481,7 +497,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
                 <Typography variant="caption" color="text.secondary">Python Backend</Typography>
                 <Typography variant="caption" fontWeight="medium">
                   {appResources.backend
-                    ? `${appResources.backend.memoryMb.toFixed(0)} MB | ${appResources.backend.cpuPercent.toFixed(1)}%`
+                    ? `${appResources.backend.memoryMb.toFixed(0)} MB | ${(appResources.backend.cpuPercent / appResources.systemCpuCount).toFixed(1)}%`
                     : 'N/A'}
                 </Typography>
               </Box>
@@ -490,7 +506,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
                 <Typography variant="caption" color="text.secondary">Electron Main</Typography>
                 <Typography variant="caption" fontWeight="medium">
                   {appResources.electronMain
-                    ? `${appResources.electronMain.memoryMb.toFixed(0)} MB | ${appResources.electronMain.cpuPercent.toFixed(1)}%`
+                    ? `${appResources.electronMain.memoryMb.toFixed(0)} MB | ${(appResources.electronMain.cpuPercent / appResources.systemCpuCount).toFixed(1)}%`
                     : 'N/A'}
                 </Typography>
               </Box>
@@ -499,7 +515,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
                 <Typography variant="caption" color="text.secondary">Electron Renderer</Typography>
                 <Typography variant="caption" fontWeight="medium">
                   {appResources.electronRenderer
-                    ? `${appResources.electronRenderer.memoryMb.toFixed(0)} MB | ${appResources.electronRenderer.cpuPercent.toFixed(1)}%`
+                    ? `${appResources.electronRenderer.memoryMb.toFixed(0)} MB | ${(appResources.electronRenderer.cpuPercent / appResources.systemCpuCount).toFixed(1)}%`
                     : 'N/A'}
                 </Typography>
               </Box>

@@ -61,7 +61,19 @@ import BoltIcon from '@mui/icons-material/Bolt';
 import AccessTimeIcon from '@mui/icons-material/AccessTime';
 import NumbersIcon from '@mui/icons-material/Numbers';
 import QueryStatsIcon from '@mui/icons-material/QueryStats';
-import { dataApi, EventListSummary, EventListInfo, FileSizeInfo, EventListFullPreview, FileMetadata } from '@/api/dataApi';
+import {
+  dataApi,
+  EventListSummary,
+  EventListInfo,
+  FileSizeInfo,
+  EventListFullPreview,
+  FileMetadata,
+  SingleFileConfig,
+  BatchSizeResult,
+  BatchLoadResult,
+  BatchLoadSuccessItem,
+  BatchLoadFailedItem,
+} from '@/api/dataApi';
 import { apiClient } from '@/api/client';
 import { useUIStore } from '@/store/uiStore';
 
@@ -77,11 +89,28 @@ const DataIngestionPage: React.FC = () => {
   // Global notification store and processing state
   const { addNotification, setProcessing } = useUIStore();
 
-  // Form state - Local File
+  // Form state - Local File (batch mode)
   const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
-  const [eventListName, setEventListName] = useState<string>('');
+  const [fileNames, setFileNames] = useState<Record<string, string>>({});
   const [fileFormat, setFileFormat] = useState<string>('ogip');
   const [isLoading, setIsLoading] = useState<boolean>(false);
+
+  // Batch file settings mode
+  const [useSameSettings, setUseSameSettings] = useState<boolean>(true);
+  const [perFileConfigs, setPerFileConfigs] = useState<Record<string, Partial<SingleFileConfig>>>({});
+  const [expandedFileSettings, setExpandedFileSettings] = useState<Record<string, boolean>>({});
+
+  // Batch size info
+  const [batchSizeInfo, setBatchSizeInfo] = useState<BatchSizeResult | null>(null);
+  const [isCheckingBatchSize, setIsCheckingBatchSize] = useState<boolean>(false);
+
+  // Batch loading progress
+  const [batchProgress, setBatchProgress] = useState<{
+    loading: boolean;
+    total: number;
+    completed: number;
+  } | null>(null);
+  const [batchResult, setBatchResult] = useState<BatchLoadResult | null>(null);
 
   // Advanced options state
   const [showAdvancedOptions, setShowAdvancedOptions] = useState<boolean>(false);
@@ -171,7 +200,7 @@ const DataIngestionPage: React.FC = () => {
     }
   };
 
-  // Check file size when file is selected
+  // Check file size when file is selected (single file)
   const checkFileSize = async (filePath: string): Promise<void> => {
     setIsCheckingFileSize(true);
     try {
@@ -192,7 +221,30 @@ const DataIngestionPage: React.FC = () => {
     }
   };
 
-  // Fetch file metadata for true lazy loading
+  // Check batch file sizes when multiple files are selected
+  const checkBatchFileSize = async (filePaths: string[]): Promise<void> => {
+    if (filePaths.length === 0) return;
+
+    setIsCheckingBatchSize(true);
+    try {
+      await apiClient.getPort();
+      const response = await dataApi.checkBatchFileSize(filePaths);
+      if (response.success && response.data) {
+        setBatchSizeInfo(response.data);
+        // Auto-enable lazy loading if recommended
+        if (response.data.recommend_partial_loading && !useTrueLazyLoading) {
+          setUseTrueLazyLoading(true);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to check batch file sizes:', error);
+      setBatchSizeInfo(null);
+    } finally {
+      setIsCheckingBatchSize(false);
+    }
+  };
+
+  // Fetch file metadata for true lazy loading (uses first selected file as reference)
   const fetchFileMetadata = async (): Promise<void> => {
     if (selectedFiles.length === 0) {
       showAlert('Please select a file first', 'warning');
@@ -202,6 +254,7 @@ const DataIngestionPage: React.FC = () => {
     setIsLoadingMetadata(true);
     try {
       await apiClient.getPort();
+      // Use first file for metadata preview
       const response = await dataApi.getFileMetadata({
         file_path: selectedFiles[0],
         fmt: fileFormat,
@@ -217,11 +270,10 @@ const DataIngestionPage: React.FC = () => {
         if (response.data.recommended_loading.suggested_chunk_size) {
           setEventCount(response.data.recommended_loading.suggested_chunk_size);
         }
-        showAlert(
-          `File has ${response.data.total_events.toLocaleString()} events over ${response.data.duration.toFixed(1)}s`,
-          'success',
-          'File Metadata'
-        );
+        const message = selectedFiles.length > 1
+          ? `First file has ${response.data.total_events.toLocaleString()} events over ${response.data.duration.toFixed(1)}s (settings will apply to all files)`
+          : `File has ${response.data.total_events.toLocaleString()} events over ${response.data.duration.toFixed(1)}s`;
+        showAlert(message, 'success', 'File Metadata');
       } else {
         showAlert(response.message || 'Failed to fetch file metadata', 'error', 'Metadata Error');
       }
@@ -233,7 +285,7 @@ const DataIngestionPage: React.FC = () => {
     }
   };
 
-  // Handle file selection via Electron dialog
+  // Handle file selection via Electron dialog (supports multiple files)
   const handleBrowseFiles = async (): Promise<void> => {
     if (!window.electronAPI) {
       showAlert('File dialog not available (Electron API not found)', 'error');
@@ -248,19 +300,113 @@ const DataIngestionPage: React.FC = () => {
         { name: 'Text Files', extensions: ['txt', 'csv', 'dat'] },
         { name: 'All Files', extensions: ['*'] },
       ],
-      multiple: false,
+      multiple: true, // Enable multi-select
     });
 
     if (files && files.length > 0) {
       setSelectedFiles(files);
-      // Auto-generate name from filename
-      const fileName = files[0].split('/').pop()?.split('.')[0] || '';
-      if (!eventListName) {
-        setEventListName(fileName);
+      setBatchResult(null); // Clear previous batch result
+
+      // Auto-generate names from filenames
+      const names: Record<string, string> = {};
+      files.forEach((f) => {
+        const baseName = f.split('/').pop()?.split('.')[0] || 'event_list';
+        // Ensure unique names by appending index if needed
+        let uniqueName = baseName;
+        let counter = 1;
+        while (Object.values(names).includes(uniqueName)) {
+          uniqueName = `${baseName}_${counter}`;
+          counter++;
+        }
+        names[f] = uniqueName;
+      });
+      setFileNames(names);
+
+      // Initialize per-file configs
+      const configs: Record<string, Partial<SingleFileConfig>> = {};
+      files.forEach((f) => {
+        configs[f] = {
+          fmt: 'ogip',
+          high_precision: false,
+          skip_checks: false,
+          use_partial_loading: false,
+          partial_mode: 'time_range',
+          time_range_start: 0,
+          time_range_end: 100,
+          event_start_index: 0,
+          event_count: 10000,
+        };
+      });
+      setPerFileConfigs(configs);
+
+      // Check batch file sizes
+      if (files.length > 1) {
+        checkBatchFileSize(files);
+        setFileSizeInfo(null); // Clear single file info
+      } else {
+        // Single file - use existing single file check
+        checkFileSize(files[0]);
+        setBatchSizeInfo(null);
       }
-      // Check file size
-      checkFileSize(files[0]);
     }
+  };
+
+  // Remove a file from the selection
+  const handleRemoveFile = (filePath: string): void => {
+    const newFiles = selectedFiles.filter((f) => f !== filePath);
+    setSelectedFiles(newFiles);
+
+    // Update file names
+    const newNames = { ...fileNames };
+    delete newNames[filePath];
+    setFileNames(newNames);
+
+    // Update per-file configs
+    const newConfigs = { ...perFileConfigs };
+    delete newConfigs[filePath];
+    setPerFileConfigs(newConfigs);
+
+    // Re-check sizes
+    if (newFiles.length > 1) {
+      checkBatchFileSize(newFiles);
+      setFileSizeInfo(null);
+    } else if (newFiles.length === 1) {
+      checkFileSize(newFiles[0]);
+      setBatchSizeInfo(null);
+    } else {
+      setFileSizeInfo(null);
+      setBatchSizeInfo(null);
+    }
+  };
+
+  // Update file name
+  const handleFileNameChange = (filePath: string, newName: string): void => {
+    setFileNames((prev) => ({
+      ...prev,
+      [filePath]: newName,
+    }));
+  };
+
+  // Update per-file config
+  const handlePerFileConfigChange = (
+    filePath: string,
+    updates: Partial<SingleFileConfig>
+  ): void => {
+    setPerFileConfigs((prev) => ({
+      ...prev,
+      [filePath]: {
+        ...prev[filePath],
+        ...updates,
+      },
+    }));
+  };
+
+  // Toggle per-file settings expansion
+  const toggleFileSettings = (filePath: string): void => {
+    setExpandedFileSettings((prev) => ({
+      ...prev,
+      [filePath]: !prev[filePath],
+    }));
   };
 
   // Handle RMF file selection
@@ -285,96 +431,280 @@ const DataIngestionPage: React.FC = () => {
     }
   };
 
-  // Handle loading the selected file
+  // Handle per-file RMF file browsing
+  const handleBrowsePerFileRmf = async (filePath: string): Promise<void> => {
+    if (!window.electronAPI) {
+      showAlert('File dialog not available (Electron API not found)', 'error');
+      return;
+    }
+
+    const files = await window.electronAPI.openFile({
+      title: 'Select RMF (Response Matrix) File',
+      filters: [
+        { name: 'RMF Files', extensions: ['rmf', 'rsp'] },
+        { name: 'FITS Files', extensions: ['fits', 'fit'] },
+        { name: 'All Files', extensions: ['*'] },
+      ],
+      multiple: false,
+    });
+
+    if (files && files.length > 0) {
+      handlePerFileConfigChange(filePath, { rmf_file: files[0] });
+    }
+  };
+
+  // Handle loading files (single or batch)
   const handleLoadFile = async (): Promise<void> => {
     if (selectedFiles.length === 0) {
       showAlert('Please select a file first', 'warning');
       return;
     }
 
-    if (!eventListName.trim()) {
-      showAlert('Please provide a name for the Event List', 'warning');
+    // Validate names
+    const names = Object.values(fileNames);
+    const emptyNames = selectedFiles.filter((f) => !fileNames[f]?.trim());
+    if (emptyNames.length > 0) {
+      showAlert('Please provide names for all selected files', 'warning');
+      return;
+    }
+
+    // Check for duplicate names
+    const uniqueNames = new Set(names);
+    if (uniqueNames.size !== names.length) {
+      showAlert('File names must be unique', 'warning');
       return;
     }
 
     setIsLoading(true);
-    setProcessing(true, `Loading ${eventListName.trim()}...`);
+    setBatchResult(null);
     setAlert({ open: false, message: '', severity: 'info' });
 
     try {
-      // Ensure we have the correct port
       await apiClient.getPort();
 
-      // Parse additional columns if provided
+      // Parse additional columns if provided (for shared settings)
       const additionalColumnsArray = additionalColumns.trim()
         ? additionalColumns.split(',').map((col) => col.trim()).filter((col) => col)
         : undefined;
 
-      let response;
-      let loadMethod = '';
+      // Single file: use existing single-file loading
+      if (selectedFiles.length === 1) {
+        setProcessing(true, `Loading ${fileNames[selectedFiles[0]]}...`);
 
-      if (useTrueLazyLoading) {
-        // True lazy loading - only reads requested portion from disk
-        if (trueLazyMode === 'time_range') {
-          response = await dataApi.loadEventListByTimeRange({
-            file_path: selectedFiles[0],
-            name: eventListName.trim(),
-            start_time: timeRangeStart,
-            end_time: timeRangeEnd,
-            fmt: fileFormat,
-          });
-          loadMethod = ` (Time Range: ${timeRangeStart}s - ${timeRangeEnd}s)`;
+        let response;
+        let loadMethod = '';
+
+        if (useTrueLazyLoading) {
+          if (trueLazyMode === 'time_range') {
+            response = await dataApi.loadEventListByTimeRange({
+              file_path: selectedFiles[0],
+              name: fileNames[selectedFiles[0]].trim(),
+              start_time: timeRangeStart,
+              end_time: timeRangeEnd,
+              fmt: fileFormat,
+            });
+            loadMethod = ` (Time Range: ${timeRangeStart}s - ${timeRangeEnd}s)`;
+          } else {
+            response = await dataApi.loadEventListByEventCount({
+              file_path: selectedFiles[0],
+              name: fileNames[selectedFiles[0]].trim(),
+              start_index: eventCountStart,
+              count: eventCount,
+              fmt: fileFormat,
+            });
+            loadMethod = ` (Events: ${eventCountStart} - ${eventCountStart + eventCount})`;
+          }
         } else {
-          response = await dataApi.loadEventListByEventCount({
+          response = await dataApi.loadEventList({
             file_path: selectedFiles[0],
-            name: eventListName.trim(),
-            start_index: eventCountStart,
-            count: eventCount,
+            name: fileNames[selectedFiles[0]].trim(),
             fmt: fileFormat,
+            rmf_file: rmfFile || undefined,
+            additional_columns: additionalColumnsArray,
+            high_precision: highPrecision,
+            skip_checks: skipChecks,
           });
-          loadMethod = ` (Events: ${eventCountStart} - ${eventCountStart + eventCount})`;
+        }
+
+        if (response.success) {
+          showAlert(response.message || `Event List loaded successfully!${loadMethod}`, 'success', 'Data Loaded');
+          resetForm();
+          await fetchEventLists();
+        } else {
+          showAlert(response.message || 'Failed to load Event List', 'error', 'Load Failed');
         }
       } else {
-        // Standard loading
-        response = await dataApi.loadEventList({
-          file_path: selectedFiles[0],
-          name: eventListName.trim(),
-          fmt: fileFormat,
-          rmf_file: rmfFile || undefined,
-          additional_columns: additionalColumnsArray,
-          high_precision: highPrecision,
-          skip_checks: skipChecks,
-        });
-      }
+        // Multiple files: use SSE streaming batch loading for real-time progress
+        setProcessing(true, `Loading ${selectedFiles.length} files...`);
+        setBatchProgress({ loading: true, total: selectedFiles.length, completed: 0 });
 
-      if (response.success) {
-        showAlert(response.message || `Event List loaded successfully!${loadMethod}`, 'success', 'Data Loaded');
-        // Reset form
-        setSelectedFiles([]);
-        setEventListName('');
-        setRmfFile('');
-        setAdditionalColumns('');
-        setFileSizeInfo(null);
-        setFileMetadata(null);
-        setUseTrueLazyLoading(false);
-        setHighPrecision(false);
-        setSkipChecks(false);
-        setTimeRangeStart(0);
-        setTimeRangeEnd(100);
-        setEventCountStart(0);
-        setEventCount(10000);
-        // Refresh the list
-        await fetchEventLists();
-      } else {
-        showAlert(response.message || 'Failed to load Event List', 'error', 'Load Failed');
+        // Build file configs
+        const fileConfigs: SingleFileConfig[] = selectedFiles.map((f) => {
+          const perFile = perFileConfigs[f] || {};
+          return {
+            file_path: f,
+            name: fileNames[f].trim(),
+            fmt: useSameSettings ? fileFormat : (perFile.fmt || 'ogip'),
+            rmf_file: useSameSettings ? (rmfFile || undefined) : perFile.rmf_file,
+            additional_columns: useSameSettings ? additionalColumnsArray : perFile.additional_columns,
+            high_precision: useSameSettings ? highPrecision : (perFile.high_precision || false),
+            skip_checks: useSameSettings ? skipChecks : (perFile.skip_checks || false),
+            use_partial_loading: useSameSettings ? useTrueLazyLoading : (perFile.use_partial_loading || false),
+            partial_mode: useSameSettings ? trueLazyMode : (perFile.partial_mode || 'time_range'),
+            time_range_start: useSameSettings ? timeRangeStart : perFile.time_range_start,
+            time_range_end: useSameSettings ? timeRangeEnd : perFile.time_range_end,
+            event_start_index: useSameSettings ? eventCountStart : perFile.event_start_index,
+            event_count: useSameSettings ? eventCount : perFile.event_count,
+          };
+        });
+
+        // Track results incrementally via SSE streaming
+        const successful: BatchLoadSuccessItem[] = [];
+        const failed: BatchLoadFailedItem[] = [];
+        let finalSummary: {
+          total_time_ms: number;
+          success_count: number;
+          failure_count: number;
+          total_events: number;
+          workers_used: number;
+        } | null = null;
+
+        // Use SSE streaming to get real-time progress updates
+        for await (const event of dataApi.loadBatchEventListsSSE({
+          files: fileConfigs,
+          use_same_settings: useSameSettings,
+          shared_fmt: fileFormat,
+          shared_rmf_file: rmfFile || undefined,
+          shared_additional_columns: additionalColumnsArray,
+          shared_high_precision: highPrecision,
+          shared_skip_checks: skipChecks,
+          shared_use_partial_loading: useTrueLazyLoading,
+          shared_partial_mode: trueLazyMode,
+          shared_time_range_start: useTrueLazyLoading ? timeRangeStart : undefined,
+          shared_time_range_end: useTrueLazyLoading ? timeRangeEnd : undefined,
+          shared_event_start_index: useTrueLazyLoading ? eventCountStart : undefined,
+          shared_event_count: useTrueLazyLoading ? eventCount : undefined,
+        })) {
+          // Log SSE events to console for debugging
+          console.log('[SSE Event]', event);
+
+          if (event.type === 'file_complete') {
+            // Update progress immediately
+            setBatchProgress((prev) =>
+              prev ? { ...prev, completed: event.completed } : null
+            );
+            setProcessing(true, `Loading files (${event.completed}/${event.total})...`);
+
+            // Track results
+            if (event.success && event.data) {
+              successful.push({
+                name: event.name,
+                file_path: event.file_path,
+                data: event.data,
+              });
+              // Log warnings if present
+              if (event.data.gti_warnings && event.data.gti_warnings.length > 0) {
+                console.warn(`[GTI Warnings] ${event.name}:`, event.data.gti_warnings);
+              }
+              if (event.data.stingray_warnings && event.data.stingray_warnings.length > 0) {
+                console.warn(`[Stingray Warnings] ${event.name}:`, event.data.stingray_warnings);
+              }
+              // Refresh the list to show the newly loaded file immediately
+              await fetchEventLists();
+            } else {
+              console.error(`[Load Failed] ${event.name}:`, event.error);
+              failed.push({
+                name: event.name,
+                file_path: event.file_path,
+                error: event.error || 'Unknown error',
+              });
+            }
+          } else if (event.type === 'complete') {
+            // Final summary
+            console.log('[Batch Complete]', event);
+            finalSummary = {
+              total_time_ms: event.total_time_ms,
+              success_count: event.success_count,
+              failure_count: event.failure_count,
+              total_events: event.total_events,
+              workers_used: event.workers_used,
+            };
+          } else if (event.type === 'error') {
+            // Pre-validation error
+            console.error('[Batch Error]', event.error);
+            showAlert(event.error, 'error', 'Batch Load Error');
+            setBatchProgress(null);
+            return;
+          }
+        }
+
+        // Set final batch result for display
+        setBatchProgress(null);
+        if (finalSummary) {
+          setBatchResult({
+            successful,
+            failed,
+            summary: {
+              total_files: selectedFiles.length,
+              success_count: finalSummary.success_count,
+              failure_count: finalSummary.failure_count,
+              total_events_loaded: finalSummary.total_events,
+              total_time_ms: finalSummary.total_time_ms,
+              workers_used: finalSummary.workers_used,
+            },
+          });
+
+          if (finalSummary.failure_count === 0) {
+            showAlert(
+              `Loaded ${finalSummary.success_count} files (${finalSummary.total_events.toLocaleString()} events) in ${finalSummary.total_time_ms.toFixed(0)}ms`,
+              'success',
+              'Batch Load Complete'
+            );
+            resetForm();
+          } else if (finalSummary.success_count > 0) {
+            showAlert(
+              `Loaded ${finalSummary.success_count}/${selectedFiles.length} files. ${finalSummary.failure_count} failed.`,
+              'warning',
+              'Partial Success'
+            );
+          } else {
+            showAlert(
+              `All ${selectedFiles.length} files failed to load`,
+              'error',
+              'Batch Load Failed'
+            );
+          }
+        }
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
       showAlert(`Error: ${errorMessage}`, 'error', 'Load Error');
+      setBatchProgress(null);
     } finally {
       setIsLoading(false);
       setProcessing(false);
     }
+  };
+
+  // Reset form after successful load
+  const resetForm = (): void => {
+    setSelectedFiles([]);
+    setFileNames({});
+    setPerFileConfigs({});
+    setExpandedFileSettings({});
+    setRmfFile('');
+    setAdditionalColumns('');
+    setFileSizeInfo(null);
+    setBatchSizeInfo(null);
+    setFileMetadata(null);
+    setUseTrueLazyLoading(false);
+    setHighPrecision(false);
+    setSkipChecks(false);
+    setTimeRangeStart(0);
+    setTimeRangeEnd(100);
+    setEventCountStart(0);
+    setEventCount(10000);
+    setBatchResult(null);
   };
 
   // Handle deleting an event list
@@ -624,7 +954,7 @@ const DataIngestionPage: React.FC = () => {
               </Box>
 
               <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-                Load FITS, HDF5, or text event list files from your computer
+                Load FITS, HDF5, or text event list files from your computer (supports multiple files)
               </Typography>
 
               {/* File Selection */}
@@ -636,131 +966,477 @@ const DataIngestionPage: React.FC = () => {
                   fullWidth
                   sx={{ mb: 1 }}
                 >
-                  Browse Files
+                  Browse Files (Multi-select)
                 </Button>
+
+                {/* Selected Files List */}
                 {selectedFiles.length > 0 && (
-                  <Typography variant="body2" color="text.secondary" noWrap>
-                    Selected: {selectedFiles[0].split('/').pop()}
-                  </Typography>
-                )}
-                {/* File Size Info */}
-                {isCheckingFileSize && (
-                  <Box sx={{ mt: 1 }}>
-                    <LinearProgress />
-                    <Typography variant="caption" color="text.secondary">
-                      Checking file size...
-                    </Typography>
-                  </Box>
-                )}
-                {fileSizeInfo && !isCheckingFileSize && (
-                  <Box
-                    sx={{
-                      mt: 1,
-                      p: 1.5,
-                      borderRadius: 1,
-                      bgcolor: fileSizeInfo.risk_level === 'safe' ? 'success.50' :
-                               fileSizeInfo.risk_level === 'caution' ? 'warning.50' :
-                               'error.50',
-                      border: '1px solid',
-                      borderColor: fileSizeInfo.risk_level === 'safe' ? 'success.main' :
-                                   fileSizeInfo.risk_level === 'caution' ? 'warning.main' :
-                                   'error.main',
-                    }}
-                  >
-                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
-                      {fileSizeInfo.risk_level === 'safe' ? (
-                        <CheckCircleIcon fontSize="small" color="success" />
-                      ) : (
-                        <WarningAmberIcon fontSize="small" color={fileSizeInfo.risk_level === 'caution' ? 'warning' : 'error'} />
+                  <Box sx={{ mt: 2 }}>
+                    <Typography variant="subtitle2" sx={{ mb: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
+                      Selected Files ({selectedFiles.length})
+                      {selectedFiles.length > 1 && (
+                        <Chip label="Batch Mode" size="small" color="primary" variant="outlined" />
                       )}
-                      <Typography variant="body2" fontWeight="medium">
-                        {fileSizeInfo.file_size_mb < 1
-                          ? `${(fileSizeInfo.file_size_bytes / 1024).toFixed(1)} KB`
-                          : fileSizeInfo.file_size_gb >= 1
-                          ? `${fileSizeInfo.file_size_gb.toFixed(2)} GB`
-                          : `${fileSizeInfo.file_size_mb.toFixed(1)} MB`}
-                      </Typography>
-                      <Chip
-                        label={fileSizeInfo.risk_level.toUpperCase()}
-                        size="small"
-                        color={fileSizeInfo.risk_level === 'safe' ? 'success' :
-                               fileSizeInfo.risk_level === 'caution' ? 'warning' : 'error'}
-                        sx={{ ml: 'auto' }}
-                      />
-                    </Box>
-                    {fileSizeInfo.estimated_memory_mb && fileSizeInfo.memory_info && (
-                      <Box sx={{ display: 'flex', gap: 2, mt: 0.5, flexWrap: 'wrap' }}>
+                    </Typography>
+
+                    {/* Batch Size Info (for multiple files) */}
+                    {(isCheckingBatchSize || isCheckingFileSize) && (
+                      <Box sx={{ mb: 2 }}>
+                        <LinearProgress />
                         <Typography variant="caption" color="text.secondary">
-                          Est. Memory: ~{fileSizeInfo.estimated_memory_mb.toFixed(0)} MB
+                          Checking file sizes...
                         </Typography>
+                      </Box>
+                    )}
+
+                    {/* Batch Size Summary */}
+                    {batchSizeInfo && !isCheckingBatchSize && (
+                      <Box
+                        sx={{
+                          mb: 2,
+                          p: 1.5,
+                          borderRadius: 1,
+                          bgcolor: batchSizeInfo.total.risk_level === 'safe' ? 'success.50' :
+                                   batchSizeInfo.total.risk_level === 'caution' ? 'warning.50' :
+                                   'error.50',
+                          border: '1px solid',
+                          borderColor: batchSizeInfo.total.risk_level === 'safe' ? 'success.main' :
+                                       batchSizeInfo.total.risk_level === 'caution' ? 'warning.main' :
+                                       'error.main',
+                        }}
+                      >
+                        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                            {batchSizeInfo.total.risk_level === 'safe' ? (
+                              <CheckCircleIcon fontSize="small" color="success" />
+                            ) : (
+                              <WarningAmberIcon fontSize="small" color={batchSizeInfo.total.risk_level === 'caution' ? 'warning' : 'error'} />
+                            )}
+                            <Typography variant="body2" fontWeight="medium">
+                              Total: {batchSizeInfo.total.size_mb.toFixed(1)} MB → ~{batchSizeInfo.total.estimated_ram_mb.toFixed(0)} MB RAM
+                            </Typography>
+                          </Box>
+                          <Chip
+                            label={`${batchSizeInfo.total.ram_percent.toFixed(0)}% RAM`}
+                            size="small"
+                            color={batchSizeInfo.total.risk_level === 'safe' ? 'success' :
+                                   batchSizeInfo.total.risk_level === 'caution' ? 'warning' : 'error'}
+                          />
+                        </Box>
                         <Typography variant="caption" color="text.secondary">
-                          Available RAM: {fileSizeInfo.memory_info.available_mb.toFixed(0)} MB
+                          Available RAM: {batchSizeInfo.available_ram_mb.toFixed(0)} MB
                         </Typography>
-                        {fileSizeInfo.ram_usage_percent !== undefined && (
-                          <Typography
-                            variant="caption"
-                            color={fileSizeInfo.ram_usage_percent > 50 ? 'error' : fileSizeInfo.ram_usage_percent > 30 ? 'warning.main' : 'success.main'}
-                            fontWeight="medium"
-                          >
-                            Would use {fileSizeInfo.ram_usage_percent.toFixed(0)}% of free RAM
+                        {batchSizeInfo.recommend_partial_loading && (
+                          <Typography variant="caption" color="warning.main" sx={{ display: 'block', mt: 0.5 }}>
+                            Consider using partial loading to reduce memory usage.
                           </Typography>
                         )}
                       </Box>
                     )}
-                    {fileSizeInfo.recommend_lazy && (
-                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
-                        Would use &gt;30% of available RAM. Partial loading auto-enabled.
-                      </Typography>
+
+                    {/* Single file size info */}
+                    {fileSizeInfo && !isCheckingFileSize && selectedFiles.length === 1 && (
+                      <Box
+                        sx={{
+                          mb: 2,
+                          p: 1.5,
+                          borderRadius: 1,
+                          bgcolor: fileSizeInfo.risk_level === 'safe' ? 'success.50' :
+                                   fileSizeInfo.risk_level === 'caution' ? 'warning.50' :
+                                   'error.50',
+                          border: '1px solid',
+                          borderColor: fileSizeInfo.risk_level === 'safe' ? 'success.main' :
+                                       fileSizeInfo.risk_level === 'caution' ? 'warning.main' :
+                                       'error.main',
+                        }}
+                      >
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+                          {fileSizeInfo.risk_level === 'safe' ? (
+                            <CheckCircleIcon fontSize="small" color="success" />
+                          ) : (
+                            <WarningAmberIcon fontSize="small" color={fileSizeInfo.risk_level === 'caution' ? 'warning' : 'error'} />
+                          )}
+                          <Typography variant="body2" fontWeight="medium">
+                            {fileSizeInfo.file_size_mb < 1
+                              ? `${(fileSizeInfo.file_size_bytes / 1024).toFixed(1)} KB`
+                              : fileSizeInfo.file_size_gb >= 1
+                              ? `${fileSizeInfo.file_size_gb.toFixed(2)} GB`
+                              : `${fileSizeInfo.file_size_mb.toFixed(1)} MB`}
+                          </Typography>
+                          <Chip
+                            label={fileSizeInfo.risk_level.toUpperCase()}
+                            size="small"
+                            color={fileSizeInfo.risk_level === 'safe' ? 'success' :
+                                   fileSizeInfo.risk_level === 'caution' ? 'warning' : 'error'}
+                            sx={{ ml: 'auto' }}
+                          />
+                        </Box>
+                        {fileSizeInfo.ram_usage_percent !== undefined && (
+                          <Typography variant="caption" color="text.secondary">
+                            Would use ~{fileSizeInfo.ram_usage_percent.toFixed(0)}% of available RAM
+                          </Typography>
+                        )}
+                      </Box>
                     )}
-                    {fileSizeInfo.risk_level === 'critical' && (
-                      <Typography variant="caption" color="error" sx={{ display: 'block', mt: 0.5 }}>
-                        Critical: Would use &gt;80% of available RAM. Partial loading strongly recommended.
-                      </Typography>
+
+                    {/* Settings Mode Toggle (only for batch) */}
+                    {selectedFiles.length > 1 && (
+                      <Box sx={{ mb: 2, p: 1.5, bgcolor: 'action.hover', borderRadius: 1 }}>
+                        <FormControlLabel
+                          control={
+                            <Checkbox
+                              checked={useSameSettings}
+                              onChange={(e) => setUseSameSettings(e.target.checked)}
+                              size="small"
+                            />
+                          }
+                          label={
+                            <Typography variant="body2">
+                              Apply same settings to all files
+                            </Typography>
+                          }
+                        />
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', ml: 3.5 }}>
+                          {useSameSettings
+                            ? 'All files will use the format and options below'
+                            : 'Each file can have different settings (expand to configure)'}
+                        </Typography>
+                      </Box>
                     )}
+
+                    {/* File List */}
+                    <Paper variant="outlined" sx={{ maxHeight: 300, overflow: 'auto' }}>
+                      <List dense disablePadding>
+                        {selectedFiles.map((filePath, index) => {
+                          const fileName = filePath.split('/').pop() || filePath;
+                          const sizeInfo = batchSizeInfo?.files.find((f) => f.file_path === filePath);
+                          const isExpanded = expandedFileSettings[filePath];
+
+                          return (
+                            <React.Fragment key={filePath}>
+                              {index > 0 && <Divider />}
+                              <ListItem
+                                sx={{ py: 1, flexDirection: 'column', alignItems: 'stretch' }}
+                              >
+                                <Box sx={{ display: 'flex', alignItems: 'center', width: '100%', gap: 1 }}>
+                                  <TextField
+                                    size="small"
+                                    value={fileNames[filePath] || ''}
+                                    onChange={(e) => handleFileNameChange(filePath, e.target.value)}
+                                    placeholder="Name"
+                                    sx={{ width: 140, flexShrink: 0 }}
+                                    inputProps={{ style: { fontSize: '0.875rem' } }}
+                                  />
+                                  <Box sx={{ flex: 1, minWidth: 0 }}>
+                                    <Typography variant="body2" noWrap title={fileName}>
+                                      {fileName}
+                                    </Typography>
+                                    {sizeInfo && (
+                                      <Typography variant="caption" color="text.secondary">
+                                        {sizeInfo.size_mb.toFixed(1)} MB
+                                        {sizeInfo.ram_percent > 30 && (
+                                          <Chip
+                                            label={`${sizeInfo.ram_percent.toFixed(0)}%`}
+                                            size="small"
+                                            color={sizeInfo.risk_level === 'safe' ? 'success' :
+                                                   sizeInfo.risk_level === 'caution' ? 'warning' : 'error'}
+                                            sx={{ ml: 1, height: 18 }}
+                                          />
+                                        )}
+                                      </Typography>
+                                    )}
+                                  </Box>
+                                  {/* Per-file settings button (only when not using same settings) */}
+                                  {selectedFiles.length > 1 && !useSameSettings && (
+                                    <IconButton
+                                      size="small"
+                                      onClick={() => toggleFileSettings(filePath)}
+                                      color={isExpanded ? 'primary' : 'default'}
+                                    >
+                                      <SettingsIcon fontSize="small" />
+                                    </IconButton>
+                                  )}
+                                  <IconButton
+                                    size="small"
+                                    onClick={() => handleRemoveFile(filePath)}
+                                    color="error"
+                                  >
+                                    <CloseIcon fontSize="small" />
+                                  </IconButton>
+                                </Box>
+
+                                {/* Per-file settings (collapsed) */}
+                                {!useSameSettings && isExpanded && (
+                                  <Box sx={{ mt: 1, pl: 2, pr: 1, pb: 1, bgcolor: 'action.hover', borderRadius: 1 }}>
+                                    <Grid container spacing={1} sx={{ mt: 0.5 }}>
+                                      {/* Format */}
+                                      <Grid item xs={12}>
+                                        <FormControl fullWidth size="small">
+                                          <InputLabel>Format</InputLabel>
+                                          <Select
+                                            value={perFileConfigs[filePath]?.fmt || 'ogip'}
+                                            label="Format"
+                                            onChange={(e) => handlePerFileConfigChange(filePath, { fmt: e.target.value })}
+                                          >
+                                            <MenuItem value="ogip">OGIP</MenuItem>
+                                            <MenuItem value="hdf5">HDF5</MenuItem>
+                                            <MenuItem value="fits">FITS</MenuItem>
+                                          </Select>
+                                        </FormControl>
+                                      </Grid>
+
+                                      {/* RMF File */}
+                                      <Grid item xs={12}>
+                                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 0.5 }}>
+                                          RMF File (optional)
+                                        </Typography>
+                                        <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
+                                          <TextField
+                                            size="small"
+                                            value={perFileConfigs[filePath]?.rmf_file || ''}
+                                            onChange={(e) => handlePerFileConfigChange(filePath, { rmf_file: e.target.value })}
+                                            fullWidth
+                                            placeholder="Path to RMF file"
+                                            InputProps={{ readOnly: true }}
+                                            inputProps={{ style: { fontSize: '0.75rem' } }}
+                                          />
+                                          <Button
+                                            size="small"
+                                            variant="outlined"
+                                            onClick={() => handleBrowsePerFileRmf(filePath)}
+                                            sx={{ minWidth: 'auto', px: 1, fontSize: '0.7rem' }}
+                                          >
+                                            Browse
+                                          </Button>
+                                          {perFileConfigs[filePath]?.rmf_file && (
+                                            <IconButton
+                                              size="small"
+                                              onClick={() => handlePerFileConfigChange(filePath, { rmf_file: undefined })}
+                                            >
+                                              <CloseIcon sx={{ fontSize: '0.875rem' }} />
+                                            </IconButton>
+                                          )}
+                                        </Box>
+                                      </Grid>
+
+                                      {/* Additional Columns */}
+                                      <Grid item xs={12}>
+                                        <TextField
+                                          size="small"
+                                          label="Additional Columns"
+                                          value={perFileConfigs[filePath]?.additional_columns?.join(', ') || ''}
+                                          onChange={(e) => handlePerFileConfigChange(filePath, {
+                                            additional_columns: e.target.value
+                                              .split(',')
+                                              .map((s) => s.trim())
+                                              .filter(Boolean)
+                                          })}
+                                          fullWidth
+                                          placeholder="e.g., PI, ENERGY, DET_ID"
+                                          helperText="Comma-separated"
+                                          inputProps={{ style: { fontSize: '0.75rem' } }}
+                                        />
+                                      </Grid>
+
+                                      {/* High Precision & Skip Checks */}
+                                      <Grid item xs={6}>
+                                        <Tooltip title="Uses float128 for time arrays (nanosecond precision)" arrow placement="top">
+                                          <FormControlLabel
+                                            control={
+                                              <Checkbox
+                                                checked={perFileConfigs[filePath]?.high_precision || false}
+                                                onChange={(e) => handlePerFileConfigChange(filePath, { high_precision: e.target.checked })}
+                                                size="small"
+                                              />
+                                            }
+                                            label={
+                                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                                <PrecisionManufacturingIcon sx={{ fontSize: '0.875rem' }} color="info" />
+                                                <Typography variant="caption">High precision</Typography>
+                                              </Box>
+                                            }
+                                          />
+                                        </Tooltip>
+                                      </Grid>
+                                      <Grid item xs={6}>
+                                        <Tooltip title="Skip time ordering and GTI validation" arrow placement="top">
+                                          <FormControlLabel
+                                            control={
+                                              <Checkbox
+                                                checked={perFileConfigs[filePath]?.skip_checks || false}
+                                                onChange={(e) => handlePerFileConfigChange(filePath, { skip_checks: e.target.checked })}
+                                                size="small"
+                                              />
+                                            }
+                                            label={
+                                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                                <BoltIcon sx={{ fontSize: '0.875rem' }} color="warning" />
+                                                <Typography variant="caption">Skip checks</Typography>
+                                              </Box>
+                                            }
+                                          />
+                                        </Tooltip>
+                                      </Grid>
+
+                                      {/* Partial Loading */}
+                                      <Grid item xs={12}>
+                                        <Tooltip title="Load only a portion of the file (FITS only)" arrow placement="top">
+                                          <FormControlLabel
+                                            control={
+                                              <Checkbox
+                                                checked={perFileConfigs[filePath]?.use_partial_loading || false}
+                                                onChange={(e) => handlePerFileConfigChange(filePath, { use_partial_loading: e.target.checked })}
+                                                size="small"
+                                                color="secondary"
+                                              />
+                                            }
+                                            label={
+                                              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                                <QueryStatsIcon sx={{ fontSize: '0.875rem' }} color="secondary" />
+                                                <Typography variant="caption">Partial loading</Typography>
+                                              </Box>
+                                            }
+                                          />
+                                        </Tooltip>
+                                      </Grid>
+
+                                      {perFileConfigs[filePath]?.use_partial_loading && (
+                                        <>
+                                          <Grid item xs={12}>
+                                            <FormControl fullWidth size="small">
+                                              <InputLabel>Mode</InputLabel>
+                                              <Select
+                                                value={perFileConfigs[filePath]?.partial_mode || 'time_range'}
+                                                label="Mode"
+                                                onChange={(e) => handlePerFileConfigChange(filePath, { partial_mode: e.target.value as 'time_range' | 'event_count' })}
+                                              >
+                                                <MenuItem value="time_range">Time Range</MenuItem>
+                                                <MenuItem value="event_count">Event Count</MenuItem>
+                                              </Select>
+                                            </FormControl>
+                                          </Grid>
+                                          {perFileConfigs[filePath]?.partial_mode === 'time_range' ? (
+                                            <>
+                                              <Grid item xs={6}>
+                                                <TextField
+                                                  size="small"
+                                                  label="Start (s)"
+                                                  type="number"
+                                                  value={perFileConfigs[filePath]?.time_range_start ?? 0}
+                                                  onChange={(e) => handlePerFileConfigChange(filePath, { time_range_start: parseFloat(e.target.value) || 0 })}
+                                                  fullWidth
+                                                />
+                                              </Grid>
+                                              <Grid item xs={6}>
+                                                <TextField
+                                                  size="small"
+                                                  label="End (s)"
+                                                  type="number"
+                                                  value={perFileConfigs[filePath]?.time_range_end ?? 100}
+                                                  onChange={(e) => handlePerFileConfigChange(filePath, { time_range_end: parseFloat(e.target.value) || 100 })}
+                                                  fullWidth
+                                                />
+                                              </Grid>
+                                            </>
+                                          ) : (
+                                            <>
+                                              <Grid item xs={6}>
+                                                <TextField
+                                                  size="small"
+                                                  label="Start Index"
+                                                  type="number"
+                                                  value={perFileConfigs[filePath]?.event_start_index ?? 0}
+                                                  onChange={(e) => handlePerFileConfigChange(filePath, { event_start_index: parseInt(e.target.value) || 0 })}
+                                                  fullWidth
+                                                />
+                                              </Grid>
+                                              <Grid item xs={6}>
+                                                <TextField
+                                                  size="small"
+                                                  label="Count"
+                                                  type="number"
+                                                  value={perFileConfigs[filePath]?.event_count ?? 10000}
+                                                  onChange={(e) => handlePerFileConfigChange(filePath, { event_count: parseInt(e.target.value) || 10000 })}
+                                                  fullWidth
+                                                />
+                                              </Grid>
+                                            </>
+                                          )}
+                                        </>
+                                      )}
+                                    </Grid>
+                                  </Box>
+                                )}
+                              </ListItem>
+                            </React.Fragment>
+                          );
+                        })}
+                      </List>
+                    </Paper>
+                  </Box>
+                )}
+
+                {/* Batch Result Summary */}
+                {batchResult && (
+                  <Box sx={{ mt: 2 }}>
+                    <Alert
+                      severity={batchResult.summary.failure_count === 0 ? 'success' :
+                               batchResult.summary.success_count === 0 ? 'error' : 'warning'}
+                      onClose={() => setBatchResult(null)}
+                    >
+                      <Typography variant="body2" fontWeight="medium">
+                        Loaded {batchResult.summary.success_count}/{batchResult.summary.total_files} files
+                        {batchResult.summary.total_events_loaded > 0 && (
+                          <span> ({batchResult.summary.total_events_loaded.toLocaleString()} events)</span>
+                        )}
+                      </Typography>
+                      {batchResult.failed.length > 0 && (
+                        <Box sx={{ mt: 1 }}>
+                          <Typography variant="caption" color="error">Failed files:</Typography>
+                          {batchResult.failed.map((f, i) => (
+                            <Typography key={i} variant="caption" sx={{ display: 'block', ml: 1 }}>
+                              • {f.name}: {f.error}
+                            </Typography>
+                          ))}
+                        </Box>
+                      )}
+                    </Alert>
                   </Box>
                 )}
               </Box>
 
-              {/* Event List Name */}
-              <TextField
-                label="Event List Name"
-                value={eventListName}
-                onChange={(e) => setEventListName(e.target.value)}
-                fullWidth
-                size="small"
-                sx={{ mb: 2 }}
-                placeholder="Enter a name for this event list"
-                helperText="This name will be used to reference the data"
-              />
+              {/* File Format - only shown when using same settings for all files */}
+              {useSameSettings && (
+                <FormControl fullWidth size="small" sx={{ mb: 2 }}>
+                  <InputLabel>File Format</InputLabel>
+                  <Select
+                    value={fileFormat}
+                    label="File Format"
+                    onChange={(e) => setFileFormat(e.target.value)}
+                  >
+                    <MenuItem value="ogip">OGIP/FITS (recommended)</MenuItem>
+                    <MenuItem value="hdf5">HDF5</MenuItem>
+                    <MenuItem value="fits">FITS (generic)</MenuItem>
+                    <MenuItem value="ascii.ecsv">ASCII ECSV</MenuItem>
+                  </Select>
+                </FormControl>
+              )}
 
-              {/* File Format */}
-              <FormControl fullWidth size="small" sx={{ mb: 2 }}>
-                <InputLabel>File Format</InputLabel>
-                <Select
-                  value={fileFormat}
-                  label="File Format"
-                  onChange={(e) => setFileFormat(e.target.value)}
+              {/* Advanced Options Toggle - only shown when using same settings for all files */}
+              {useSameSettings && (
+                <Button
+                  size="small"
+                  onClick={() => setShowAdvancedOptions(!showAdvancedOptions)}
+                  startIcon={<SettingsIcon />}
+                  endIcon={showAdvancedOptions ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                  sx={{ mb: 2, textTransform: 'none' }}
                 >
-                  <MenuItem value="ogip">OGIP/FITS (recommended)</MenuItem>
-                  <MenuItem value="hdf5">HDF5</MenuItem>
-                  <MenuItem value="fits">FITS (generic)</MenuItem>
-                  <MenuItem value="ascii.ecsv">ASCII ECSV</MenuItem>
-                </Select>
-              </FormControl>
+                  Advanced Options
+                </Button>
+              )}
 
-              {/* Advanced Options Toggle */}
-              <Button
-                size="small"
-                onClick={() => setShowAdvancedOptions(!showAdvancedOptions)}
-                startIcon={<SettingsIcon />}
-                endIcon={showAdvancedOptions ? <ExpandLessIcon /> : <ExpandMoreIcon />}
-                sx={{ mb: 2, textTransform: 'none' }}
-              >
-                Advanced Options
-              </Button>
-
-              {/* Advanced Options Content */}
-              <Collapse in={showAdvancedOptions}>
+              {/* Advanced Options Content - only shown when using same settings for all files */}
+              <Collapse in={showAdvancedOptions && useSameSettings}>
                 <Box sx={{ mb: 2, p: 2, bgcolor: 'action.hover', borderRadius: 1 }}>
                   {/* RMF File */}
                   <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
@@ -1075,8 +1751,25 @@ const DataIngestionPage: React.FC = () => {
                 fullWidth
                 startIcon={isLoading ? <CircularProgress size={20} /> : <UploadFileIcon />}
               >
-                {isLoading ? 'Loading...' : 'Load Event List'}
+                {isLoading
+                  ? (selectedFiles.length > 1 ? `Loading ${selectedFiles.length} files...` : 'Loading...')
+                  : (selectedFiles.length > 1
+                    ? `Load ${selectedFiles.length} Event Lists`
+                    : 'Load Event List')}
               </Button>
+
+              {/* Batch loading progress with real-time updates */}
+              {batchProgress && (
+                <Box sx={{ mt: 2 }}>
+                  <LinearProgress
+                    variant="determinate"
+                    value={(batchProgress.completed / batchProgress.total) * 100}
+                  />
+                  <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
+                    Loaded {batchProgress.completed} of {batchProgress.total} files...
+                  </Typography>
+                </Box>
+              )}
             </CardContent>
           </Card>
         </Grid>

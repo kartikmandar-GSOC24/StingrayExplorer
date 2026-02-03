@@ -5,9 +5,13 @@ Handles loading, saving, and managing event lists.
 Includes lazy loading support for large files.
 """
 
+import asyncio
 import os
 import tempfile
-from typing import Any, Dict, List, Optional
+import time
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import numpy as np
 import psutil
@@ -136,15 +140,24 @@ class DataService(BaseService):
                     error=None,
                 )
 
-            # Load the event list using Stingray
-            event_list = EventList.read(
-                file_path,
-                fmt=fmt,
-                rmf_file=rmf_file,
-                additional_columns=additional_columns,
-                high_precision=high_precision,
-                skip_checks=skip_checks,
-            )
+            # Capture Stingray/library warnings during loading
+            stingray_warnings: List[str] = []
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                warnings.simplefilter("always")  # Catch all warnings
+
+                # Load the event list using Stingray
+                event_list = EventList.read(
+                    file_path,
+                    fmt=fmt,
+                    rmf_file=rmf_file,
+                    additional_columns=additional_columns,
+                    high_precision=high_precision,
+                    skip_checks=skip_checks,
+                )
+
+                # Collect warning messages
+                for w in caught_warnings:
+                    stingray_warnings.append(str(w.message))
 
             # Add to state manager
             self.state.add_event_data(name, event_list)
@@ -164,12 +177,15 @@ class DataService(BaseService):
                 "has_pi": event_list.pi is not None,
                 "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
                 "gti_warnings": gti_warnings if gti_warnings else None,
+                "stingray_warnings": stingray_warnings if stingray_warnings else None,
             }
 
             # Build message with warnings if present
             message = f"EventList '{name}' loaded successfully ({len(event_list.time)} events)"
             if gti_warnings:
                 message += f" [GTI warnings: {len(gti_warnings)}]"
+            if stingray_warnings:
+                message += f" [Stingray warnings: {len(stingray_warnings)}]"
 
             return self.create_result(
                 success=True,
@@ -1242,3 +1258,563 @@ class DataService(BaseService):
             recommendations["strategy"] = "full"
 
         return recommendations
+
+    # =========================================================================
+    # BATCH LOADING METHODS
+    # Load multiple files in parallel using ThreadPoolExecutor
+    # =========================================================================
+
+    def _get_risk_level(self, ram_percent: float) -> str:
+        """Determine risk level based on RAM usage percentage."""
+        if ram_percent > 80:
+            return "critical"
+        elif ram_percent > 50:
+            return "risky"
+        elif ram_percent > 30:
+            return "caution"
+        else:
+            return "safe"
+
+    def check_batch_file_size(self, file_paths: List[str]) -> Dict[str, Any]:
+        """
+        Check sizes of multiple files and estimate total memory usage.
+
+        Args:
+            file_paths: List of file paths to check
+
+        Returns:
+            Result dictionary with per-file and total memory estimates
+        """
+        try:
+            memory_info = self._get_memory_info()
+            available_ram_mb = memory_info["available_mb"]
+
+            files_info = []
+            total_size_mb = 0.0
+            total_estimated_ram_mb = 0.0
+
+            for path in file_paths:
+                if not os.path.exists(path):
+                    files_info.append({
+                        "file_path": path,
+                        "file_name": os.path.basename(path),
+                        "error": "File not found",
+                        "size_mb": 0,
+                        "estimated_ram_mb": 0,
+                        "ram_percent": 0,
+                        "risk_level": "critical",
+                    })
+                    continue
+
+                size_bytes = os.path.getsize(path)
+                size_mb = size_bytes / (1024**2)
+
+                # Determine format from extension
+                ext = os.path.splitext(path)[1].lower()
+                fmt = "fits" if ext in ['.fits', '.fit', '.fts', '.evt'] else "hdf5" if ext in ['.hdf5', '.h5'] else "fits"
+
+                estimated_ram_mb = self._estimate_memory_usage(size_bytes, fmt) / (1024**2)
+                ram_percent = (estimated_ram_mb / available_ram_mb) * 100 if available_ram_mb > 0 else 100
+
+                files_info.append({
+                    "file_path": path,
+                    "file_name": os.path.basename(path),
+                    "size_mb": round(size_mb, 1),
+                    "estimated_ram_mb": round(estimated_ram_mb, 1),
+                    "ram_percent": round(ram_percent, 1),
+                    "risk_level": self._get_risk_level(ram_percent),
+                })
+
+                total_size_mb += size_mb
+                total_estimated_ram_mb += estimated_ram_mb
+
+            total_ram_percent = (total_estimated_ram_mb / available_ram_mb) * 100 if available_ram_mb > 0 else 100
+
+            return self.create_result(
+                success=True,
+                data={
+                    "files": files_info,
+                    "total": {
+                        "size_mb": round(total_size_mb, 1),
+                        "estimated_ram_mb": round(total_estimated_ram_mb, 1),
+                        "ram_percent": round(total_ram_percent, 1),
+                        "risk_level": self._get_risk_level(total_ram_percent),
+                    },
+                    "available_ram_mb": round(available_ram_mb, 1),
+                    "file_count": len(file_paths),
+                    "recommend_partial_loading": total_ram_percent > 30,
+                },
+                message=f"Checked {len(file_paths)} files: {total_size_mb:.1f} MB total, ~{total_ram_percent:.0f}% of available RAM",
+            )
+
+        except Exception as e:
+            return self.handle_error(e, "Checking batch file sizes")
+
+    def load_batch_event_lists(
+        self,
+        files: List[Dict[str, Any]],
+        use_same_settings: bool = True,
+        # Shared settings (used when use_same_settings=True)
+        shared_fmt: str = "ogip",
+        shared_rmf_file: Optional[str] = None,
+        shared_additional_columns: Optional[List[str]] = None,
+        shared_high_precision: bool = False,
+        shared_skip_checks: bool = False,
+        shared_use_partial_loading: bool = False,
+        shared_partial_mode: str = "time_range",
+        shared_time_range_start: Optional[float] = None,
+        shared_time_range_end: Optional[float] = None,
+        shared_event_start_index: Optional[int] = None,
+        shared_event_count: Optional[int] = None,
+        max_workers: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Load multiple EventLists in parallel using threads.
+
+        Args:
+            files: List of dicts with file configurations. Each dict should have:
+                - file_path: str (required)
+                - name: str (required)
+                - fmt: str (optional, used if use_same_settings=False)
+                - rmf_file: Optional[str]
+                - additional_columns: Optional[List[str]]
+                - high_precision: bool
+                - skip_checks: bool
+                - use_partial_loading: bool
+                - partial_mode: str ('time_range' or 'event_count')
+                - time_range_start/end: Optional[float]
+                - event_start_index/count: Optional[int]
+            use_same_settings: If True, use shared_* settings for all files
+            shared_*: Settings applied to all files when use_same_settings=True
+            max_workers: Max parallel threads (default: min(cpu_count, len(files), 8))
+
+        Returns:
+            Result with successful[], failed[], and summary statistics
+        """
+        start_time = time.time()
+
+        if not files:
+            return self.create_result(
+                success=False,
+                message="No files provided for batch loading",
+            )
+
+        # Pre-validate: check for duplicate names in the request
+        names = [f.get("name", "") for f in files]
+        duplicate_names = [name for name in set(names) if names.count(name) > 1]
+        if duplicate_names:
+            return self.create_result(
+                success=False,
+                message=f"Duplicate names in request: {duplicate_names}",
+            )
+
+        # Pre-validate: check no names already exist in state
+        existing_names = []
+        for f in files:
+            name = f.get("name", "")
+            if name and self.state.has_event_data(name):
+                existing_names.append(name)
+        if existing_names:
+            return self.create_result(
+                success=False,
+                message=f"Names already exist in state: {existing_names}",
+            )
+
+        # Determine worker count
+        if max_workers is None:
+            max_workers = min(os.cpu_count() or 4, len(files), 8)
+
+        successful: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+
+        def load_single_file(file_config: Dict[str, Any]) -> Dict[str, Any]:
+            """Load a single file with the appropriate settings."""
+            file_path = file_config.get("file_path", "")
+            name = file_config.get("name", "")
+
+            if not file_path or not name:
+                return {
+                    "success": False,
+                    "name": name,
+                    "file_path": file_path,
+                    "error": "Missing file_path or name",
+                }
+
+            # Determine settings to use
+            if use_same_settings:
+                fmt = shared_fmt
+                rmf_file = shared_rmf_file
+                additional_columns = shared_additional_columns
+                high_precision = shared_high_precision
+                skip_checks = shared_skip_checks
+                use_partial = shared_use_partial_loading
+                partial_mode = shared_partial_mode
+                time_start = shared_time_range_start
+                time_end = shared_time_range_end
+                event_start = shared_event_start_index
+                event_cnt = shared_event_count
+            else:
+                # Use per-file settings
+                fmt = file_config.get("fmt", "ogip")
+                rmf_file = file_config.get("rmf_file")
+                additional_columns = file_config.get("additional_columns")
+                high_precision = file_config.get("high_precision", False)
+                skip_checks = file_config.get("skip_checks", False)
+                use_partial = file_config.get("use_partial_loading", False)
+                partial_mode = file_config.get("partial_mode", "time_range")
+                time_start = file_config.get("time_range_start")
+                time_end = file_config.get("time_range_end")
+                event_start = file_config.get("event_start_index")
+                event_cnt = file_config.get("event_count")
+
+            try:
+                if use_partial:
+                    if partial_mode == "time_range":
+                        if time_start is None or time_end is None:
+                            return {
+                                "success": False,
+                                "name": name,
+                                "file_path": file_path,
+                                "error": "Partial loading (time_range) requires time_range_start and time_range_end",
+                            }
+                        result = self.load_event_list_by_time_range(
+                            file_path, name, time_start, time_end, fmt
+                        )
+                    else:  # event_count
+                        result = self.load_event_list_by_event_count(
+                            file_path, name,
+                            event_start or 0,
+                            event_cnt or 10000,
+                            fmt
+                        )
+                else:
+                    result = self.load_event_list(
+                        file_path, name, fmt,
+                        rmf_file, additional_columns,
+                        high_precision, skip_checks
+                    )
+
+                return {
+                    "success": result.get("success", False),
+                    "name": name,
+                    "file_path": file_path,
+                    "data": result.get("data"),
+                    "message": result.get("message"),
+                    "error": result.get("error") if not result.get("success") else None,
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "name": name,
+                    "file_path": file_path,
+                    "error": str(e),
+                }
+
+        # Execute loading in parallel
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(load_single_file, f): f
+                for f in files
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_file):
+                file_info = future_to_file[future]
+                try:
+                    result = future.result()
+                    if result.get("success"):
+                        successful.append({
+                            "name": result["name"],
+                            "file_path": result["file_path"],
+                            "data": result.get("data"),
+                            "message": result.get("message"),
+                        })
+                    else:
+                        failed.append({
+                            "name": result.get("name", file_info.get("name", "")),
+                            "file_path": result.get("file_path", file_info.get("file_path", "")),
+                            "error": result.get("error", "Unknown error"),
+                        })
+                except Exception as e:
+                    failed.append({
+                        "name": file_info.get("name", ""),
+                        "file_path": file_info.get("file_path", ""),
+                        "error": str(e),
+                    })
+
+        total_time_ms = (time.time() - start_time) * 1000
+        total_events = sum(
+            s.get("data", {}).get("n_events", 0) if s.get("data") else 0
+            for s in successful
+        )
+
+        return self.create_result(
+            success=len(failed) == 0,
+            data={
+                "successful": successful,
+                "failed": failed,
+                "summary": {
+                    "total_files": len(files),
+                    "success_count": len(successful),
+                    "failure_count": len(failed),
+                    "total_events_loaded": total_events,
+                    "total_time_ms": round(total_time_ms, 1),
+                    "workers_used": max_workers,
+                },
+            },
+            message=f"Loaded {len(successful)}/{len(files)} files ({total_events:,} total events) in {total_time_ms:.0f}ms",
+        )
+
+    async def load_batch_event_lists_stream(
+        self,
+        files: List[Dict[str, Any]],
+        use_same_settings: bool = True,
+        shared_fmt: str = "ogip",
+        shared_rmf_file: Optional[str] = None,
+        shared_additional_columns: Optional[List[str]] = None,
+        shared_high_precision: bool = False,
+        shared_skip_checks: bool = False,
+        shared_use_partial_loading: bool = False,
+        shared_partial_mode: str = "time_range",
+        shared_time_range_start: Optional[float] = None,
+        shared_time_range_end: Optional[float] = None,
+        shared_event_start_index: Optional[int] = None,
+        shared_event_count: Optional[int] = None,
+        max_workers: Optional[int] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Stream batch loading results as they complete via SSE.
+
+        Yields events for each file completion and a final summary event.
+        This allows the frontend to update progress incrementally instead of
+        waiting for all files to complete.
+
+        Args:
+            files: List of file configurations (same as load_batch_event_lists)
+            use_same_settings: If True, use shared_* settings for all files
+            shared_*: Shared settings applied when use_same_settings=True
+            max_workers: Max parallel threads
+
+        Yields:
+            Dict events with type 'file_complete' or 'complete'
+        """
+        start_time = time.time()
+
+        if not files:
+            yield {
+                "type": "error",
+                "error": "No files provided for batch loading",
+            }
+            return
+
+        # Pre-validate: check for duplicate names in the request
+        names = [f.get("name", "") for f in files]
+        duplicate_names = [name for name in set(names) if names.count(name) > 1]
+        if duplicate_names:
+            yield {
+                "type": "error",
+                "error": f"Duplicate names in request: {duplicate_names}",
+            }
+            return
+
+        # Pre-validate: check no names already exist in state
+        existing_names = []
+        for f in files:
+            name = f.get("name", "")
+            if name and self.state.has_event_data(name):
+                existing_names.append(name)
+        if existing_names:
+            yield {
+                "type": "error",
+                "error": f"Names already exist in state: {existing_names}",
+            }
+            return
+
+        # Determine worker count
+        if max_workers is None:
+            max_workers = min(os.cpu_count() or 4, len(files), 8)
+
+        successful: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+
+        def load_single_file(file_config: Dict[str, Any]) -> Dict[str, Any]:
+            """Load a single file with the appropriate settings."""
+            file_path = file_config.get("file_path", "")
+            name = file_config.get("name", "")
+
+            if not file_path or not name:
+                return {
+                    "success": False,
+                    "name": name,
+                    "file_path": file_path,
+                    "error": "Missing file_path or name",
+                }
+
+            # Determine settings to use
+            if use_same_settings:
+                fmt = shared_fmt
+                rmf_file = shared_rmf_file
+                additional_columns = shared_additional_columns
+                high_precision = shared_high_precision
+                skip_checks = shared_skip_checks
+                use_partial = shared_use_partial_loading
+                partial_mode = shared_partial_mode
+                time_start = shared_time_range_start
+                time_end = shared_time_range_end
+                event_start = shared_event_start_index
+                event_cnt = shared_event_count
+            else:
+                # Use per-file settings
+                fmt = file_config.get("fmt", "ogip")
+                rmf_file = file_config.get("rmf_file")
+                additional_columns = file_config.get("additional_columns")
+                high_precision = file_config.get("high_precision", False)
+                skip_checks = file_config.get("skip_checks", False)
+                use_partial = file_config.get("use_partial_loading", False)
+                partial_mode = file_config.get("partial_mode", "time_range")
+                time_start = file_config.get("time_range_start")
+                time_end = file_config.get("time_range_end")
+                event_start = file_config.get("event_start_index")
+                event_cnt = file_config.get("event_count")
+
+            try:
+                if use_partial:
+                    if partial_mode == "time_range":
+                        if time_start is None or time_end is None:
+                            return {
+                                "success": False,
+                                "name": name,
+                                "file_path": file_path,
+                                "error": "Partial loading (time_range) requires time_range_start and time_range_end",
+                            }
+                        result = self.load_event_list_by_time_range(
+                            file_path, name, time_start, time_end, fmt
+                        )
+                    else:  # event_count
+                        result = self.load_event_list_by_event_count(
+                            file_path, name,
+                            event_start or 0,
+                            event_cnt or 10000,
+                            fmt
+                        )
+                else:
+                    result = self.load_event_list(
+                        file_path, name, fmt,
+                        rmf_file, additional_columns,
+                        high_precision, skip_checks
+                    )
+
+                return {
+                    "success": result.get("success", False),
+                    "name": name,
+                    "file_path": file_path,
+                    "data": result.get("data"),
+                    "message": result.get("message"),
+                    "error": result.get("error") if not result.get("success") else None,
+                }
+            except Exception as e:
+                return {
+                    "success": False,
+                    "name": name,
+                    "file_path": file_path,
+                    "error": str(e),
+                }
+
+        # Execute loading in parallel, yielding results as they complete
+        # Use asyncio to wrap thread pool futures for proper async handling
+        loop = asyncio.get_event_loop()
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks and wrap them as asyncio futures
+            future_to_file = {
+                executor.submit(load_single_file, f): f
+                for f in files
+            }
+
+            # Convert to asyncio futures for proper async iteration
+            pending = {
+                asyncio.wrap_future(future): (future, file_info)
+                for future, file_info in future_to_file.items()
+            }
+
+            completed = 0
+            while pending:
+                # Wait for the next future to complete (non-blocking)
+                done, _ = await asyncio.wait(
+                    pending.keys(),
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+
+                for async_future in done:
+                    original_future, file_info = pending.pop(async_future)
+                    completed += 1
+
+                    try:
+                        result = async_future.result()
+                        if result.get("success"):
+                            successful.append({
+                                "name": result["name"],
+                                "file_path": result["file_path"],
+                                "data": result.get("data"),
+                                "message": result.get("message"),
+                            })
+                            yield {
+                                "type": "file_complete",
+                                "name": result["name"],
+                                "file_path": result["file_path"],
+                                "success": True,
+                                "completed": completed,
+                                "total": len(files),
+                                "data": result.get("data"),
+                            }
+                        else:
+                            error_msg = result.get("error", "Unknown error")
+                            failed.append({
+                                "name": result.get("name", file_info.get("name", "")),
+                                "file_path": result.get("file_path", file_info.get("file_path", "")),
+                                "error": error_msg,
+                            })
+                            yield {
+                                "type": "file_complete",
+                                "name": result.get("name", file_info.get("name", "")),
+                                "file_path": result.get("file_path", file_info.get("file_path", "")),
+                                "success": False,
+                                "completed": completed,
+                                "total": len(files),
+                                "error": error_msg,
+                            }
+                    except Exception as e:
+                        failed.append({
+                            "name": file_info.get("name", ""),
+                            "file_path": file_info.get("file_path", ""),
+                            "error": str(e),
+                        })
+                        yield {
+                            "type": "file_complete",
+                            "name": file_info.get("name", ""),
+                            "file_path": file_info.get("file_path", ""),
+                            "success": False,
+                            "completed": completed,
+                            "total": len(files),
+                            "error": str(e),
+                        }
+
+                    # Allow event loop to flush the SSE response
+                    await asyncio.sleep(0)
+
+        # Final completion event with summary
+        total_time_ms = (time.time() - start_time) * 1000
+        total_events = sum(
+            s.get("data", {}).get("n_events", 0) if s.get("data") else 0
+            for s in successful
+        )
+
+        yield {
+            "type": "complete",
+            "total_time_ms": round(total_time_ms, 1),
+            "success_count": len(successful),
+            "failure_count": len(failed),
+            "total_events": total_events,
+            "workers_used": max_workers,
+        }

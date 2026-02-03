@@ -16,12 +16,14 @@ export interface AppResources {
   electronRenderer: ProcessResources | null;
   // Combined totals (what the app is actually using)
   totalMemoryMb: number;
-  totalCpuPercent: number;
+  totalCpuPercent: number;  // Raw sum (can exceed 100% on multi-core)
   // System reference info
   systemMemoryTotalMb: number;
   systemMemoryAvailableMb: number;
-  // Calculated app percentage of system
+  systemCpuCount: number;
+  // Calculated app percentage of system capacity
   appMemoryPercent: number;
+  appCpuPercent: number;  // Normalized to total system CPU capacity (0-100%)
 }
 
 // Legacy interface for backwards compatibility
