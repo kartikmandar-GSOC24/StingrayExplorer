@@ -27,6 +27,8 @@ import {
   FormatListBulleted as FormattedIcon,
 } from '@mui/icons-material';
 import { useLogStore, selectFilteredLogs, LogEntry } from '@/store/logStore';
+import { useBackendContext } from '@/App';
+import { logStreamClient } from '@/api/logApi';
 
 /**
  * Format timestamp for display
@@ -216,6 +218,7 @@ const LogPanel: React.FC = () => {
   const logsEndRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [rawView, setRawView] = useState(false);
+  const { isReady: backendReady } = useBackendContext();
 
   // Listen for logs from Electron main process
   useEffect(() => {
@@ -231,6 +234,21 @@ const LogPanel: React.FC = () => {
       return unsubscribe;
     }
   }, []);
+
+  // Connect to Python backend log stream via SSE when backend is ready
+  useEffect(() => {
+    if (backendReady) {
+      // Small delay to ensure backend is fully initialized
+      const timer = setTimeout(() => {
+        logStreamClient.connect();
+      }, 1000);
+
+      return () => {
+        clearTimeout(timer);
+        logStreamClient.disconnect();
+      };
+    }
+  }, [backendReady]);
 
   // Auto-scroll to bottom when new logs arrive
   useEffect(() => {

@@ -16,9 +16,10 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routes import data_routes, lightcurve_routes, spectrum_routes, timing_routes, export_routes
+from routes import data_routes, lightcurve_routes, spectrum_routes, timing_routes, export_routes, log_routes
 from services.state_manager import StateManager
 from utils.performance_monitor import PerformanceMonitor
+from utils.log_stream import log_stream_manager
 
 
 # Filter to suppress /api/status access logs (polled every 2s, would flood logs)
@@ -59,12 +60,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.state_manager = state_manager
     app.state.performance_monitor = performance_monitor
 
+    # Install log streaming to capture Python logs and warnings
+    log_stream_manager.install(log_level=logging.DEBUG)
+
     print("Backend initialized successfully")
     yield
 
     # Shutdown
     print("Shutting down Stingray Explorer Backend...")
-    # Cleanup if needed
+    # Uninstall log streaming
+    log_stream_manager.uninstall()
 
 
 def create_app() -> FastAPI:
@@ -91,6 +96,7 @@ def create_app() -> FastAPI:
     app.include_router(spectrum_routes.router, prefix="/api/spectrum", tags=["Spectrum"])
     app.include_router(timing_routes.router, prefix="/api/timing", tags=["Timing"])
     app.include_router(export_routes.router, prefix="/api/export", tags=["Export"])
+    app.include_router(log_routes.router, prefix="/api/logs", tags=["Logs"])
 
     @app.get("/")
     async def root():
