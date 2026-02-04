@@ -275,6 +275,36 @@ export type BatchStreamEvent =
   | BatchStreamEventComplete
   | BatchStreamEventError;
 
+// URL Download SSE Streaming types
+export interface UrlDownloadProgressEvent {
+  type: 'progress';
+  bytes_downloaded: number;
+  total_bytes: number;
+  percent: number;
+}
+
+export interface UrlDownloadProcessingEvent {
+  type: 'processing';
+  message: string;
+}
+
+export interface UrlDownloadCompleteEvent {
+  type: 'complete';
+  data: EventListSummary;
+  message: string;
+}
+
+export interface UrlDownloadErrorEvent {
+  type: 'error';
+  error: string;
+}
+
+export type UrlDownloadStreamEvent =
+  | UrlDownloadProgressEvent
+  | UrlDownloadProcessingEvent
+  | UrlDownloadCompleteEvent
+  | UrlDownloadErrorEvent;
+
 export interface EventListFullPreview {
   name: string;
   // Core data
@@ -361,6 +391,7 @@ export const dataApi = {
     additional_columns?: string[];
     high_precision?: boolean;
     skip_checks?: boolean;
+    notes?: string;
   }): Promise<ApiResponse<EventListSummary>> {
     return apiClient.post('/api/data/load-url', {
       url: params.url,
@@ -370,7 +401,99 @@ export const dataApi = {
       additional_columns: params.additional_columns,
       high_precision: params.high_precision || false,
       skip_checks: params.skip_checks || false,
+      notes: params.notes,
     });
+  },
+
+  /**
+   * Load an EventList from a URL with SSE streaming for progress updates.
+   *
+   * This function returns an async generator that yields UrlDownloadStreamEvent
+   * objects as the download progresses. This allows the UI to show real-time
+   * download progress.
+   *
+   * @param params - URL loading parameters
+   * @yields UrlDownloadStreamEvent - Progress, processing, complete, or error events
+   */
+  async *loadEventListFromUrlSSE(params: {
+    url: string;
+    name: string;
+    fmt?: string;
+    rmf_file?: string;
+    additional_columns?: string[];
+    high_precision?: boolean;
+    skip_checks?: boolean;
+    notes?: string;
+  }): AsyncGenerator<UrlDownloadStreamEvent, void, unknown> {
+    const port = await apiClient.getPort();
+    const url = `http://localhost:${port}/api/data/load-url-stream`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: params.url,
+        name: params.name,
+        fmt: params.fmt || 'ogip',
+        rmf_file: params.rmf_file,
+        additional_columns: params.additional_columns,
+        high_precision: params.high_precision || false,
+        skip_checks: params.skip_checks || false,
+        notes: params.notes,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('No response body available for streaming');
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE format: "data: {...}\n\n"
+        const lines = buffer.split('\n\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const jsonStr = line.slice(6);
+            try {
+              const event = JSON.parse(jsonStr) as UrlDownloadStreamEvent;
+              yield event;
+            } catch (parseError) {
+              console.error('Failed to parse SSE event:', parseError, jsonStr);
+            }
+          }
+        }
+      }
+
+      // Process remaining buffer
+      if (buffer.trim() && buffer.startsWith('data: ')) {
+        const jsonStr = buffer.slice(6).trim();
+        if (jsonStr) {
+          try {
+            const event = JSON.parse(jsonStr) as UrlDownloadStreamEvent;
+            yield event;
+          } catch (parseError) {
+            console.error('Failed to parse final SSE event:', parseError, jsonStr);
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
   },
 
   /**

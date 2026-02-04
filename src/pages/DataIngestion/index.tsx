@@ -65,6 +65,7 @@ import BoltIcon from '@mui/icons-material/Bolt';
 import AccessTimeIcon from '@mui/icons-material/AccessTime';
 import NumbersIcon from '@mui/icons-material/Numbers';
 import QueryStatsIcon from '@mui/icons-material/QueryStats';
+import PublicIcon from '@mui/icons-material/Public';
 import {
   dataApi,
   EventListSummary,
@@ -78,9 +79,8 @@ import {
   BatchLoadSuccessItem,
   BatchLoadFailedItem,
   ValidationIssue,
-  PerGtiRate,
-  FitsHeaderInfo,
 } from '@/api/dataApi';
+import HeasarcBrowserPanel from './HeasarcBrowserPanel';
 import { apiClient } from '@/api/client';
 import { useUIStore } from '@/store/uiStore';
 
@@ -172,11 +172,15 @@ const DataIngestionPage: React.FC = () => {
   const [fileMetadata, setFileMetadata] = useState<FileMetadata | null>(null);
   const [isLoadingMetadata, setIsLoadingMetadata] = useState<boolean>(false);
 
+  // Tab state for data input method
+  const [dataInputTab, setDataInputTab] = useState<number>(0);
+
   // Form state - URL Loading
   const [urlInput, setUrlInput] = useState<string>('');
   const [urlEventListName, setUrlEventListName] = useState<string>('');
   const [urlFormat, setUrlFormat] = useState<string>('ogip');
   const [isLoadingUrl, setIsLoadingUrl] = useState<boolean>(false);
+  const [urlDownloadProgress, setUrlDownloadProgress] = useState<number | null>(null);
 
   // Loaded data state
   const [loadedEventLists, setLoadedEventLists] = useState<EventListSummary[]>([]);
@@ -1030,7 +1034,7 @@ const DataIngestionPage: React.FC = () => {
     }
   };
 
-  // Handle loading from URL
+  // Handle loading from URL with SSE streaming for progress
   const handleLoadFromUrl = async (): Promise<void> => {
     if (!urlInput.trim()) {
       showAlert('Please enter a URL', 'warning');
@@ -1051,35 +1055,49 @@ const DataIngestionPage: React.FC = () => {
     }
 
     setIsLoadingUrl(true);
-    setProcessing(true, `Fetching from URL...`);
+    setUrlDownloadProgress(0);
+    setProcessing(true, `Downloading from URL...`);
     setAlert({ open: false, message: '', severity: 'info' });
 
     try {
       await apiClient.getPort();
 
-      const response = await dataApi.loadEventListFromUrl({
+      // Use SSE streaming for progress updates
+      for await (const event of dataApi.loadEventListFromUrlSSE({
         url: urlInput.trim(),
         name: urlEventListName.trim(),
         fmt: urlFormat,
         high_precision: highPrecision,
         skip_checks: skipChecks,
-      });
-
-      if (response.success) {
-        showAlert(response.message || 'Event List loaded from URL successfully!', 'success', 'URL Data Loaded');
-        // Reset form
-        setUrlInput('');
-        setUrlEventListName('');
-        // Refresh the list
-        await fetchEventLists();
-      } else {
-        showAlert(response.message || 'Failed to load Event List from URL', 'error', 'URL Load Failed');
+      })) {
+        switch (event.type) {
+          case 'progress':
+            setUrlDownloadProgress(event.percent);
+            setProcessing(true, `Downloading... ${event.percent.toFixed(0)}%`);
+            break;
+          case 'processing':
+            setUrlDownloadProgress(100);
+            setProcessing(true, event.message);
+            break;
+          case 'complete':
+            showAlert(event.message || 'Event List loaded from URL successfully!', 'success', 'URL Data Loaded');
+            // Reset form
+            setUrlInput('');
+            setUrlEventListName('');
+            // Refresh the list
+            await fetchEventLists();
+            break;
+          case 'error':
+            showAlert(event.error || 'Failed to load Event List from URL', 'error', 'URL Load Failed');
+            break;
+        }
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
       showAlert(`Error: ${errorMessage}`, 'error', 'URL Load Error');
     } finally {
       setIsLoadingUrl(false);
+      setUrlDownloadProgress(null);
       setProcessing(false);
     }
   };
@@ -1177,11 +1195,38 @@ const DataIngestionPage: React.FC = () => {
         </Alert>
       )}
 
-      <Grid container spacing={3}>
-        {/* Load from Local File */}
-        <Grid item xs={12} md={6}>
-          <Card variant="outlined" sx={{ height: '100%' }}>
-            <CardContent>
+      {/* Data Input Tabs */}
+      <Card variant="outlined" sx={{ mb: 4 }}>
+        <Tabs
+          value={dataInputTab}
+          onChange={(_, newValue) => setDataInputTab(newValue)}
+          variant="fullWidth"
+          sx={{ borderBottom: 1, borderColor: 'divider' }}
+        >
+          <Tab
+            icon={<UploadFileIcon />}
+            iconPosition="start"
+            label="Local File"
+            sx={{ textTransform: 'none' }}
+          />
+          <Tab
+            icon={<CloudUploadIcon />}
+            iconPosition="start"
+            label="From URL"
+            sx={{ textTransform: 'none' }}
+          />
+          <Tab
+            icon={<PublicIcon />}
+            iconPosition="start"
+            label="Browse HEASARC"
+            sx={{ textTransform: 'none' }}
+          />
+        </Tabs>
+
+        <CardContent>
+          {/* Tab 0: Load from Local File */}
+          {dataInputTab === 0 && (
+            <Box>
               <Box sx={{ display: 'flex', alignItems: 'center', mb: 2 }}>
                 <UploadFileIcon sx={{ fontSize: 32, color: 'primary.main', mr: 1 }} />
                 <Typography variant="h6">Load Local File</Typography>
@@ -2034,14 +2079,12 @@ const DataIngestionPage: React.FC = () => {
                   </Typography>
                 </Box>
               )}
-            </CardContent>
-          </Card>
-        </Grid>
+            </Box>
+          )}
 
-        {/* Load from URL */}
-        <Grid item xs={12} md={6}>
-          <Card variant="outlined" sx={{ height: '100%' }}>
-            <CardContent>
+          {/* Tab 1: Load from URL */}
+          {dataInputTab === 1 && (
+            <Box>
               <Box sx={{ display: 'flex', alignItems: 'center', mb: 2 }}>
                 <CloudUploadIcon sx={{ fontSize: 32, color: 'primary.main', mr: 1 }} />
                 <Typography variant="h6">Load from URL</Typography>
@@ -2093,6 +2136,18 @@ const DataIngestionPage: React.FC = () => {
                 </Select>
               </FormControl>
 
+              {/* Download Progress */}
+              {urlDownloadProgress !== null && (
+                <Box sx={{ mb: 2 }}>
+                  <LinearProgress variant="determinate" value={urlDownloadProgress} />
+                  <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
+                    {urlDownloadProgress < 100
+                      ? `Downloading... ${urlDownloadProgress.toFixed(0)}%`
+                      : 'Processing file...'}
+                  </Typography>
+                </Box>
+              )}
+
               {/* Load Button */}
               <Button
                 variant="contained"
@@ -2101,12 +2156,21 @@ const DataIngestionPage: React.FC = () => {
                 fullWidth
                 startIcon={isLoadingUrl ? <CircularProgress size={20} /> : <CloudUploadIcon />}
               >
-                {isLoadingUrl ? 'Fetching...' : 'Fetch from URL'}
+                {isLoadingUrl
+                  ? (urlDownloadProgress !== null && urlDownloadProgress < 100
+                    ? `Downloading ${urlDownloadProgress.toFixed(0)}%...`
+                    : 'Processing...')
+                  : 'Fetch from URL'}
               </Button>
-            </CardContent>
-          </Card>
-        </Grid>
-      </Grid>
+            </Box>
+          )}
+
+          {/* Tab 2: Browse HEASARC */}
+          {dataInputTab === 2 && (
+            <HeasarcBrowserPanel onDataLoaded={fetchEventLists} />
+          )}
+        </CardContent>
+      </Card>
 
       {/* Loaded Event Lists */}
       <Paper variant="outlined" sx={{ mt: 4, p: 3 }}>

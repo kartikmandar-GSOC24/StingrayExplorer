@@ -805,6 +805,177 @@ class DataService(BaseService):
                 e, "Loading event list from URL", url=url, name=name, fmt=fmt
             )
 
+    async def load_event_list_from_url_stream(
+        self,
+        url: str,
+        name: str,
+        fmt: str = "ogip",
+        rmf_file: Optional[str] = None,
+        additional_columns: Optional[List[str]] = None,
+        high_precision: bool = False,
+        skip_checks: bool = False,
+        notes: Optional[str] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Load an EventList from a URL with SSE streaming for progress updates.
+
+        Yields progress events during download and processing, allowing
+        the frontend to show real-time progress.
+
+        Args:
+            url: URL to download the event file from
+            name: Name to assign to the loaded event list
+            fmt: File format
+            rmf_file: Optional path to local RMF file for energy calibration
+            additional_columns: Optional list of additional columns to read
+            high_precision: Use numpy.float128 for time array (pulsar timing)
+            skip_checks: Skip time ordering and GTI validation (performance)
+            notes: Optional notes/comments to attach to the event list
+
+        Yields:
+            Dict events with types: 'progress', 'processing', 'complete', 'error'
+        """
+        import httpx
+
+        try:
+            # Validate the name doesn't already exist
+            if self.state.has_event_data(name):
+                yield {
+                    "type": "error",
+                    "error": f"An event list with the name '{name}' already exists.",
+                }
+                return
+
+            # Start download with progress tracking
+            temp_filename = None
+            try:
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    # Use streaming response to track download progress
+                    async with client.stream("GET", url) as response:
+                        response.raise_for_status()
+
+                        # Get total file size if available
+                        total_bytes = int(response.headers.get("content-length", 0))
+
+                        # Create temporary file
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{fmt}") as tmp_file:
+                            temp_filename = tmp_file.name
+                            bytes_downloaded = 0
+
+                            # Download in chunks with progress updates
+                            async for chunk in response.aiter_bytes(chunk_size=65536):
+                                tmp_file.write(chunk)
+                                bytes_downloaded += len(chunk)
+
+                                # Yield progress event
+                                percent = (bytes_downloaded / total_bytes * 100) if total_bytes > 0 else 0
+                                yield {
+                                    "type": "progress",
+                                    "bytes_downloaded": bytes_downloaded,
+                                    "total_bytes": total_bytes,
+                                    "percent": round(percent, 1),
+                                }
+
+                                # Allow event loop to process
+                                await asyncio.sleep(0)
+
+                # Yield processing event
+                yield {
+                    "type": "processing",
+                    "message": "Download complete, loading event list...",
+                }
+                await asyncio.sleep(0)
+
+                # Detect file type before attempting to load (for FITS files)
+                is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+                if is_fits:
+                    file_type_info = self._detect_fits_file_type(temp_filename)
+                    if not file_type_info["is_event_list"]:
+                        # Clean up temp file
+                        if temp_filename and os.path.exists(temp_filename):
+                            os.remove(temp_filename)
+                        yield {
+                            "type": "error",
+                            "error": f"Cannot load '{name}' as Event List: {file_type_info['error_message']}",
+                        }
+                        return
+
+                # Load the event list (blocking, but typically fast after download)
+                def _load_event_list():
+                    return EventList.read(
+                        temp_filename,
+                        fmt=fmt,
+                        rmf_file=rmf_file,
+                        additional_columns=additional_columns,
+                        high_precision=high_precision,
+                        skip_checks=skip_checks,
+                    )
+
+                # Run blocking I/O in thread pool
+                loop = asyncio.get_event_loop()
+                event_list = await loop.run_in_executor(None, _load_event_list)
+
+            finally:
+                # Clean up temporary file
+                if temp_filename and os.path.exists(temp_filename):
+                    os.remove(temp_filename)
+
+            # Fix inverted GTI intervals (common with unsorted data)
+            gti_was_fixed = self._fix_inverted_gti(event_list)
+
+            # Add to state manager with notes
+            self.state.add_event_data(name, event_list, notes=notes)
+
+            # Validate GTI and collect warnings
+            gti_warnings = self._validate_gti(event_list)
+            if gti_was_fixed:
+                gti_warnings.insert(0, "GTI intervals were inverted and automatically fixed.")
+
+            # Validate data quality
+            validation_issues = self._validate_data_quality(event_list)
+
+            summary = {
+                "name": name,
+                "n_events": len(event_list.time),
+                "time_range": [
+                    _to_python_float(event_list.time.min()),
+                    _to_python_float(event_list.time.max())
+                ],
+                "has_energy": event_list.energy is not None,
+                "has_pi": event_list.pi is not None,
+                "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
+                "gti_warnings": gti_warnings if gti_warnings else None,
+                "validation_issues": validation_issues,
+                "notes": notes,
+            }
+
+            # Build message with warnings if present
+            message = f"EventList '{name}' loaded successfully from URL"
+            if gti_warnings:
+                message += f" [GTI warnings: {len(gti_warnings)}]"
+
+            yield {
+                "type": "complete",
+                "data": summary,
+                "message": message,
+            }
+
+        except httpx.HTTPStatusError as e:
+            yield {
+                "type": "error",
+                "error": f"HTTP error {e.response.status_code}: {e.response.reason_phrase}",
+            }
+        except httpx.RequestError as e:
+            yield {
+                "type": "error",
+                "error": f"Failed to download file from URL: {str(e)}",
+            }
+        except Exception as e:
+            yield {
+                "type": "error",
+                "error": f"Error loading event list: {str(e)}",
+            }
+
     def save_event_list(
         self,
         name: str,

@@ -25,3 +25,6 @@ python-multipart>=0.0.6
 
 # Optional: async support
 aiofiles>=23.2.1
+
+# HEASARC archive queries
+astroquery>=0.4.8

@@ -63,6 +63,13 @@ aiofiles = "*"
 psutil = ">=5.9"
 requests = ">=2.31"
 
+# HEASARC archive queries
+astroquery = ">=0.4.8"
+
+# HTML parsing for HEASARC directory listings
+beautifulsoup4 = ">=4.12"
+lxml = ">=5.0"
+
 # Node.js (npm is included with nodejs)
 nodejs = ">=20"
 

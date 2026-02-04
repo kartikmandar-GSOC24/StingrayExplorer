@@ -16,7 +16,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routes import data_routes, lightcurve_routes, spectrum_routes, timing_routes, export_routes, log_routes
+from routes import data_routes, lightcurve_routes, spectrum_routes, timing_routes, export_routes, log_routes, archive_routes
 from services.state_manager import StateManager
 from utils.performance_monitor import PerformanceMonitor
 from utils.log_stream import log_stream_manager
@@ -97,6 +97,7 @@ def create_app() -> FastAPI:
     app.include_router(timing_routes.router, prefix="/api/timing", tags=["Timing"])
     app.include_router(export_routes.router, prefix="/api/export", tags=["Export"])
     app.include_router(log_routes.router, prefix="/api/logs", tags=["Logs"])
+    app.include_router(archive_routes.router, prefix="/api/archive", tags=["Archive"])
 
     @app.get("/")
     async def root():

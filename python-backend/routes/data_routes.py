@@ -44,6 +44,7 @@ class LoadEventListFromUrlRequest(BaseModel):
     additional_columns: Optional[List[str]] = None
     high_precision: bool = False
     skip_checks: bool = False
+    notes: Optional[str] = None
 
 
 class SaveEventListRequest(BaseModel):
@@ -161,6 +162,47 @@ async def load_event_list_from_url(
         additional_columns=request.additional_columns,
         high_precision=request.high_precision,
         skip_checks=request.skip_checks,
+    )
+
+
+@router.post("/load-url-stream")
+async def load_event_list_from_url_stream(
+    request: LoadEventListFromUrlRequest,
+    service: DataService = Depends(get_data_service),
+):
+    """
+    Load an EventList from a URL with SSE streaming for progress updates.
+
+    Returns Server-Sent Events (SSE) with download and processing progress,
+    allowing the frontend to show real-time download progress.
+
+    SSE Event Format:
+    - type: "progress" - Download progress with bytes_downloaded, total_bytes, percent
+    - type: "processing" - Download complete, now loading event list
+    - type: "complete" - Successfully loaded, includes data summary
+    - type: "error" - An error occurred
+    """
+    async def event_generator():
+        async for event in service.load_event_list_from_url_stream(
+            url=request.url,
+            name=request.name,
+            fmt=request.fmt,
+            rmf_file=request.rmf_file,
+            additional_columns=request.additional_columns,
+            high_precision=request.high_precision,
+            skip_checks=request.skip_checks,
+            notes=request.notes,
+        ):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
