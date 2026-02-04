@@ -33,6 +33,7 @@ class LoadEventListRequest(BaseModel):
     additional_columns: Optional[List[str]] = None
     high_precision: bool = False
     skip_checks: bool = False
+    notes: Optional[str] = None
 
 
 class LoadEventListFromUrlRequest(BaseModel):
@@ -62,6 +63,7 @@ class LoadByTimeRangeRequest(BaseModel):
     start_time: float
     end_time: float
     fmt: str = "ogip"
+    notes: Optional[str] = None
 
 
 class LoadByEventCountRequest(BaseModel):
@@ -71,6 +73,7 @@ class LoadByEventCountRequest(BaseModel):
     start_index: int = 0
     count: int = 10000
     fmt: str = "ogip"
+    notes: Optional[str] = None
 
 
 class GetFileMetadataRequest(BaseModel):
@@ -95,6 +98,8 @@ class SingleFileConfig(BaseModel):
     time_range_end: Optional[float] = None
     event_start_index: Optional[int] = None
     event_count: Optional[int] = None
+    # Per-file notes
+    notes: Optional[str] = None
 
 
 class BatchLoadEventListRequest(BaseModel):
@@ -138,6 +143,7 @@ async def load_event_list(
         additional_columns=request.additional_columns,
         high_precision=request.high_precision,
         skip_checks=request.skip_checks,
+        notes=request.notes,
     )
 
 
@@ -247,6 +253,7 @@ async def load_event_list_by_time_range(
         start_time=request.start_time,
         end_time=request.end_time,
         fmt=request.fmt,
+        notes=request.notes,
     )
 
 
@@ -267,6 +274,7 @@ async def load_event_list_by_event_count(
         start_index=request.start_index,
         count=request.count,
         fmt=request.fmt,
+        notes=request.notes,
     )
 
 

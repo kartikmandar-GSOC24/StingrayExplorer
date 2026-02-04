@@ -5,6 +5,51 @@
 import { apiClient, ApiResponse } from './client';
 
 // Types
+
+/** Validation check result from data quality checks */
+export interface ValidationIssue {
+  type: string;
+  name?: string;
+  description?: string;
+  status: 'pass' | 'fail' | 'skip';
+  severity: 'error' | 'warning' | 'pass' | 'skip';
+  message: string;
+  count?: number;
+  total?: number;
+}
+
+/** Per-GTI rate information */
+export interface PerGtiRate {
+  start: number;
+  stop: number;
+  events: number;
+  duration: number;
+  rate: number;
+}
+
+/** FITS header information extracted from the event file */
+export interface FitsHeaderInfo {
+  object?: string;
+  obs_id?: string;
+  ra_nom?: number;
+  dec_nom?: number;
+  ra_obj?: number;
+  dec_obj?: number;
+  exposure?: number;
+  ontime?: number;
+  livetime?: number;
+  date_obs?: string;
+  date_end?: string;
+  tstart?: number;
+  tstop?: number;
+  creator?: string;
+  telescop?: string;
+  instrume?: string;
+  datamode?: string;
+  observer?: string;
+  raw_header?: Record<string, string>;
+}
+
 export interface EventListSummary {
   name: string;
   n_events: number;
@@ -14,6 +59,8 @@ export interface EventListSummary {
   gti_count?: number;
   gti_warnings?: string[] | null;
   stingray_warnings?: string[] | null;
+  validation_issues?: ValidationIssue[] | null;
+  notes?: string | null;
 }
 
 export interface EventListInfo extends EventListSummary {
@@ -32,6 +79,11 @@ export interface EventListInfo extends EventListSummary {
   mean_count_rate?: number;
   min_time_diff?: number;
   max_time_diff?: number;
+  mean_time_diff?: number;
+  median_time_diff?: number;
+  std_time_diff?: number;
+  // Per-GTI rates
+  per_gti_rates?: PerGtiRate[];
 }
 
 export interface MemoryInfo {
@@ -73,6 +125,9 @@ export interface LazyLoadingInfo {
 
 export interface EventListLazyLoadedSummary extends EventListSummary {
   lazy_loading_info?: LazyLoadingInfo;
+  // These are inherited from EventListSummary but explicitly listed for clarity:
+  // validation_issues?: ValidationIssue[] | null;
+  // notes?: string | null;
 }
 
 export interface LoadingRecommendation {
@@ -116,6 +171,7 @@ export interface SingleFileConfig {
   time_range_end?: number;
   event_start_index?: number;
   event_count?: number;
+  notes?: string;
 }
 
 export interface BatchLoadRequest {
@@ -252,8 +308,19 @@ export interface EventListFullPreview {
   min_time_diff: number | null;
   max_time_diff: number | null;
   mean_time_diff?: number | null;
+  // Enhanced time statistics
+  median_time_diff?: number | null;
+  std_time_diff?: number | null;
+  // Per-GTI rates
+  per_gti_rates?: PerGtiRate[] | null;
   // Additional columns
   additional_columns: string[];
+  // User notes
+  notes?: string | null;
+  // Data validation
+  validation_issues?: ValidationIssue[] | null;
+  // FITS header information
+  header_info?: FitsHeaderInfo | null;
 }
 
 // API functions
@@ -269,6 +336,7 @@ export const dataApi = {
     additional_columns?: string[];
     high_precision?: boolean;
     skip_checks?: boolean;
+    notes?: string;
   }): Promise<ApiResponse<EventListSummary>> {
     return apiClient.post('/api/data/load', {
       file_path: params.file_path,
@@ -278,6 +346,7 @@ export const dataApi = {
       additional_columns: params.additional_columns,
       high_precision: params.high_precision || false,
       skip_checks: params.skip_checks || false,
+      notes: params.notes,
     });
   },
 
@@ -315,7 +384,7 @@ export const dataApi = {
     return apiClient.post('/api/data/save', {
       name: params.name,
       file_path: params.file_path,
-      fmt: params.fmt || 'ogip',
+      fmt: params.fmt || 'hdf5',
     });
   },
 
@@ -380,6 +449,7 @@ export const dataApi = {
     start_time: number;
     end_time: number;
     fmt?: string;
+    notes?: string;
   }): Promise<ApiResponse<EventListLazyLoadedSummary>> {
     return apiClient.post('/api/data/load-by-time-range', {
       file_path: params.file_path,
@@ -387,6 +457,7 @@ export const dataApi = {
       start_time: params.start_time,
       end_time: params.end_time,
       fmt: params.fmt || 'ogip',
+      notes: params.notes,
     });
   },
 
@@ -400,6 +471,7 @@ export const dataApi = {
     start_index?: number;
     count?: number;
     fmt?: string;
+    notes?: string;
   }): Promise<ApiResponse<EventListLazyLoadedSummary>> {
     return apiClient.post('/api/data/load-by-event-count', {
       file_path: params.file_path,
@@ -407,6 +479,7 @@ export const dataApi = {
       start_index: params.start_index ?? 0,
       count: params.count ?? 10000,
       fmt: params.fmt || 'ogip',
+      notes: params.notes,
     });
   },
 

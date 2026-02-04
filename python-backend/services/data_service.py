@@ -52,6 +52,41 @@ class DataService(BaseService):
     Handles loading, saving, and managing event lists without any UI dependencies.
     """
 
+    def _fix_inverted_gti(self, event_list: EventList) -> bool:
+        """
+        Fix inverted GTI intervals in an EventList (in-place).
+
+        When Stingray loads unsorted data without a GTI extension, it sets
+        GTI to [time[0], time[-1]] which can have start > stop for unsorted times.
+        This causes Stingray's internal check_gtis to fail on later operations.
+
+        This method sorts each GTI interval to ensure start <= stop.
+
+        Args:
+            event_list: The EventList to fix (modified in-place)
+
+        Returns:
+            True if any GTI was fixed, False otherwise
+        """
+        if event_list.gti is None or len(event_list.gti) == 0:
+            return False
+
+        fixed_any = False
+        fixed_gti = []
+        for g in event_list.gti:
+            start, stop = g[0], g[1]
+            if stop < start:
+                # Swap to fix inverted interval
+                fixed_gti.append([stop, start])
+                fixed_any = True
+            else:
+                fixed_gti.append([start, stop])
+
+        if fixed_any:
+            event_list.gti = np.array(fixed_gti)
+
+        return fixed_any
+
     def _validate_gti(self, event_list: EventList) -> List[str]:
         """
         Validate GTI (Good Time Intervals) for an EventList.
@@ -105,6 +140,405 @@ class DataService(BaseService):
 
         return warnings
 
+    def _validate_data_quality(self, event_list: EventList) -> List[Dict[str, Any]]:
+        """
+        Validate data quality beyond GTI checks.
+
+        Performs comprehensive validation including:
+        - NaN values in time/energy arrays
+        - Time ordering (monotonically increasing)
+        - Negative energy/PI values
+
+        Args:
+            event_list: The EventList to validate
+
+        Returns:
+            List of all validation check results with type, status, severity, message, and details
+        """
+        validations: List[Dict[str, Any]] = []
+
+        # Check 1: NaN in time array
+        if event_list.time is not None and len(event_list.time) > 0:
+            nan_count = int(np.sum(np.isnan(event_list.time)))
+            validations.append({
+                "type": "nan_time",
+                "name": "Time Array NaN Check",
+                "description": "Check for NaN (Not a Number) values in time array",
+                "status": "fail" if nan_count > 0 else "pass",
+                "severity": "error" if nan_count > 0 else "pass",
+                "message": f"Found {nan_count} NaN values" if nan_count > 0 else "No NaN values found",
+                "count": nan_count,
+                "total": len(event_list.time)
+            })
+
+            # Check 2: Time ordering (monotonically increasing)
+            time_diffs = np.diff(event_list.time)
+            disorder_count = int(np.sum(time_diffs < 0))
+            validations.append({
+                "type": "time_ordering",
+                "name": "Time Ordering Check",
+                "description": "Check if time values are monotonically increasing",
+                "status": "fail" if disorder_count > 0 else "pass",
+                "severity": "warning" if disorder_count > 0 else "pass",
+                "message": f"Found {disorder_count} time inversions (not monotonically increasing)" if disorder_count > 0 else "Time values are monotonically increasing",
+                "count": disorder_count,
+                "total": len(event_list.time) - 1
+            })
+        else:
+            validations.append({
+                "type": "nan_time",
+                "name": "Time Array NaN Check",
+                "description": "Check for NaN values in time array",
+                "status": "skip",
+                "severity": "skip",
+                "message": "No time data available",
+                "count": 0,
+                "total": 0
+            })
+            validations.append({
+                "type": "time_ordering",
+                "name": "Time Ordering Check",
+                "description": "Check if time values are monotonically increasing",
+                "status": "skip",
+                "severity": "skip",
+                "message": "No time data available",
+                "count": 0,
+                "total": 0
+            })
+
+        # Check 3: NaN in energy array
+        if event_list.energy is not None and len(event_list.energy) > 0:
+            nan_energy = int(np.sum(np.isnan(event_list.energy)))
+            validations.append({
+                "type": "nan_energy",
+                "name": "Energy Array NaN Check",
+                "description": "Check for NaN values in energy array",
+                "status": "fail" if nan_energy > 0 else "pass",
+                "severity": "error" if nan_energy > 0 else "pass",
+                "message": f"Found {nan_energy} NaN values" if nan_energy > 0 else "No NaN values found",
+                "count": nan_energy,
+                "total": len(event_list.energy)
+            })
+
+            # Check 4: Negative energy values
+            neg_energy = int(np.sum(event_list.energy < 0))
+            validations.append({
+                "type": "negative_energy",
+                "name": "Negative Energy Check",
+                "description": "Check for negative energy values (physically invalid)",
+                "status": "fail" if neg_energy > 0 else "pass",
+                "severity": "error" if neg_energy > 0 else "pass",
+                "message": f"Found {neg_energy} negative energy values" if neg_energy > 0 else "All energy values are non-negative",
+                "count": neg_energy,
+                "total": len(event_list.energy)
+            })
+        else:
+            validations.append({
+                "type": "nan_energy",
+                "name": "Energy Array NaN Check",
+                "description": "Check for NaN values in energy array",
+                "status": "skip",
+                "severity": "skip",
+                "message": "No energy data available",
+                "count": 0,
+                "total": 0
+            })
+            validations.append({
+                "type": "negative_energy",
+                "name": "Negative Energy Check",
+                "description": "Check for negative energy values",
+                "status": "skip",
+                "severity": "skip",
+                "message": "No energy data available",
+                "count": 0,
+                "total": 0
+            })
+
+        # Check 5: Negative PI values
+        if event_list.pi is not None and len(event_list.pi) > 0:
+            neg_pi = int(np.sum(event_list.pi < 0))
+            validations.append({
+                "type": "negative_pi",
+                "name": "Negative PI Check",
+                "description": "Check for negative PI (Pulse Invariant) channel values",
+                "status": "fail" if neg_pi > 0 else "pass",
+                "severity": "error" if neg_pi > 0 else "pass",
+                "message": f"Found {neg_pi} negative PI values" if neg_pi > 0 else "All PI values are non-negative",
+                "count": neg_pi,
+                "total": len(event_list.pi)
+            })
+        else:
+            validations.append({
+                "type": "negative_pi",
+                "name": "Negative PI Check",
+                "description": "Check for negative PI channel values",
+                "status": "skip",
+                "severity": "skip",
+                "message": "No PI data available",
+                "count": 0,
+                "total": 0
+            })
+
+        # Check 6: GTI validity (start < stop for all intervals)
+        if event_list.gti is not None and len(event_list.gti) > 0:
+            invalid_gti = sum(1 for g in event_list.gti if g[1] <= g[0])
+            validations.append({
+                "type": "gti_validity",
+                "name": "GTI Interval Check",
+                "description": "Check that all GTI intervals have valid start < stop times",
+                "status": "fail" if invalid_gti > 0 else "pass",
+                "severity": "error" if invalid_gti > 0 else "pass",
+                "message": f"Found {invalid_gti} invalid GTI intervals (stop <= start)" if invalid_gti > 0 else "All GTI intervals are valid",
+                "count": invalid_gti,
+                "total": len(event_list.gti)
+            })
+        else:
+            validations.append({
+                "type": "gti_validity",
+                "name": "GTI Interval Check",
+                "description": "Check that all GTI intervals have valid start < stop times",
+                "status": "skip",
+                "severity": "skip",
+                "message": "No GTI data available",
+                "count": 0,
+                "total": 0
+            })
+
+        return validations
+
+    def _parse_fits_header_string(self, header_str: str) -> Dict[str, str]:
+        """
+        Parse a FITS header string into a dictionary.
+
+        FITS headers have 80-character lines with format:
+        KEYWORD = value / comment
+        or
+        KEYWORD = 'string value' / comment
+
+        Args:
+            header_str: Raw FITS header string
+
+        Returns:
+            Dictionary of keyword -> value mappings
+        """
+        parsed: Dict[str, str] = {}
+
+        # Split into 80-character cards (FITS standard)
+        # Some headers may be newline-separated instead
+        if '\n' in header_str:
+            lines = header_str.split('\n')
+        else:
+            # Split into 80-char chunks
+            lines = [header_str[i:i+80] for i in range(0, len(header_str), 80)]
+
+        for line in lines:
+            if not line or len(line) < 8:
+                continue
+
+            # Skip COMMENT, HISTORY, and END cards
+            keyword = line[:8].strip()
+            if not keyword or keyword in ('COMMENT', 'HISTORY', 'END', ''):
+                continue
+
+            # Check for value indicator '='
+            if len(line) > 9 and line[8] == '=':
+                value_part = line[9:].strip()
+
+                # Handle quoted string values
+                if value_part.startswith("'"):
+                    # Find closing quote (may contain escaped quotes '')
+                    end_quote = 1
+                    while end_quote < len(value_part):
+                        if value_part[end_quote] == "'":
+                            if end_quote + 1 < len(value_part) and value_part[end_quote + 1] == "'":
+                                end_quote += 2  # Skip escaped quote
+                            else:
+                                break
+                        else:
+                            end_quote += 1
+                    value = value_part[1:end_quote].replace("''", "'").strip()
+                else:
+                    # Numeric or boolean value - take until comment marker
+                    if '/' in value_part:
+                        value = value_part.split('/')[0].strip()
+                    else:
+                        value = value_part.strip()
+
+                    # Handle boolean
+                    if value == 'T':
+                        value = 'True'
+                    elif value == 'F':
+                        value = 'False'
+
+                if value:
+                    parsed[keyword] = value
+
+        return parsed
+
+    def _extract_fits_header(self, event_list: EventList) -> Dict[str, Any]:
+        """
+        Extract key FITS header information from an EventList.
+
+        Extracts commonly used header keywords including:
+        - Object name, observation ID
+        - RA/Dec coordinates
+        - Exposure, ontime, livetime
+        - Observation dates
+        - Creator software
+
+        Args:
+            event_list: The EventList to extract headers from
+
+        Returns:
+            Dictionary containing extracted header information
+        """
+        header_info: Dict[str, Any] = {}
+        raw_header = getattr(event_list, "header", None)
+
+        if raw_header is None:
+            return header_info
+
+        # Parse string headers into a dictionary first
+        header_dict: Dict[str, str] = {}
+        if isinstance(raw_header, str):
+            header_dict = self._parse_fits_header_string(raw_header)
+        elif isinstance(raw_header, dict):
+            header_dict = {str(k): str(v) for k, v in raw_header.items()}
+        elif hasattr(raw_header, 'get'):
+            # Handle astropy Header-like objects - convert to dict
+            try:
+                for key in raw_header.keys():
+                    if key and key.strip() and key not in ('COMMENT', 'HISTORY', ''):
+                        val = raw_header.get(key)
+                        if val is not None:
+                            header_dict[str(key)] = str(val)
+            except Exception:
+                pass
+
+        if not header_dict:
+            return header_info
+
+        # Define key headers to extract with output key and type conversion
+        key_headers = [
+            ("OBJECT", "object", str),
+            ("OBS_ID", "obs_id", str),
+            ("RA_NOM", "ra_nom", float),
+            ("DEC_NOM", "dec_nom", float),
+            ("RA_OBJ", "ra_obj", float),
+            ("DEC_OBJ", "dec_obj", float),
+            ("EXPOSURE", "exposure", float),
+            ("ONTIME", "ontime", float),
+            ("LIVETIME", "livetime", float),
+            ("DATE-OBS", "date_obs", str),
+            ("DATE-END", "date_end", str),
+            ("TSTART", "tstart", float),
+            ("TSTOP", "tstop", float),
+            ("CREATOR", "creator", str),
+            ("TELESCOP", "telescop", str),
+            ("INSTRUME", "instrume", str),
+            ("DATAMODE", "datamode", str),
+            ("OBSERVER", "observer", str),
+        ]
+
+        for fits_key, output_key, type_func in key_headers:
+            if fits_key in header_dict:
+                value = header_dict[fits_key]
+                try:
+                    if type_func == float:
+                        header_info[output_key] = _to_python_float(float(value))
+                    else:
+                        header_info[output_key] = type_func(value)
+                except (ValueError, TypeError):
+                    header_info[output_key] = str(value)
+
+        # Include full raw header
+        raw_header_dict = {}
+        for k, v in header_dict.items():
+            try:
+                raw_header_dict[str(k)] = str(v)
+            except Exception:
+                pass
+        if raw_header_dict:
+            header_info["raw_header"] = raw_header_dict
+
+        return header_info
+
+    def _detect_fits_file_type(self, file_path: str) -> Dict[str, Any]:
+        """
+        Detect the type of a FITS file by reading its headers.
+
+        This pre-check prevents cryptic Stingray errors when users try to load
+        Light Curve files as Event Lists (or other type mismatches).
+
+        Returns:
+            Dictionary with:
+            - file_type: 'event_list', 'light_curve', 'spectrum', 'unknown'
+            - details: Dict with HDUCLAS1, EXTNAME, columns found
+            - is_event_list: bool
+            - error_message: str or None (user-friendly message if not event list)
+        """
+        result: Dict[str, Any] = {
+            "file_type": "unknown",
+            "details": {},
+            "is_event_list": False,
+            "error_message": None
+        }
+
+        try:
+            with fits.open(file_path) as hdulist:
+                for hdu in hdulist:
+                    if hdu.name in ['PRIMARY', '']:
+                        continue
+
+                    header = hdu.header
+                    extname = header.get('EXTNAME', '').upper()
+                    hduclas1 = header.get('HDUCLAS1', '').upper()
+
+                    result["details"] = {
+                        "extname": extname,
+                        "hduclas1": hduclas1,
+                        "extension_name": hdu.name
+                    }
+
+                    # Check for Light Curve
+                    if 'LIGHT' in hduclas1 or extname == 'RATE':
+                        result["file_type"] = "light_curve"
+                        result["is_event_list"] = False
+                        result["error_message"] = (
+                            f"This is a Light Curve file (HDUCLAS1='{hduclas1}', "
+                            f"EXTNAME='{extname}'). "
+                            f"Use the Light Curve analysis tools instead of Event List loading."
+                        )
+                        return result
+
+                    # Check for Event List
+                    if extname == 'EVENTS' or hduclas1 == 'EVENTS':
+                        result["file_type"] = "event_list"
+                        result["is_event_list"] = True
+                        return result
+
+                    # Check for Spectrum
+                    if 'SPECTRUM' in hduclas1 or extname == 'SPECTRUM':
+                        result["file_type"] = "spectrum"
+                        result["is_event_list"] = False
+                        result["error_message"] = (
+                            f"This is a Spectrum file (HDUCLAS1='{hduclas1}'). "
+                            f"Use spectral analysis tools instead of Event List loading."
+                        )
+                        return result
+
+            # If we get here, couldn't determine type - allow attempt
+            result["file_type"] = "unknown"
+            result["is_event_list"] = True  # Allow unknown files to attempt loading
+
+        except Exception as e:
+            # If we can't read headers, let the normal loading handle errors
+            result["file_type"] = "unknown"
+            result["is_event_list"] = True
+            result["details"]["error"] = str(e)
+
+        return result
+
     def load_event_list(
         self,
         file_path: str,
@@ -114,6 +548,7 @@ class DataService(BaseService):
         additional_columns: Optional[List[str]] = None,
         high_precision: bool = False,
         skip_checks: bool = False,
+        notes: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Load an EventList from a file.
@@ -126,6 +561,7 @@ class DataService(BaseService):
             additional_columns: Optional list of additional columns to read
             high_precision: Use numpy.float128 for time array (pulsar timing)
             skip_checks: Skip time ordering and GTI validation (performance)
+            notes: Optional user notes/comments about this data
 
         Returns:
             Result dictionary with the EventList data
@@ -139,6 +575,27 @@ class DataService(BaseService):
                     message=f"An event list with the name '{name}' already exists.",
                     error=None,
                 )
+
+            # Auto-detect format from file extension if not explicitly specified differently
+            file_ext = os.path.splitext(file_path)[1].lower()
+            if file_ext in ['.hdf5', '.h5']:
+                fmt = 'hdf5'
+            elif file_ext in ['.ecsv']:
+                fmt = 'ascii.ecsv'
+            # Otherwise use the provided fmt (default: ogip for FITS files)
+
+            # Detect file type before attempting to load (for FITS files)
+            is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+            if is_fits:
+                file_type_info = self._detect_fits_file_type(file_path)
+                if not file_type_info["is_event_list"]:
+                    return self.create_result(
+                        success=False,
+                        data=None,
+                        message=f"Cannot load '{name}' as Event List: "
+                                f"{file_type_info['error_message']}",
+                        error=f"File type: {file_type_info['file_type']}",
+                    )
 
             # Capture Stingray/library warnings during loading
             stingray_warnings: List[str] = []
@@ -159,11 +616,28 @@ class DataService(BaseService):
                 for w in caught_warnings:
                     stingray_warnings.append(str(w.message))
 
+            # Fix inverted GTI intervals (common with unsorted data)
+            # This must be done before storing, as Stingray's check_gtis
+            # will fail on later operations if GTI has start > stop
+            gti_was_fixed = self._fix_inverted_gti(event_list)
+            if gti_was_fixed:
+                stingray_warnings.append(
+                    "GTI intervals were inverted (start > stop) and have been automatically fixed. "
+                    "This typically occurs with unsorted event data."
+                )
+
+            # Store user notes on the event list object
+            if notes:
+                event_list.notes = notes
+
             # Add to state manager
             self.state.add_event_data(name, event_list)
 
             # Validate GTI and collect warnings
             gti_warnings = self._validate_gti(event_list)
+
+            # Run comprehensive data quality validation
+            validation_issues = self._validate_data_quality(event_list)
 
             # Prepare serializable summary (use helper for numpy type conversion)
             summary = {
@@ -178,6 +652,8 @@ class DataService(BaseService):
                 "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
                 "gti_warnings": gti_warnings if gti_warnings else None,
                 "stingray_warnings": stingray_warnings if stingray_warnings else None,
+                "validation_issues": validation_issues if validation_issues else None,
+                "notes": notes if notes else None,
             }
 
             # Build message with warnings if present
@@ -186,6 +662,13 @@ class DataService(BaseService):
                 message += f" [GTI warnings: {len(gti_warnings)}]"
             if stingray_warnings:
                 message += f" [Stingray warnings: {len(stingray_warnings)}]"
+            if validation_issues:
+                error_count = sum(1 for v in validation_issues if v["severity"] == "error")
+                warn_count = sum(1 for v in validation_issues if v["severity"] == "warning")
+                if error_count > 0:
+                    message += f" [Data errors: {error_count}]"
+                if warn_count > 0:
+                    message += f" [Data warnings: {warn_count}]"
 
             return self.create_result(
                 success=True,
@@ -244,6 +727,22 @@ class DataService(BaseService):
                         tmp_file.write(chunk)
                 temp_filename = tmp_file.name
 
+            # Detect file type before attempting to load (for FITS files)
+            is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+            if is_fits:
+                file_type_info = self._detect_fits_file_type(temp_filename)
+                if not file_type_info["is_event_list"]:
+                    # Clean up temp file
+                    if os.path.exists(temp_filename):
+                        os.remove(temp_filename)
+                    return self.create_result(
+                        success=False,
+                        data=None,
+                        message=f"Cannot load '{name}' as Event List: "
+                                f"{file_type_info['error_message']}",
+                        error=f"File type: {file_type_info['file_type']}",
+                    )
+
             # Load the event list with guaranteed temp file cleanup
             try:
                 event_list = EventList.read(
@@ -259,11 +758,16 @@ class DataService(BaseService):
                 if os.path.exists(temp_filename):
                     os.remove(temp_filename)
 
+            # Fix inverted GTI intervals (common with unsorted data)
+            gti_was_fixed = self._fix_inverted_gti(event_list)
+
             # Add to state manager
             self.state.add_event_data(name, event_list)
 
             # Validate GTI and collect warnings
             gti_warnings = self._validate_gti(event_list)
+            if gti_was_fixed:
+                gti_warnings.insert(0, "GTI intervals were inverted and automatically fixed.")
 
             summary = {
                 "name": name,
@@ -305,7 +809,7 @@ class DataService(BaseService):
         self,
         name: str,
         file_path: str,
-        fmt: str = "ogip",
+        fmt: str = "hdf5",
     ) -> Dict[str, Any]:
         """
         Save an EventList to disk.
@@ -313,7 +817,7 @@ class DataService(BaseService):
         Args:
             name: Name of the event list in state
             file_path: Path where to save the file
-            fmt: File format to save as
+            fmt: File format to save as ('hdf5', 'ascii.ecsv', or 'pickle')
 
         Returns:
             Result dictionary
@@ -334,23 +838,19 @@ class DataService(BaseService):
             if dirname:
                 os.makedirs(dirname, exist_ok=True)
 
-            # Save based on format
-            # For FITS formats, use to_astropy_table() for better OGIP compliance
-            # Stingray's direct write() may not preserve all metadata correctly
-            if fmt in ["fits", "ogip", "hea"]:
-                table = event_list.to_astropy_table()
-                table.write(file_path, format="fits", overwrite=True)
-            elif fmt == "hdf5":
-                event_list.to_astropy_table().write(
-                    file_path, format="hdf5", path="data", overwrite=True
-                )
+            # Save using Stingray's native write method with requested format
+            # Supported formats: hdf5, ascii.ecsv, pickle
+            if fmt in ('hdf5', 'ascii.ecsv', 'pickle'):
+                event_list.write(file_path, fmt=fmt)
             else:
-                event_list.write(file_path, fmt)
+                # Default to HDF5 for unrecognized formats
+                # HDF5 preserves all metadata (GTI, MJDREF, etc.) and supports float128
+                event_list.write(file_path, fmt='hdf5')
 
             return self.create_result(
                 success=True,
                 data={"file_path": file_path},
-                message=f"EventList '{name}' saved to '{file_path}'",
+                message=f"EventList '{name}' saved to '{file_path}' (format: {fmt})",
             )
 
         except Exception as e:
@@ -448,6 +948,29 @@ class DataService(BaseService):
                 info["mean_count_rate"] = _to_python_float(len(event_list.time) / duration) if duration and duration > 0 else 0
                 info["min_time_diff"] = _to_python_float(time_diffs.min())
                 info["max_time_diff"] = _to_python_float(time_diffs.max())
+                info["mean_time_diff"] = _to_python_float(np.mean(time_diffs))
+                info["median_time_diff"] = _to_python_float(np.median(time_diffs))
+                info["std_time_diff"] = _to_python_float(np.std(time_diffs))
+
+            # Per-GTI rates
+            if event_list.gti is not None and len(event_list.gti) > 0:
+                per_gti_rates = []
+                for start, stop in event_list.gti:
+                    mask = (event_list.time >= start) & (event_list.time <= stop)
+                    gti_events = int(np.sum(mask))
+                    gti_duration = float(stop - start)
+                    rate = gti_events / gti_duration if gti_duration > 0 else 0
+                    per_gti_rates.append({
+                        "start": _to_python_float(start),
+                        "stop": _to_python_float(stop),
+                        "events": gti_events,
+                        "duration": _to_python_float(gti_duration),
+                        "rate": _to_python_float(rate),
+                    })
+                info["per_gti_rates"] = per_gti_rates
+
+            # Notes
+            info["notes"] = getattr(event_list, "notes", None) or None
 
             return self.create_result(
                 success=True,
@@ -657,18 +1180,12 @@ class DataService(BaseService):
                     else None
                 ),
 
-                # GTI data
-                "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
-                "gti_list": (
-                    [[_to_python_float(g[0]), _to_python_float(g[1])] for g in event_list.gti]
-                    if event_list.gti is not None
-                    else None
-                ),
-                "total_gti_time": (
-                    _to_python_float(sum(g[1] - g[0] for g in event_list.gti))
-                    if event_list.gti is not None and len(event_list.gti) > 0
-                    else None
-                ),
+                # GTI data - sort each interval to handle inverted GTIs from unsorted data
+                # When Stingray loads unsorted data without a GTI extension, it sets
+                # GTI to [time[0], time[-1]] which can have start > stop for unsorted times
+                "gti_count": 0,  # Will be set below
+                "gti_list": None,  # Will be set below
+                "total_gti_time": None,  # Will be set below
 
                 # Reference time - mjdref is often numpy.longdouble
                 "mjdref": _to_python_float(event_list.mjdref),
@@ -677,7 +1194,7 @@ class DataService(BaseService):
                 "mission": str(getattr(event_list, "mission", None)) if getattr(event_list, "mission", None) else None,
                 "instrument": str(getattr(event_list, "instr", None)) if getattr(event_list, "instr", None) else None,
                 "detector_id": (
-                    getattr(event_list, "detector_id", None)
+                    str(getattr(event_list, "detector_id", None))
                     if hasattr(event_list, "detector_id") and event_list.detector_id is not None
                     else None
                 ),
@@ -691,6 +1208,24 @@ class DataService(BaseService):
                 "max_time_diff": None,
             }
 
+            # Process GTI data - sort each interval to handle inverted GTIs from unsorted data
+            # When Stingray loads unsorted data without a GTI extension, it sets
+            # GTI to [time[0], time[-1]] which can have start > stop for unsorted times
+            valid_gti = None
+            if event_list.gti is not None and len(event_list.gti) > 0:
+                # Sort each GTI interval to ensure [start, stop] order (start <= stop)
+                valid_gti = [
+                    [_to_python_float(min(g[0], g[1])), _to_python_float(max(g[0], g[1]))]
+                    for g in event_list.gti
+                ]
+            preview["gti_count"] = len(valid_gti) if valid_gti else 0
+            preview["gti_list"] = valid_gti
+            preview["total_gti_time"] = (
+                _to_python_float(sum(g[1] - g[0] for g in valid_gti))
+                if valid_gti
+                else None
+            )
+
             # Calculate time statistics
             duration = preview["duration"]
             if duration and duration > 0:
@@ -702,6 +1237,27 @@ class DataService(BaseService):
                 preview["min_time_diff"] = _to_python_float(time_diffs.min())
                 preview["max_time_diff"] = _to_python_float(time_diffs.max())
                 preview["mean_time_diff"] = _to_python_float(time_diffs.mean())
+                # Enhanced time statistics
+                preview["median_time_diff"] = _to_python_float(np.median(time_diffs))
+                preview["std_time_diff"] = _to_python_float(np.std(time_diffs))
+
+            # Per-GTI rates - use the validated/sorted GTI intervals
+            if valid_gti:
+                per_gti_rates = []
+                for gti_entry in valid_gti:
+                    start, stop = gti_entry[0], gti_entry[1]
+                    mask = (event_list.time >= start) & (event_list.time <= stop)
+                    gti_events = int(np.sum(mask))
+                    gti_duration = float(stop - start)
+                    rate = gti_events / gti_duration if gti_duration > 0 else 0
+                    per_gti_rates.append({
+                        "start": _to_python_float(start),
+                        "stop": _to_python_float(stop),
+                        "events": gti_events,
+                        "duration": _to_python_float(gti_duration),
+                        "rate": _to_python_float(rate),
+                    })
+                preview["per_gti_rates"] = per_gti_rates
 
             # Check for additional columns
             additional_cols = []
@@ -715,6 +1271,17 @@ class DataService(BaseService):
                     if isinstance(val, np.ndarray) and len(val) == len(event_list.time):
                         additional_cols.append(attr)
             preview["additional_columns"] = additional_cols
+
+            # User notes
+            preview["notes"] = getattr(event_list, "notes", None) or None
+
+            # Data quality validation
+            validation_issues = self._validate_data_quality(event_list)
+            preview["validation_issues"] = validation_issues if validation_issues else None
+
+            # FITS header information
+            header_info = self._extract_fits_header(event_list)
+            preview["header_info"] = header_info if header_info else None
 
             return self.create_result(
                 success=True,
@@ -758,6 +1325,7 @@ class DataService(BaseService):
         start_time: float,
         end_time: float,
         fmt: str = "ogip",
+        notes: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Load events within a specific time range using true lazy loading.
@@ -771,6 +1339,7 @@ class DataService(BaseService):
             start_time: Start time (in seconds from file start or absolute)
             end_time: End time (in seconds from file start or absolute)
             fmt: File format (only FITS formats supported for lazy loading)
+            notes: Optional user notes/comments about this data
 
         Returns:
             Result dictionary with the filtered EventList
@@ -793,6 +1362,17 @@ class DataService(BaseService):
                     data=None,
                     message=f"True lazy loading only supports FITS formats. Got: {fmt}",
                     error="Unsupported format for lazy loading",
+                )
+
+            # Detect file type before attempting to load
+            file_type_info = self._detect_fits_file_type(file_path)
+            if not file_type_info["is_event_list"]:
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"Cannot load '{name}' as Event List: "
+                            f"{file_type_info['error_message']}",
+                    error=f"File type: {file_type_info['file_type']}",
                 )
 
             # Create the reader
@@ -865,11 +1445,23 @@ class DataService(BaseService):
             if instr:
                 event_list.instr = instr
 
+            # Store user notes on the event list object
+            if notes:
+                event_list.notes = notes
+
+            # Fix inverted GTI intervals (common with unsorted data)
+            gti_was_fixed = self._fix_inverted_gti(event_list)
+
             # Add to state manager
             self.state.add_event_data(name, event_list)
 
             # Validate GTI and collect warnings
             gti_warnings = self._validate_gti(event_list)
+            if gti_was_fixed:
+                gti_warnings.insert(0, "GTI intervals were inverted and automatically fixed.")
+
+            # Run comprehensive data quality validation
+            validation_issues = self._validate_data_quality(event_list)
 
             # Calculate loaded duration
             loaded_duration = abs_end - abs_start
@@ -885,6 +1477,8 @@ class DataService(BaseService):
                 "has_pi": event_list.pi is not None,
                 "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
                 "gti_warnings": gti_warnings if gti_warnings else None,
+                "validation_issues": validation_issues if validation_issues else None,
+                "notes": notes if notes else None,
                 "lazy_loading_info": {
                     "method": "time_range",
                     "requested_range": [start_time, end_time],
@@ -903,6 +1497,13 @@ class DataService(BaseService):
             )
             if gti_warnings:
                 message += f" [GTI warnings: {len(gti_warnings)}]"
+            if validation_issues:
+                error_count = sum(1 for v in validation_issues if v["severity"] == "error")
+                warn_count = sum(1 for v in validation_issues if v["severity"] == "warning")
+                if error_count > 0:
+                    message += f" [Data errors: {error_count}]"
+                if warn_count > 0:
+                    message += f" [Data warnings: {warn_count}]"
 
             return self.create_result(
                 success=True,
@@ -923,6 +1524,7 @@ class DataService(BaseService):
         start_index: int = 0,
         count: int = 10000,
         fmt: str = "ogip",
+        notes: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Load a specific number of events using true lazy loading.
@@ -936,6 +1538,7 @@ class DataService(BaseService):
             start_index: Starting event index (0-based)
             count: Number of events to load
             fmt: File format (only FITS formats supported for lazy loading)
+            notes: Optional user notes/comments about this data
 
         Returns:
             Result dictionary with the sliced EventList
@@ -958,6 +1561,17 @@ class DataService(BaseService):
                     data=None,
                     message=f"True lazy loading only supports FITS formats. Got: {fmt}",
                     error="Unsupported format for lazy loading",
+                )
+
+            # Detect file type before attempting to load
+            file_type_info = self._detect_fits_file_type(file_path)
+            if not file_type_info["is_event_list"]:
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"Cannot load '{name}' as Event List: "
+                            f"{file_type_info['error_message']}",
+                    error=f"File type: {file_type_info['file_type']}",
                 )
 
             # Create the reader
@@ -1013,11 +1627,23 @@ class DataService(BaseService):
             if instr:
                 event_list.instr = instr
 
+            # Store user notes on the event list object
+            if notes:
+                event_list.notes = notes
+
+            # Fix inverted GTI intervals (common with unsorted data)
+            gti_was_fixed = self._fix_inverted_gti(event_list)
+
             # Add to state manager
             self.state.add_event_data(name, event_list)
 
             # Validate GTI and collect warnings
             gti_warnings = self._validate_gti(event_list)
+            if gti_was_fixed:
+                gti_warnings.insert(0, "GTI intervals were inverted and automatically fixed.")
+
+            # Run comprehensive data quality validation
+            validation_issues = self._validate_data_quality(event_list)
 
             summary = {
                 "name": name,
@@ -1030,6 +1656,8 @@ class DataService(BaseService):
                 "has_pi": event_list.pi is not None,
                 "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
                 "gti_warnings": gti_warnings if gti_warnings else None,
+                "validation_issues": validation_issues if validation_issues else None,
+                "notes": notes if notes else None,
                 "lazy_loading_info": {
                     "method": "event_count",
                     "start_index": start_index,
@@ -1049,6 +1677,13 @@ class DataService(BaseService):
             )
             if gti_warnings:
                 message += f" [GTI warnings: {len(gti_warnings)}]"
+            if validation_issues:
+                error_count = sum(1 for v in validation_issues if v["severity"] == "error")
+                warn_count = sum(1 for v in validation_issues if v["severity"] == "warning")
+                if error_count > 0:
+                    message += f" [Data errors: {error_count}]"
+                if warn_count > 0:
+                    message += f" [Data warnings: {warn_count}]"
 
             return self.create_result(
                 success=True,
@@ -1453,6 +2088,7 @@ class DataService(BaseService):
                 time_end = shared_time_range_end
                 event_start = shared_event_start_index
                 event_cnt = shared_event_count
+                notes = None  # No shared notes for batch loading
             else:
                 # Use per-file settings
                 fmt = file_config.get("fmt", "ogip")
@@ -1466,6 +2102,7 @@ class DataService(BaseService):
                 time_end = file_config.get("time_range_end")
                 event_start = file_config.get("event_start_index")
                 event_cnt = file_config.get("event_count")
+                notes = file_config.get("notes")
 
             try:
                 if use_partial:
@@ -1478,20 +2115,22 @@ class DataService(BaseService):
                                 "error": "Partial loading (time_range) requires time_range_start and time_range_end",
                             }
                         result = self.load_event_list_by_time_range(
-                            file_path, name, time_start, time_end, fmt
+                            file_path, name, time_start, time_end, fmt, notes
                         )
                     else:  # event_count
                         result = self.load_event_list_by_event_count(
                             file_path, name,
                             event_start or 0,
                             event_cnt or 10000,
-                            fmt
+                            fmt,
+                            notes
                         )
                 else:
                     result = self.load_event_list(
                         file_path, name, fmt,
                         rmf_file, additional_columns,
-                        high_precision, skip_checks
+                        high_precision, skip_checks,
+                        notes
                     )
 
                 return {
@@ -1664,6 +2303,7 @@ class DataService(BaseService):
                 time_end = shared_time_range_end
                 event_start = shared_event_start_index
                 event_cnt = shared_event_count
+                notes = None  # No shared notes for batch loading
             else:
                 # Use per-file settings
                 fmt = file_config.get("fmt", "ogip")
@@ -1677,6 +2317,7 @@ class DataService(BaseService):
                 time_end = file_config.get("time_range_end")
                 event_start = file_config.get("event_start_index")
                 event_cnt = file_config.get("event_count")
+                notes = file_config.get("notes")
 
             try:
                 if use_partial:
@@ -1689,20 +2330,22 @@ class DataService(BaseService):
                                 "error": "Partial loading (time_range) requires time_range_start and time_range_end",
                             }
                         result = self.load_event_list_by_time_range(
-                            file_path, name, time_start, time_end, fmt
+                            file_path, name, time_start, time_end, fmt, notes
                         )
                     else:  # event_count
                         result = self.load_event_list_by_event_count(
                             file_path, name,
                             event_start or 0,
                             event_cnt or 10000,
-                            fmt
+                            fmt,
+                            notes
                         )
                 else:
                     result = self.load_event_list(
                         file_path, name, fmt,
                         rmf_file, additional_columns,
-                        high_precision, skip_checks
+                        high_precision, skip_checks,
+                        notes
                     )
 
                 return {

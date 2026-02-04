@@ -38,6 +38,8 @@ import {
   Checkbox,
   Tabs,
   Tab,
+  Radio,
+  RadioGroup,
 } from '@mui/material';
 import UploadFileIcon from '@mui/icons-material/UploadFile';
 import CloudUploadIcon from '@mui/icons-material/CloudUpload';
@@ -52,8 +54,10 @@ import ExpandLessIcon from '@mui/icons-material/ExpandLess';
 import SettingsIcon from '@mui/icons-material/Settings';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
+import ErrorIcon from '@mui/icons-material/Error';
 import SaveIcon from '@mui/icons-material/Save';
 import ClearAllIcon from '@mui/icons-material/ClearAll';
+import HistoryIcon from '@mui/icons-material/History';
 import VisibilityIcon from '@mui/icons-material/Visibility';
 import MemoryIcon from '@mui/icons-material/Memory';
 import PrecisionManufacturingIcon from '@mui/icons-material/PrecisionManufacturing';
@@ -73,6 +77,9 @@ import {
   BatchLoadResult,
   BatchLoadSuccessItem,
   BatchLoadFailedItem,
+  ValidationIssue,
+  PerGtiRate,
+  FitsHeaderInfo,
 } from '@/api/dataApi';
 import { apiClient } from '@/api/client';
 import { useUIStore } from '@/store/uiStore';
@@ -84,6 +91,34 @@ interface AlertState {
   message: string;
   severity: AlertSeverity;
 }
+
+// localStorage persistence for last loaded files
+const LAST_LOADED_FILES_KEY = 'lastLoadedFiles';
+
+interface LastLoadedFilesData {
+  files: string[];
+  fileNames: Record<string, string>;
+  timestamp: number;
+}
+
+const saveLastLoadedFiles = (files: string[], names: Record<string, string>): void => {
+  const data: LastLoadedFilesData = {
+    files,
+    fileNames: names,
+    timestamp: Date.now(),
+  };
+  localStorage.setItem(LAST_LOADED_FILES_KEY, JSON.stringify(data));
+};
+
+const getLastLoadedFiles = (): LastLoadedFilesData | null => {
+  const saved = localStorage.getItem(LAST_LOADED_FILES_KEY);
+  if (!saved) return null;
+  try {
+    return JSON.parse(saved) as LastLoadedFilesData;
+  } catch {
+    return null;
+  }
+};
 
 const DataIngestionPage: React.FC = () => {
   // Global notification store and processing state
@@ -118,6 +153,9 @@ const DataIngestionPage: React.FC = () => {
   const [additionalColumns, setAdditionalColumns] = useState<string>('');
   const [fileSizeInfo, setFileSizeInfo] = useState<FileSizeInfo | null>(null);
   const [isCheckingFileSize, setIsCheckingFileSize] = useState<boolean>(false);
+
+  // Notes/Comments for the data
+  const [eventNotes, setEventNotes] = useState<string>('');
 
 
   // Advanced loading options
@@ -162,6 +200,14 @@ const DataIngestionPage: React.FC = () => {
   const [fullPreviewData, setFullPreviewData] = useState<EventListFullPreview | null>(null);
   const [previewTabValue, setPreviewTabValue] = useState<number>(0);
 
+  // Save format dialog state
+  const [saveFormatDialogOpen, setSaveFormatDialogOpen] = useState<boolean>(false);
+  const [saveEventListName, setSaveEventListName] = useState<string>('');
+  const [selectedSaveFormat, setSelectedSaveFormat] = useState<string>('hdf5');
+
+  // Last loaded files state (for restore functionality)
+  const [hasLastLoadedFiles, setHasLastLoadedFiles] = useState<boolean>(false);
+
   // Fetch loaded event lists on mount and after operations
   const fetchEventLists = useCallback(async (): Promise<void> => {
     setIsRefreshing(true);
@@ -183,21 +229,46 @@ const DataIngestionPage: React.FC = () => {
     fetchEventLists();
   }, [fetchEventLists]);
 
-  // Show alert helper - uses global notifications for success/error, local alert for warnings/info
+  // Check for last loaded files on mount
+  useEffect(() => {
+    const lastLoaded = getLastLoadedFiles();
+    setHasLastLoadedFiles(lastLoaded !== null && lastLoaded.files.length > 0);
+  }, []);
+
+  // Show alert helper - sends all alerts to the global notification center
   const showAlert = (message: string, severity: AlertSeverity, title?: string): void => {
-    if (severity === 'success' || severity === 'error') {
-      // Use global notification for success/error (no local alert to avoid duplication)
-      addNotification({
-        type: severity === 'success' ? 'success' : 'error',
-        title: title || (severity === 'success' ? 'Success' : 'Error'),
-        message,
-      });
-      // Clear any existing local alert
-      setAlert({ open: false, message: '', severity: 'info' });
-    } else {
-      // Use local page alert for warnings/info (immediate feedback without cluttering notifications)
-      setAlert({ open: true, message, severity });
-    }
+    // Map severity to notification type
+    const typeMap: Record<AlertSeverity, 'success' | 'error' | 'warning' | 'info'> = {
+      success: 'success',
+      error: 'error',
+      warning: 'warning',
+      info: 'info',
+    };
+    const defaultTitles: Record<AlertSeverity, string> = {
+      success: 'Success',
+      error: 'Error',
+      warning: 'Warning',
+      info: 'Info',
+    };
+
+    addNotification({
+      type: typeMap[severity],
+      title: title || defaultTitles[severity],
+      message,
+    });
+
+    // Clear any existing local alert
+    setAlert({ open: false, message: '', severity: 'info' });
+  };
+
+  // Auto-detect file format from extension
+  const detectFormatFromExtension = (filePath: string): string => {
+    const ext = filePath.toLowerCase().split('.').pop();
+    if (ext === 'hdf5' || ext === 'h5') return 'hdf5';
+    if (ext === 'ecsv') return 'ascii.ecsv';
+    if (ext === 'pkl' || ext === 'pickle') return 'pickle';
+    // Default to ogip for .fits, .evt, .fit, .fts, .gz, etc.
+    return 'ogip';
   };
 
   // Check file size when file is selected (single file)
@@ -295,38 +366,50 @@ const DataIngestionPage: React.FC = () => {
     const files = await window.electronAPI.openFile({
       title: 'Select Event List Files',
       filters: [
-        { name: 'FITS Files', extensions: ['fits', 'fit', 'fts', 'evt'] },
-        { name: 'HDF5 Files', extensions: ['hdf5', 'h5'] },
-        { name: 'Text Files', extensions: ['txt', 'csv', 'dat'] },
         { name: 'All Files', extensions: ['*'] },
+        { name: 'FITS Files', extensions: ['fits', 'fit', 'fts', 'evt', 'fits.gz', 'fit.gz', 'fts.gz', 'evt.gz', 'gz'] },
+        { name: 'HDF5 Files', extensions: ['hdf5', 'h5'] },
+        { name: 'Text Files', extensions: ['txt', 'csv', 'dat', 'ecsv'] },
       ],
       multiple: true, // Enable multi-select
     });
 
     if (files && files.length > 0) {
-      setSelectedFiles(files);
       setBatchResult(null); // Clear previous batch result
 
-      // Auto-generate names from filenames
-      const names: Record<string, string> = {};
-      files.forEach((f) => {
+      // APPEND mode: merge with existing selection (filter duplicates)
+      const existingSet = new Set(selectedFiles);
+      const newFiles = files.filter((f) => !existingSet.has(f));
+      const mergedFiles = [...selectedFiles, ...newFiles];
+      setSelectedFiles(mergedFiles);
+
+      // Auto-detect format from first new file's extension (only update if adding new files)
+      if (newFiles.length > 0 && selectedFiles.length === 0) {
+        const detectedFormat = detectFormatFromExtension(newFiles[0]);
+        setFileFormat(detectedFormat);
+      }
+
+      // Merge names: keep existing names, generate for new files only
+      const mergedNames = { ...fileNames };
+      newFiles.forEach((f) => {
         const baseName = f.split('/').pop()?.split('.')[0] || 'event_list';
-        // Ensure unique names by appending index if needed
+        // Ensure unique names by checking against all existing and new names
         let uniqueName = baseName;
         let counter = 1;
-        while (Object.values(names).includes(uniqueName)) {
+        while (Object.values(mergedNames).includes(uniqueName)) {
           uniqueName = `${baseName}_${counter}`;
           counter++;
         }
-        names[f] = uniqueName;
+        mergedNames[f] = uniqueName;
       });
-      setFileNames(names);
+      setFileNames(mergedNames);
 
-      // Initialize per-file configs
-      const configs: Record<string, Partial<SingleFileConfig>> = {};
-      files.forEach((f) => {
-        configs[f] = {
-          fmt: 'ogip',
+      // Merge per-file configs: keep existing, initialize new ones
+      const mergedConfigs = { ...perFileConfigs };
+      newFiles.forEach((f) => {
+        const fileDetectedFormat = detectFormatFromExtension(f);
+        mergedConfigs[f] = {
+          fmt: fileDetectedFormat,
           high_precision: false,
           skip_checks: false,
           use_partial_loading: false,
@@ -335,17 +418,18 @@ const DataIngestionPage: React.FC = () => {
           time_range_end: 100,
           event_start_index: 0,
           event_count: 10000,
+          notes: '',
         };
       });
-      setPerFileConfigs(configs);
+      setPerFileConfigs(mergedConfigs);
 
-      // Check batch file sizes
-      if (files.length > 1) {
-        checkBatchFileSize(files);
+      // Check batch file sizes for merged selection
+      if (mergedFiles.length > 1) {
+        checkBatchFileSize(mergedFiles);
         setFileSizeInfo(null); // Clear single file info
-      } else {
+      } else if (mergedFiles.length === 1) {
         // Single file - use existing single file check
-        checkFileSize(files[0]);
+        checkFileSize(mergedFiles[0]);
         setBatchSizeInfo(null);
       }
     }
@@ -376,6 +460,126 @@ const DataIngestionPage: React.FC = () => {
     } else {
       setFileSizeInfo(null);
       setBatchSizeInfo(null);
+    }
+  };
+
+  // Clear all selected files
+  const handleClearSelection = (): void => {
+    setSelectedFiles([]);
+    setFileNames({});
+    setPerFileConfigs({});
+    setBatchSizeInfo(null);
+    setFileSizeInfo(null);
+    setBatchResult(null);
+    setExpandedFileSettings({});
+  };
+
+  // Restore last loaded files from localStorage
+  const handleRestoreLastFiles = async (): Promise<void> => {
+    const lastLoaded = getLastLoadedFiles();
+    if (!lastLoaded || lastLoaded.files.length === 0) {
+      showAlert('No previously loaded files found', 'info');
+      return;
+    }
+
+    if (!window.electronAPI) {
+      showAlert('Electron API not available', 'error');
+      return;
+    }
+
+    // Validate files still exist
+    const existingFiles: string[] = [];
+    const missingFiles: string[] = [];
+
+    for (const filePath of lastLoaded.files) {
+      const exists = await window.electronAPI.fileExists(filePath);
+      if (exists) {
+        existingFiles.push(filePath);
+      } else {
+        missingFiles.push(filePath);
+      }
+    }
+
+    if (existingFiles.length === 0) {
+      showAlert('None of the previously loaded files exist anymore', 'warning');
+      return;
+    }
+
+    setBatchResult(null);
+
+    // Merge with current selection (same logic as browse)
+    const existingSet = new Set(selectedFiles);
+    const newFiles = existingFiles.filter((f) => !existingSet.has(f));
+    const mergedFiles = [...selectedFiles, ...newFiles];
+    setSelectedFiles(mergedFiles);
+
+    // Restore names from localStorage for existing files, generate for others
+    const mergedNames = { ...fileNames };
+    newFiles.forEach((f) => {
+      if (lastLoaded.fileNames[f]) {
+        // Use saved name, but ensure uniqueness
+        let uniqueName = lastLoaded.fileNames[f];
+        let counter = 1;
+        while (Object.values(mergedNames).includes(uniqueName)) {
+          uniqueName = `${lastLoaded.fileNames[f]}_${counter}`;
+          counter++;
+        }
+        mergedNames[f] = uniqueName;
+      } else {
+        const baseName = f.split('/').pop()?.split('.')[0] || 'event_list';
+        let uniqueName = baseName;
+        let counter = 1;
+        while (Object.values(mergedNames).includes(uniqueName)) {
+          uniqueName = `${baseName}_${counter}`;
+          counter++;
+        }
+        mergedNames[f] = uniqueName;
+      }
+    });
+    setFileNames(mergedNames);
+
+    // Initialize per-file configs for new files
+    const mergedConfigs = { ...perFileConfigs };
+    newFiles.forEach((f) => {
+      const fileDetectedFormat = detectFormatFromExtension(f);
+      mergedConfigs[f] = {
+        fmt: fileDetectedFormat,
+        high_precision: false,
+        skip_checks: false,
+        use_partial_loading: false,
+        partial_mode: 'time_range',
+        time_range_start: 0,
+        time_range_end: 100,
+        event_start_index: 0,
+        event_count: 10000,
+        notes: '',
+      };
+    });
+    setPerFileConfigs(mergedConfigs);
+
+    // Auto-detect format if this is the first selection
+    if (selectedFiles.length === 0 && newFiles.length > 0) {
+      const detectedFormat = detectFormatFromExtension(newFiles[0]);
+      setFileFormat(detectedFormat);
+    }
+
+    // Check batch file sizes for merged selection
+    if (mergedFiles.length > 1) {
+      checkBatchFileSize(mergedFiles);
+      setFileSizeInfo(null);
+    } else if (mergedFiles.length === 1) {
+      checkFileSize(mergedFiles[0]);
+      setBatchSizeInfo(null);
+    }
+
+    // Show appropriate message
+    if (missingFiles.length > 0) {
+      showAlert(
+        `Selected ${existingFiles.length} files. ${missingFiles.length} file(s) no longer exist.`,
+        'warning'
+      );
+    } else {
+      showAlert(`Selected ${existingFiles.length} previously loaded file${existingFiles.length > 1 ? 's' : ''}`, 'success');
     }
   };
 
@@ -502,6 +706,7 @@ const DataIngestionPage: React.FC = () => {
               start_time: timeRangeStart,
               end_time: timeRangeEnd,
               fmt: fileFormat,
+              notes: eventNotes.trim() || undefined,
             });
             loadMethod = ` (Time Range: ${timeRangeStart}s - ${timeRangeEnd}s)`;
           } else {
@@ -511,6 +716,7 @@ const DataIngestionPage: React.FC = () => {
               start_index: eventCountStart,
               count: eventCount,
               fmt: fileFormat,
+              notes: eventNotes.trim() || undefined,
             });
             loadMethod = ` (Events: ${eventCountStart} - ${eventCountStart + eventCount})`;
           }
@@ -523,11 +729,15 @@ const DataIngestionPage: React.FC = () => {
             additional_columns: additionalColumnsArray,
             high_precision: highPrecision,
             skip_checks: skipChecks,
+            notes: eventNotes.trim() || undefined,
           });
         }
 
         if (response.success) {
           showAlert(response.message || `Event List loaded successfully!${loadMethod}`, 'success', 'Data Loaded');
+          // Save files to localStorage before clearing form
+          saveLastLoadedFiles(selectedFiles, fileNames);
+          setHasLastLoadedFiles(true);
           resetForm();
           await fetchEventLists();
         } else {
@@ -555,6 +765,7 @@ const DataIngestionPage: React.FC = () => {
             time_range_end: useSameSettings ? timeRangeEnd : perFile.time_range_end,
             event_start_index: useSameSettings ? eventCountStart : perFile.event_start_index,
             event_count: useSameSettings ? eventCount : perFile.event_count,
+            notes: useSameSettings ? (eventNotes.trim() || undefined) : (perFile.notes?.trim() || undefined),
           };
         });
 
@@ -654,26 +865,34 @@ const DataIngestionPage: React.FC = () => {
             },
           });
 
+          // Show appropriate message based on results
           if (finalSummary.failure_count === 0) {
             showAlert(
               `Loaded ${finalSummary.success_count} files (${finalSummary.total_events.toLocaleString()} events) in ${finalSummary.total_time_ms.toFixed(0)}ms`,
               'success',
               'Batch Load Complete'
             );
-            resetForm();
           } else if (finalSummary.success_count > 0) {
+            const failedDetails = failed.map(f => `• ${f.name}: ${f.error}`).join('\n');
             showAlert(
-              `Loaded ${finalSummary.success_count}/${selectedFiles.length} files. ${finalSummary.failure_count} failed.`,
+              `Loaded ${finalSummary.success_count}/${selectedFiles.length} files (${finalSummary.total_events.toLocaleString()} events). ${finalSummary.failure_count} failed:\n${failedDetails}`,
               'warning',
               'Partial Success'
             );
           } else {
+            const failedDetails = failed.map(f => `• ${f.name}: ${f.error}`).join('\n');
             showAlert(
-              `All ${selectedFiles.length} files failed to load`,
+              `All ${selectedFiles.length} files failed to load:\n${failedDetails}`,
               'error',
               'Batch Load Failed'
             );
           }
+
+          // Always save files to localStorage and clear form after any load attempt
+          // User can use "Last Files" button to restore if needed
+          saveLastLoadedFiles(selectedFiles, fileNames);
+          setHasLastLoadedFiles(true);
+          resetForm();
         }
       }
     } catch (error) {
@@ -694,6 +913,7 @@ const DataIngestionPage: React.FC = () => {
     setExpandedFileSettings({});
     setRmfFile('');
     setAdditionalColumns('');
+    setEventNotes('');
     setFileSizeInfo(null);
     setBatchSizeInfo(null);
     setFileMetadata(null);
@@ -725,21 +945,42 @@ const DataIngestionPage: React.FC = () => {
     }
   };
 
-  // Handle saving an event list to disk
-  const handleSaveEventList = async (name: string): Promise<void> => {
+  // Handle opening the save format dialog
+  const handleSaveEventList = (name: string): void => {
+    setSaveEventListName(name);
+    setSelectedSaveFormat('hdf5'); // Reset to default
+    setSaveFormatDialogOpen(true);
+  };
+
+  // Handle the actual save after format is selected
+  const handleConfirmSave = async (): Promise<void> => {
+    setSaveFormatDialogOpen(false);
+
     if (!window.electronAPI) {
       showAlert('Save dialog not available (Electron API not found)', 'error');
       return;
     }
 
+    // Determine file extension based on selected format
+    const extensionMap: Record<string, string> = {
+      'hdf5': 'hdf5',
+      'ascii.ecsv': 'ecsv',
+      'pickle': 'pkl',
+    };
+    const ext = extensionMap[selectedSaveFormat] || 'hdf5';
+
+    // Determine file filter based on selected format
+    const filterMap: Record<string, { name: string; extensions: string[] }> = {
+      'hdf5': { name: 'HDF5 Files', extensions: ['hdf5', 'h5'] },
+      'ascii.ecsv': { name: 'ASCII ECSV Files', extensions: ['ecsv'] },
+      'pickle': { name: 'Pickle Files', extensions: ['pkl'] },
+    };
+    const filter = filterMap[selectedSaveFormat] || filterMap['hdf5'];
+
     const filePath = await window.electronAPI.saveFile({
-      title: `Save Event List: ${name}`,
-      defaultPath: `${name}.fits`,
-      filters: [
-        { name: 'FITS Files', extensions: ['fits'] },
-        { name: 'HDF5 Files', extensions: ['hdf5', 'h5'] },
-        { name: 'All Files', extensions: ['*'] },
-      ],
+      title: `Save Event List: ${saveEventListName}`,
+      defaultPath: `${saveEventListName}.${ext}`,
+      filters: [filter],
     });
 
     if (!filePath) {
@@ -749,21 +990,14 @@ const DataIngestionPage: React.FC = () => {
     try {
       await apiClient.getPort();
 
-      // Determine format from file extension
-      const ext = filePath.split('.').pop()?.toLowerCase();
-      let fmt = 'fits';
-      if (ext === 'hdf5' || ext === 'h5') {
-        fmt = 'hdf5';
-      }
-
       const response = await dataApi.saveEventList({
-        name,
+        name: saveEventListName,
         file_path: filePath,
-        fmt,
+        fmt: selectedSaveFormat,
       });
 
       if (response.success) {
-        showAlert(`Event List '${name}' saved to ${filePath}`, 'success', 'Data Saved');
+        showAlert(`Event List '${saveEventListName}' saved to ${filePath}`, 'success', 'Data Saved');
       } else {
         showAlert(response.message || 'Failed to save Event List', 'error', 'Save Failed');
       }
@@ -959,25 +1193,49 @@ const DataIngestionPage: React.FC = () => {
 
               {/* File Selection */}
               <Box sx={{ mb: 2 }}>
-                <Button
-                  variant="outlined"
-                  startIcon={<FolderOpenIcon />}
-                  onClick={handleBrowseFiles}
-                  fullWidth
-                  sx={{ mb: 1 }}
-                >
-                  Browse Files (Multi-select)
-                </Button>
+                <Box sx={{ display: 'flex', gap: 1, mb: 1 }}>
+                  <Button
+                    variant="outlined"
+                    startIcon={<FolderOpenIcon />}
+                    onClick={handleBrowseFiles}
+                    sx={{ flex: 1 }}
+                  >
+                    Browse Files
+                  </Button>
+                  {hasLastLoadedFiles && (
+                    <Tooltip title="Select previously loaded files">
+                      <Button
+                        variant="outlined"
+                        color="secondary"
+                        startIcon={<HistoryIcon />}
+                        onClick={handleRestoreLastFiles}
+                      >
+                        Last Files
+                      </Button>
+                    </Tooltip>
+                  )}
+                </Box>
 
                 {/* Selected Files List */}
                 {selectedFiles.length > 0 && (
                   <Box sx={{ mt: 2 }}>
-                    <Typography variant="subtitle2" sx={{ mb: 1, display: 'flex', alignItems: 'center', gap: 1 }}>
-                      Selected Files ({selectedFiles.length})
-                      {selectedFiles.length > 1 && (
-                        <Chip label="Batch Mode" size="small" color="primary" variant="outlined" />
-                      )}
-                    </Typography>
+                    <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+                      <Typography variant="subtitle2" sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        Selected Files ({selectedFiles.length})
+                        {selectedFiles.length > 1 && (
+                          <Chip label="Batch Mode" size="small" color="primary" variant="outlined" />
+                        )}
+                      </Typography>
+                      <Button
+                        variant="text"
+                        size="small"
+                        startIcon={<ClearAllIcon />}
+                        onClick={handleClearSelection}
+                        color="error"
+                      >
+                        Clear All
+                      </Button>
+                    </Box>
 
                     {/* Batch Size Info (for multiple files) */}
                     {(isCheckingBatchSize || isCheckingFileSize) && (
@@ -1238,6 +1496,23 @@ const DataIngestionPage: React.FC = () => {
                                         />
                                       </Grid>
 
+                                      {/* Notes */}
+                                      <Grid item xs={12}>
+                                        <TextField
+                                          size="small"
+                                          label="Notes"
+                                          value={perFileConfigs[filePath]?.notes || ''}
+                                          onChange={(e) => handlePerFileConfigChange(filePath, {
+                                            notes: e.target.value
+                                          })}
+                                          fullWidth
+                                          multiline
+                                          rows={2}
+                                          placeholder="Add notes about this file..."
+                                          inputProps={{ style: { fontSize: '0.75rem' } }}
+                                        />
+                                      </Grid>
+
                                       {/* High Precision & Skip Checks */}
                                       <Grid item xs={6}>
                                         <Tooltip title="Uses float128 for time arrays (nanosecond precision)" arrow placement="top">
@@ -1376,33 +1651,6 @@ const DataIngestionPage: React.FC = () => {
                   </Box>
                 )}
 
-                {/* Batch Result Summary */}
-                {batchResult && (
-                  <Box sx={{ mt: 2 }}>
-                    <Alert
-                      severity={batchResult.summary.failure_count === 0 ? 'success' :
-                               batchResult.summary.success_count === 0 ? 'error' : 'warning'}
-                      onClose={() => setBatchResult(null)}
-                    >
-                      <Typography variant="body2" fontWeight="medium">
-                        Loaded {batchResult.summary.success_count}/{batchResult.summary.total_files} files
-                        {batchResult.summary.total_events_loaded > 0 && (
-                          <span> ({batchResult.summary.total_events_loaded.toLocaleString()} events)</span>
-                        )}
-                      </Typography>
-                      {batchResult.failed.length > 0 && (
-                        <Box sx={{ mt: 1 }}>
-                          <Typography variant="caption" color="error">Failed files:</Typography>
-                          {batchResult.failed.map((f, i) => (
-                            <Typography key={i} variant="caption" sx={{ display: 'block', ml: 1 }}>
-                              • {f.name}: {f.error}
-                            </Typography>
-                          ))}
-                        </Box>
-                      )}
-                    </Alert>
-                  </Box>
-                )}
               </Box>
 
               {/* File Format - only shown when using same settings for all files */}
@@ -1479,6 +1727,22 @@ const DataIngestionPage: React.FC = () => {
                     size="small"
                     placeholder="e.g., PI, ENERGY, DET_ID (comma-separated)"
                     helperText="Extra columns to read from the file"
+                    sx={{ mb: 2 }}
+                  />
+
+                  {/* Notes/Comments */}
+                  <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+                    Notes / Comments
+                  </Typography>
+                  <TextField
+                    value={eventNotes}
+                    onChange={(e) => setEventNotes(e.target.value)}
+                    fullWidth
+                    size="small"
+                    multiline
+                    rows={2}
+                    placeholder="Add notes about this data (e.g., observation details, analysis purpose...)"
+                    helperText="Optional annotations stored with the event list"
                     sx={{ mb: 2 }}
                   />
 
@@ -1900,6 +2164,41 @@ const DataIngestionPage: React.FC = () => {
                             />
                           </Tooltip>
                         )}
+                        {/* Validation issues */}
+                        {eventList.validation_issues && eventList.validation_issues.length > 0 && (() => {
+                          const errors = eventList.validation_issues.filter((v) => v.severity === 'error');
+                          const warnings = eventList.validation_issues.filter((v) => v.severity === 'warning');
+                          return (
+                            <>
+                              {errors.length > 0 && (
+                                <Tooltip title={errors.map((e) => e.message).join('\n')}>
+                                  <Chip
+                                    label={`${errors.length} data error${errors.length > 1 ? 's' : ''}`}
+                                    size="small"
+                                    color="error"
+                                    icon={<WarningAmberIcon />}
+                                  />
+                                </Tooltip>
+                              )}
+                              {warnings.length > 0 && (
+                                <Tooltip title={warnings.map((w) => w.message).join('\n')}>
+                                  <Chip
+                                    label={`${warnings.length} data warning${warnings.length > 1 ? 's' : ''}`}
+                                    size="small"
+                                    color="warning"
+                                    variant="outlined"
+                                  />
+                                </Tooltip>
+                              )}
+                            </>
+                          );
+                        })()}
+                        {/* Notes indicator */}
+                        {eventList.notes && (
+                          <Tooltip title={eventList.notes}>
+                            <Chip label="Notes" size="small" variant="outlined" />
+                          </Tooltip>
+                        )}
                       </Box>
                     }
                     secondary={
@@ -1946,7 +2245,7 @@ const DataIngestionPage: React.FC = () => {
                         <VisibilityIcon />
                       </IconButton>
                     </Tooltip>
-                    <Tooltip title="Save to disk">
+                    <Tooltip title="Save to disk (HDF5, ECSV, or Pickle)">
                       <IconButton
                         edge="end"
                         sx={{ mr: 0.5 }}
@@ -2007,12 +2306,12 @@ const DataIngestionPage: React.FC = () => {
                   </Grid>
                   <Grid item xs={6} sm={4}>
                     <Typography variant="caption" color="text.secondary">Duration</Typography>
-                    <Typography variant="body1">{selectedEventListDetails.duration.toFixed(2)}s</Typography>
+                    <Typography variant="body1">{selectedEventListDetails.duration.toFixed(6)}s</Typography>
                   </Grid>
                   <Grid item xs={6} sm={4}>
                     <Typography variant="caption" color="text.secondary">Mean Count Rate</Typography>
                     <Typography variant="body1">
-                      {selectedEventListDetails.mean_count_rate?.toFixed(2) || 'N/A'} cts/s
+                      {selectedEventListDetails.mean_count_rate?.toFixed(6) || 'N/A'} cts/s
                     </Typography>
                   </Grid>
                   <Grid item xs={6} sm={4}>
@@ -2053,7 +2352,7 @@ const DataIngestionPage: React.FC = () => {
                   {selectedEventListDetails.min_time_diff !== undefined && (
                     <Grid item xs={6} sm={4}>
                       <Typography variant="caption" color="text.secondary">Min Time Diff</Typography>
-                      <Typography variant="body1">{selectedEventListDetails.min_time_diff.toExponential(3)}s</Typography>
+                      <Typography variant="body1">{selectedEventListDetails.min_time_diff.toExponential(6)}s</Typography>
                     </Grid>
                   )}
                 </Grid>
@@ -2070,7 +2369,7 @@ const DataIngestionPage: React.FC = () => {
                   <Chip label="Time" color="primary" size="small" />
                   {selectedEventListDetails.has_energy && (
                     <Chip
-                      label={`Energy${selectedEventListDetails.energy_range ? ` (${selectedEventListDetails.energy_range[0].toFixed(2)}-${selectedEventListDetails.energy_range[1].toFixed(2)} keV)` : ''}`}
+                      label={`Energy${selectedEventListDetails.energy_range ? ` (${selectedEventListDetails.energy_range[0].toFixed(4)}-${selectedEventListDetails.energy_range[1].toFixed(4)} keV)` : ''}`}
                       color="success"
                       size="small"
                     />
@@ -2094,7 +2393,7 @@ const DataIngestionPage: React.FC = () => {
                       Good Time Intervals ({selectedEventListDetails.gti_count} GTI{selectedEventListDetails.gti_count !== 1 ? 's' : ''})
                       {selectedEventListDetails.total_gti_time && (
                         <Typography component="span" variant="body2" color="text.secondary" sx={{ ml: 1 }}>
-                          Total: {selectedEventListDetails.total_gti_time.toFixed(2)}s
+                          Total: {selectedEventListDetails.total_gti_time.toFixed(6)}s
                         </Typography>
                       )}
                     </Typography>
@@ -2112,9 +2411,9 @@ const DataIngestionPage: React.FC = () => {
                           {selectedEventListDetails.gti_list.map((gti, index) => (
                             <TableRow key={index}>
                               <TableCell>{index + 1}</TableCell>
-                              <TableCell>{gti[0].toFixed(4)}</TableCell>
-                              <TableCell>{gti[1].toFixed(4)}</TableCell>
-                              <TableCell>{(gti[1] - gti[0]).toFixed(4)}s</TableCell>
+                              <TableCell>{gti[0].toFixed(6)}</TableCell>
+                              <TableCell>{gti[1].toFixed(6)}</TableCell>
+                              <TableCell>{(gti[1] - gti[0]).toFixed(6)}s</TableCell>
                             </TableRow>
                           ))}
                         </TableBody>
@@ -2163,12 +2462,16 @@ const DataIngestionPage: React.FC = () => {
                 value={previewTabValue}
                 onChange={(_, newValue) => setPreviewTabValue(newValue)}
                 sx={{ mb: 2, borderBottom: 1, borderColor: 'divider' }}
+                variant="scrollable"
+                scrollButtons="auto"
               >
                 <Tab label="Overview" />
                 <Tab label="Time Data" />
                 <Tab label="Energy & PI" />
                 <Tab label="GTIs" />
                 <Tab label="Metadata" />
+                <Tab label="Header" />
+                <Tab label="Validation" />
               </Tabs>
 
               {/* Overview Tab */}
@@ -2186,7 +2489,7 @@ const DataIngestionPage: React.FC = () => {
                     <Grid item xs={6} sm={3}>
                       <Paper variant="outlined" sx={{ p: 2, textAlign: 'center' }}>
                         <Typography variant="h4" color="secondary">
-                          {fullPreviewData.duration.toFixed(2)}s
+                          {fullPreviewData.duration.toFixed(6)}s
                         </Typography>
                         <Typography variant="caption" color="text.secondary">Duration</Typography>
                       </Paper>
@@ -2194,7 +2497,7 @@ const DataIngestionPage: React.FC = () => {
                     <Grid item xs={6} sm={3}>
                       <Paper variant="outlined" sx={{ p: 2, textAlign: 'center' }}>
                         <Typography variant="h4" color="success.main">
-                          {fullPreviewData.mean_count_rate?.toFixed(1) || 'N/A'}
+                          {fullPreviewData.mean_count_rate?.toFixed(6) || 'N/A'}
                         </Typography>
                         <Typography variant="caption" color="text.secondary">Mean Count Rate (cts/s)</Typography>
                       </Paper>
@@ -2251,22 +2554,70 @@ const DataIngestionPage: React.FC = () => {
                     <Grid item xs={6} sm={4}>
                       <Typography variant="caption" color="text.secondary">Min Time Diff</Typography>
                       <Typography variant="body1" fontFamily="monospace">
-                        {fullPreviewData.min_time_diff?.toExponential(3) || 'N/A'}s
+                        {fullPreviewData.min_time_diff?.toExponential(6) || 'N/A'}s
                       </Typography>
                     </Grid>
                     <Grid item xs={6} sm={4}>
                       <Typography variant="caption" color="text.secondary">Max Time Diff</Typography>
                       <Typography variant="body1" fontFamily="monospace">
-                        {fullPreviewData.max_time_diff?.toExponential(3) || 'N/A'}s
+                        {fullPreviewData.max_time_diff?.toExponential(6) || 'N/A'}s
                       </Typography>
                     </Grid>
                     <Grid item xs={6} sm={4}>
                       <Typography variant="caption" color="text.secondary">Mean Time Diff</Typography>
                       <Typography variant="body1" fontFamily="monospace">
-                        {fullPreviewData.mean_time_diff?.toExponential(3) || 'N/A'}s
+                        {fullPreviewData.mean_time_diff?.toExponential(6) || 'N/A'}s
+                      </Typography>
+                    </Grid>
+                    <Grid item xs={6} sm={4}>
+                      <Typography variant="caption" color="text.secondary">Median Time Diff</Typography>
+                      <Typography variant="body1" fontFamily="monospace">
+                        {fullPreviewData.median_time_diff?.toExponential(6) || 'N/A'}s
+                      </Typography>
+                    </Grid>
+                    <Grid item xs={6} sm={4}>
+                      <Typography variant="caption" color="text.secondary">Std Dev Time Diff</Typography>
+                      <Typography variant="body1" fontFamily="monospace">
+                        {fullPreviewData.std_time_diff?.toExponential(6) || 'N/A'}s
                       </Typography>
                     </Grid>
                   </Grid>
+
+                  {/* Per-GTI Rates */}
+                  {fullPreviewData.per_gti_rates && fullPreviewData.per_gti_rates.length > 0 && (
+                    <>
+                      <Divider />
+                      <Typography variant="subtitle2" color="primary">
+                        Per-GTI Count Rates ({fullPreviewData.per_gti_rates.length} GTI{fullPreviewData.per_gti_rates.length !== 1 ? 's' : ''})
+                      </Typography>
+                      <TableContainer component={Paper} variant="outlined" sx={{ maxHeight: 200 }}>
+                        <Table size="small" stickyHeader>
+                          <TableHead>
+                            <TableRow>
+                              <TableCell>#</TableCell>
+                              <TableCell>Start (s)</TableCell>
+                              <TableCell>Stop (s)</TableCell>
+                              <TableCell>Events</TableCell>
+                              <TableCell>Duration (s)</TableCell>
+                              <TableCell>Rate (cts/s)</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {fullPreviewData.per_gti_rates.map((gti, index) => (
+                              <TableRow key={index}>
+                                <TableCell>{index + 1}</TableCell>
+                                <TableCell sx={{ fontFamily: 'monospace' }}>{gti.start.toFixed(6)}</TableCell>
+                                <TableCell sx={{ fontFamily: 'monospace' }}>{gti.stop.toFixed(6)}</TableCell>
+                                <TableCell>{gti.events.toLocaleString()}</TableCell>
+                                <TableCell sx={{ fontFamily: 'monospace' }}>{gti.duration.toFixed(6)}</TableCell>
+                                <TableCell sx={{ fontFamily: 'monospace' }}>{gti.rate.toFixed(6)}</TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    </>
+                  )}
 
                   <Divider />
 
@@ -2306,7 +2657,7 @@ const DataIngestionPage: React.FC = () => {
                           <Typography variant="caption" color="text.secondary">Energy Range</Typography>
                           <Typography variant="body1" fontFamily="monospace">
                             {fullPreviewData.energy_range
-                              ? `${fullPreviewData.energy_range[0].toFixed(2)} - ${fullPreviewData.energy_range[1].toFixed(2)} keV`
+                              ? `${fullPreviewData.energy_range[0].toFixed(5)} - ${fullPreviewData.energy_range[1].toFixed(5)} keV`
                               : 'N/A'}
                           </Typography>
                         </Grid>
@@ -2320,7 +2671,7 @@ const DataIngestionPage: React.FC = () => {
                             {fullPreviewData.energy_preview.map((energy, index) => (
                               <Chip
                                 key={index}
-                                label={`${energy.toFixed(2)} keV`}
+                                label={`${energy.toFixed(5)} keV`}
                                 size="small"
                                 variant="outlined"
                                 color="success"
@@ -2383,7 +2734,7 @@ const DataIngestionPage: React.FC = () => {
                   </Typography>
                   {fullPreviewData.total_gti_time && (
                     <Typography variant="body2" color="text.secondary">
-                      Total GTI Time: {fullPreviewData.total_gti_time.toFixed(2)}s
+                      Total GTI Time: {fullPreviewData.total_gti_time.toFixed(6)}s
                     </Typography>
                   )}
                   {fullPreviewData.gti_list && fullPreviewData.gti_list.length > 0 ? (
@@ -2401,9 +2752,9 @@ const DataIngestionPage: React.FC = () => {
                           {fullPreviewData.gti_list.map((gti, index) => (
                             <TableRow key={index}>
                               <TableCell>{index + 1}</TableCell>
-                              <TableCell sx={{ fontFamily: 'monospace' }}>{gti[0].toFixed(4)}</TableCell>
-                              <TableCell sx={{ fontFamily: 'monospace' }}>{gti[1].toFixed(4)}</TableCell>
-                              <TableCell sx={{ fontFamily: 'monospace' }}>{(gti[1] - gti[0]).toFixed(4)}</TableCell>
+                              <TableCell sx={{ fontFamily: 'monospace' }}>{gti[0].toFixed(6)}</TableCell>
+                              <TableCell sx={{ fontFamily: 'monospace' }}>{gti[1].toFixed(6)}</TableCell>
+                              <TableCell sx={{ fontFamily: 'monospace' }}>{(gti[1] - gti[0]).toFixed(6)}</TableCell>
                             </TableRow>
                           ))}
                         </TableBody>
@@ -2463,6 +2814,279 @@ const DataIngestionPage: React.FC = () => {
                       </Box>
                     </>
                   )}
+
+                  {/* User Notes */}
+                  {fullPreviewData.notes && (
+                    <>
+                      <Divider />
+                      <Typography variant="subtitle2" color="primary">User Notes</Typography>
+                      <Paper variant="outlined" sx={{ p: 2, bgcolor: 'action.hover' }}>
+                        <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap' }}>
+                          {fullPreviewData.notes}
+                        </Typography>
+                      </Paper>
+                    </>
+                  )}
+                </Box>
+              )}
+
+              {/* Header Tab */}
+              {previewTabValue === 5 && (
+                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  {fullPreviewData.header_info && Object.keys(fullPreviewData.header_info).length > 0 ? (
+                    <>
+                      <Typography variant="subtitle2" color="primary">Key FITS Headers</Typography>
+                      <Grid container spacing={2}>
+                        {fullPreviewData.header_info.object && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">Object</Typography>
+                            <Typography variant="body1">{fullPreviewData.header_info.object}</Typography>
+                          </Grid>
+                        )}
+                        {fullPreviewData.header_info.obs_id && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">OBS_ID</Typography>
+                            <Typography variant="body1">{fullPreviewData.header_info.obs_id}</Typography>
+                          </Grid>
+                        )}
+                        {(fullPreviewData.header_info.ra_nom !== undefined || fullPreviewData.header_info.ra_obj !== undefined) && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">RA</Typography>
+                            <Typography variant="body1" fontFamily="monospace">
+                              {(fullPreviewData.header_info.ra_nom ?? fullPreviewData.header_info.ra_obj)?.toFixed(7) || 'N/A'}°
+                            </Typography>
+                          </Grid>
+                        )}
+                        {(fullPreviewData.header_info.dec_nom !== undefined || fullPreviewData.header_info.dec_obj !== undefined) && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">Dec</Typography>
+                            <Typography variant="body1" fontFamily="monospace">
+                              {(fullPreviewData.header_info.dec_nom ?? fullPreviewData.header_info.dec_obj)?.toFixed(7) || 'N/A'}°
+                            </Typography>
+                          </Grid>
+                        )}
+                        {fullPreviewData.header_info.exposure !== undefined && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">Exposure</Typography>
+                            <Typography variant="body1" fontFamily="monospace">
+                              {fullPreviewData.header_info.exposure?.toFixed(6) || 'N/A'}s
+                            </Typography>
+                          </Grid>
+                        )}
+                        {fullPreviewData.header_info.ontime !== undefined && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">Ontime</Typography>
+                            <Typography variant="body1" fontFamily="monospace">
+                              {fullPreviewData.header_info.ontime?.toFixed(6) || 'N/A'}s
+                            </Typography>
+                          </Grid>
+                        )}
+                        {fullPreviewData.header_info.livetime !== undefined && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">Livetime</Typography>
+                            <Typography variant="body1" fontFamily="monospace">
+                              {fullPreviewData.header_info.livetime?.toFixed(6) || 'N/A'}s
+                            </Typography>
+                          </Grid>
+                        )}
+                        {fullPreviewData.header_info.date_obs && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">DATE-OBS</Typography>
+                            <Typography variant="body1">{fullPreviewData.header_info.date_obs}</Typography>
+                          </Grid>
+                        )}
+                        {fullPreviewData.header_info.date_end && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">DATE-END</Typography>
+                            <Typography variant="body1">{fullPreviewData.header_info.date_end}</Typography>
+                          </Grid>
+                        )}
+                        {fullPreviewData.header_info.telescop && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">Telescope</Typography>
+                            <Typography variant="body1">{fullPreviewData.header_info.telescop}</Typography>
+                          </Grid>
+                        )}
+                        {fullPreviewData.header_info.instrume && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">Instrument</Typography>
+                            <Typography variant="body1">{fullPreviewData.header_info.instrume}</Typography>
+                          </Grid>
+                        )}
+                        {fullPreviewData.header_info.creator && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">Creator</Typography>
+                            <Typography variant="body1">{fullPreviewData.header_info.creator}</Typography>
+                          </Grid>
+                        )}
+                        {fullPreviewData.header_info.observer && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">Observer</Typography>
+                            <Typography variant="body1">{fullPreviewData.header_info.observer}</Typography>
+                          </Grid>
+                        )}
+                        {fullPreviewData.header_info.datamode && (
+                          <Grid item xs={6} sm={4}>
+                            <Typography variant="caption" color="text.secondary">Data Mode</Typography>
+                            <Typography variant="body1">{fullPreviewData.header_info.datamode}</Typography>
+                          </Grid>
+                        )}
+                      </Grid>
+
+                      {/* Raw Header Table */}
+                      {fullPreviewData.header_info.raw_header && Object.keys(fullPreviewData.header_info.raw_header).length > 0 && (
+                        <>
+                          <Divider />
+                          <Typography variant="subtitle2" color="primary">
+                            Raw FITS Header ({Object.keys(fullPreviewData.header_info.raw_header).length} entries)
+                          </Typography>
+                          <TableContainer component={Paper} variant="outlined" sx={{ maxHeight: 300 }}>
+                            <Table size="small" stickyHeader>
+                              <TableHead>
+                                <TableRow>
+                                  <TableCell sx={{ fontWeight: 'bold', width: '30%' }}>Keyword</TableCell>
+                                  <TableCell sx={{ fontWeight: 'bold' }}>Value</TableCell>
+                                </TableRow>
+                              </TableHead>
+                              <TableBody>
+                                {Object.entries(fullPreviewData.header_info.raw_header).map(([key, value]) => (
+                                  <TableRow key={key}>
+                                    <TableCell sx={{ fontFamily: 'monospace' }}>{key}</TableCell>
+                                    <TableCell sx={{ fontFamily: 'monospace', wordBreak: 'break-word' }}>{value}</TableCell>
+                                  </TableRow>
+                                ))}
+                              </TableBody>
+                            </Table>
+                          </TableContainer>
+                        </>
+                      )}
+                    </>
+                  ) : (
+                    <Alert severity="info">No FITS header information available for this EventList</Alert>
+                  )}
+                </Box>
+              )}
+
+              {/* Validation Tab */}
+              {previewTabValue === 6 && (
+                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <Typography variant="subtitle2" color="primary">Data Quality Validation</Typography>
+                  {fullPreviewData.validation_issues && fullPreviewData.validation_issues.length > 0 ? (
+                    <>
+                      {/* Summary */}
+                      <Box sx={{ display: 'flex', gap: 1, mb: 1, flexWrap: 'wrap' }}>
+                        {(() => {
+                          const passed = fullPreviewData.validation_issues.filter((v: ValidationIssue) => v.status === 'pass');
+                          const failed = fullPreviewData.validation_issues.filter((v: ValidationIssue) => v.status === 'fail');
+                          const skipped = fullPreviewData.validation_issues.filter((v: ValidationIssue) => v.status === 'skip');
+                          const errors = fullPreviewData.validation_issues.filter((v: ValidationIssue) => v.severity === 'error');
+                          const warnings = fullPreviewData.validation_issues.filter((v: ValidationIssue) => v.severity === 'warning');
+                          return (
+                            <>
+                              <Chip
+                                label={`${passed.length} Passed`}
+                                color="success"
+                                size="small"
+                                icon={<CheckCircleIcon />}
+                              />
+                              {failed.length > 0 && (
+                                <Chip
+                                  label={`${failed.length} Failed`}
+                                  color="error"
+                                  size="small"
+                                  icon={<ErrorIcon />}
+                                />
+                              )}
+                              {skipped.length > 0 && (
+                                <Chip
+                                  label={`${skipped.length} Skipped`}
+                                  color="default"
+                                  size="small"
+                                />
+                              )}
+                              {errors.length > 0 && (
+                                <Chip label={`${errors.length} Error${errors.length !== 1 ? 's' : ''}`} color="error" size="small" variant="outlined" />
+                              )}
+                              {warnings.length > 0 && (
+                                <Chip label={`${warnings.length} Warning${warnings.length !== 1 ? 's' : ''}`} color="warning" size="small" variant="outlined" />
+                              )}
+                            </>
+                          );
+                        })()}
+                      </Box>
+
+                      {/* All Checks List */}
+                      <TableContainer component={Paper} variant="outlined">
+                        <Table size="small">
+                          <TableHead>
+                            <TableRow>
+                              <TableCell sx={{ width: '8%' }}>Status</TableCell>
+                              <TableCell sx={{ width: '22%' }}>Check</TableCell>
+                              <TableCell sx={{ width: '45%' }}>Result</TableCell>
+                              <TableCell sx={{ width: '15%' }}>Details</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {fullPreviewData.validation_issues.map((issue: ValidationIssue, index: number) => (
+                              <TableRow
+                                key={index}
+                                sx={{
+                                  backgroundColor: issue.status === 'pass'
+                                    ? 'rgba(46, 125, 50, 0.08)'
+                                    : issue.status === 'fail'
+                                      ? 'rgba(211, 47, 47, 0.08)'
+                                      : 'rgba(158, 158, 158, 0.08)'
+                                }}
+                              >
+                                <TableCell>
+                                  {issue.status === 'pass' && (
+                                    <Chip label="PASS" size="small" color="success" sx={{ fontWeight: 'bold', minWidth: 60 }} />
+                                  )}
+                                  {issue.status === 'fail' && (
+                                    <Chip
+                                      label={issue.severity === 'error' ? 'FAIL' : 'WARN'}
+                                      size="small"
+                                      color={issue.severity === 'error' ? 'error' : 'warning'}
+                                      sx={{ fontWeight: 'bold', minWidth: 60 }}
+                                    />
+                                  )}
+                                  {issue.status === 'skip' && (
+                                    <Chip label="SKIP" size="small" color="default" sx={{ fontWeight: 'bold', minWidth: 60 }} />
+                                  )}
+                                </TableCell>
+                                <TableCell>
+                                  <Typography variant="body2" fontWeight="medium">
+                                    {issue.name || issue.type}
+                                  </Typography>
+                                  {issue.description && (
+                                    <Typography variant="caption" color="text.secondary" display="block">
+                                      {issue.description}
+                                    </Typography>
+                                  )}
+                                </TableCell>
+                                <TableCell>
+                                  <Typography variant="body2">{issue.message}</Typography>
+                                </TableCell>
+                                <TableCell sx={{ fontFamily: 'monospace' }}>
+                                  {issue.status !== 'skip' && issue.total !== undefined && issue.total > 0 && (
+                                    <Typography variant="body2">
+                                      {issue.count?.toLocaleString() || 0} / {issue.total?.toLocaleString()}
+                                    </Typography>
+                                  )}
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    </>
+                  ) : (
+                    <Alert severity="info">
+                      <Typography variant="body2">
+                        No validation data available. Try reloading the event list.
+                      </Typography>
+                    </Alert>
+                  )}
                 </Box>
               )}
             </Box>
@@ -2472,6 +3096,80 @@ const DataIngestionPage: React.FC = () => {
         </DialogContent>
         <DialogActions>
           <Button onClick={handleCloseFullPreview}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Save Format Selection Dialog */}
+      <Dialog
+        open={saveFormatDialogOpen}
+        onClose={() => setSaveFormatDialogOpen(false)}
+        maxWidth="xs"
+        fullWidth
+      >
+        <DialogTitle>
+          Choose Save Format
+        </DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Select the format for saving &quot;{saveEventListName}&quot;:
+          </Typography>
+          <FormControl component="fieldset">
+            <RadioGroup
+              value={selectedSaveFormat}
+              onChange={(e) => setSelectedSaveFormat(e.target.value)}
+            >
+              <FormControlLabel
+                value="hdf5"
+                control={<Radio />}
+                label={
+                  <Box>
+                    <Typography variant="body1" fontWeight="medium">
+                      HDF5 (Recommended)
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Binary format. Preserves all metadata (GTI, MJDREF, etc.). Fast I/O, compact size.
+                    </Typography>
+                  </Box>
+                }
+              />
+              <FormControlLabel
+                value="ascii.ecsv"
+                control={<Radio />}
+                label={
+                  <Box>
+                    <Typography variant="body1" fontWeight="medium">
+                      ASCII ECSV
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Human-readable text format. Good for sharing and inspection. Larger file size.
+                    </Typography>
+                  </Box>
+                }
+                sx={{ mt: 1 }}
+              />
+              <FormControlLabel
+                value="pickle"
+                control={<Radio />}
+                label={
+                  <Box>
+                    <Typography variant="body1" fontWeight="medium">
+                      Pickle
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Python-only format. Not recommended for long-term storage or sharing.
+                    </Typography>
+                  </Box>
+                }
+                sx={{ mt: 1 }}
+              />
+            </RadioGroup>
+          </FormControl>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSaveFormatDialogOpen(false)}>Cancel</Button>
+          <Button onClick={handleConfirmSave} variant="contained" color="primary">
+            Choose Location
+          </Button>
         </DialogActions>
       </Dialog>
 
