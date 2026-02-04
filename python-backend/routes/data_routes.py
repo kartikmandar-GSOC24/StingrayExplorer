@@ -135,8 +135,13 @@ async def load_event_list(
     request: LoadEventListRequest,
     service: DataService = Depends(get_data_service),
 ):
-    """Load an EventList from a file."""
-    return service.load_event_list(
+    """Load an EventList from a file.
+
+    Uses asyncio.to_thread() to avoid blocking the event loop,
+    allowing other async operations (like resource monitoring) to continue.
+    """
+    return await asyncio.to_thread(
+        service.load_event_list,
         file_path=request.file_path,
         name=request.name,
         fmt=request.fmt,
@@ -153,8 +158,12 @@ async def load_event_list_from_url(
     request: LoadEventListFromUrlRequest,
     service: DataService = Depends(get_data_service),
 ):
-    """Load an EventList from a URL."""
-    return service.load_event_list_from_url(
+    """Load an EventList from a URL.
+
+    Uses asyncio.to_thread() to avoid blocking the event loop.
+    """
+    return await asyncio.to_thread(
+        service.load_event_list_from_url,
         url=request.url,
         name=request.name,
         fmt=request.fmt,
@@ -211,8 +220,12 @@ async def save_event_list(
     request: SaveEventListRequest,
     service: DataService = Depends(get_data_service),
 ):
-    """Save an EventList to disk."""
-    return service.save_event_list(
+    """Save an EventList to disk.
+
+    Uses asyncio.to_thread() to avoid blocking the event loop.
+    """
+    return await asyncio.to_thread(
+        service.save_event_list,
         name=request.name,
         file_path=request.file_path,
         fmt=request.fmt,
@@ -288,8 +301,11 @@ async def load_event_list_by_time_range(
 
     Uses FITSTimeseriesReader to load only events within the specified
     time window without reading the entire file into memory.
+
+    Uses asyncio.to_thread() to avoid blocking the event loop.
     """
-    return service.load_event_list_by_time_range(
+    return await asyncio.to_thread(
+        service.load_event_list_by_time_range,
         file_path=request.file_path,
         name=request.name,
         start_time=request.start_time,
@@ -309,8 +325,11 @@ async def load_event_list_by_event_count(
 
     Uses FITSTimeseriesReader slicing to load only the requested events
     without reading the entire file into memory.
+
+    Uses asyncio.to_thread() to avoid blocking the event loop.
     """
-    return service.load_event_list_by_event_count(
+    return await asyncio.to_thread(
+        service.load_event_list_by_event_count,
         file_path=request.file_path,
         name=request.name,
         start_index=request.start_index,
@@ -330,8 +349,11 @@ async def get_file_metadata(
 
     Returns file info, event count, time range, GTI, and loading recommendations
     without loading any event data into memory.
+
+    Uses asyncio.to_thread() to avoid blocking the event loop.
     """
-    return service.get_file_metadata(
+    return await asyncio.to_thread(
+        service.get_file_metadata,
         file_path=request.file_path,
         fmt=request.fmt,
     )
