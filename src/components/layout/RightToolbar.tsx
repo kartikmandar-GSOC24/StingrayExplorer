@@ -45,7 +45,6 @@ import { useBackendContext } from '@/App';
 
 const TOOLBAR_WIDTH = 52;
 const HEADER_HEIGHT = 64;
-const LOG_PANEL_COLLAPSED_HEIGHT = 40;
 
 interface RightToolbarProps {
   visible?: boolean;
@@ -274,7 +273,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
     <Box
       sx={{
         width: TOOLBAR_WIDTH,
-        height: `calc(100vh - ${HEADER_HEIGHT}px - ${LOG_PANEL_COLLAPSED_HEIGHT}px)`,
+        height: `calc(100vh - ${HEADER_HEIGHT}px)`,
         backgroundColor: 'background.paper',
         borderLeft: '1px solid',
         borderColor: 'divider',

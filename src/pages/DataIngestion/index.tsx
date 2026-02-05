@@ -75,14 +75,14 @@ import {
   FileMetadata,
   SingleFileConfig,
   BatchSizeResult,
-  BatchLoadResult,
-  BatchLoadSuccessItem,
-  BatchLoadFailedItem,
   ValidationIssue,
 } from '@/api/dataApi';
+import { jobApi } from '@/api/jobApi';
+import type { BatchFileConfig } from '@/types/job';
 import HeasarcBrowserPanel from './HeasarcBrowserPanel';
 import { apiClient } from '@/api/client';
 import { useUIStore } from '@/store/uiStore';
+import { useJobStore } from '@/store/jobStore';
 
 type AlertSeverity = 'success' | 'error' | 'warning' | 'info';
 
@@ -121,8 +121,11 @@ const getLastLoadedFiles = (): LastLoadedFilesData | null => {
 };
 
 const DataIngestionPage: React.FC = () => {
-  // Global notification store and processing state
-  const { addNotification, setProcessing } = useUIStore();
+  // Global notification store
+  const { addNotification } = useUIStore();
+
+  // Job store for watching job completions and refreshing data
+  const { jobs } = useJobStore();
 
   // Form state - Local File (batch mode)
   const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
@@ -139,13 +142,13 @@ const DataIngestionPage: React.FC = () => {
   const [batchSizeInfo, setBatchSizeInfo] = useState<BatchSizeResult | null>(null);
   const [isCheckingBatchSize, setIsCheckingBatchSize] = useState<boolean>(false);
 
-  // Batch loading progress
-  const [batchProgress, setBatchProgress] = useState<{
+  // Batch loading progress - kept for potential future use but not used with job queue
+  const [_batchProgress, _setBatchProgress] = useState<{
     loading: boolean;
     total: number;
     completed: number;
   } | null>(null);
-  const [batchResult, setBatchResult] = useState<BatchLoadResult | null>(null);
+  // Note: batchResult removed - job queue handles results in sidebar
 
   // Advanced options state
   const [showAdvancedOptions, setShowAdvancedOptions] = useState<boolean>(false);
@@ -180,7 +183,7 @@ const DataIngestionPage: React.FC = () => {
   const [urlEventListName, setUrlEventListName] = useState<string>('');
   const [urlFormat, setUrlFormat] = useState<string>('ogip');
   const [isLoadingUrl, setIsLoadingUrl] = useState<boolean>(false);
-  const [urlDownloadProgress, setUrlDownloadProgress] = useState<number | null>(null);
+  // Note: urlDownloadProgress removed - job queue handles progress in sidebar
 
   // Loaded data state
   const [loadedEventLists, setLoadedEventLists] = useState<EventListSummary[]>([]);
@@ -232,6 +235,21 @@ const DataIngestionPage: React.FC = () => {
   useEffect(() => {
     fetchEventLists();
   }, [fetchEventLists]);
+
+  // Refresh event list when jobs complete
+  useEffect(() => {
+    // Count completed load jobs
+    const completedLoadJobs = Object.values(jobs).filter(
+      (job) =>
+        job.status === 'completed' &&
+        (job.type === 'load_event_list' || job.type === 'load_batch' || job.type === 'load_from_url')
+    );
+
+    if (completedLoadJobs.length > 0) {
+      // Refresh the event list to show newly loaded data
+      fetchEventLists();
+    }
+  }, [jobs, fetchEventLists]);
 
   // Check for last loaded files on mount
   useEffect(() => {
@@ -379,7 +397,7 @@ const DataIngestionPage: React.FC = () => {
     });
 
     if (files && files.length > 0) {
-      setBatchResult(null); // Clear previous batch result
+      // Batch result cleared (job queue handles results) // Clear previous batch result
 
       // APPEND mode: merge with existing selection (filter duplicates)
       const existingSet = new Set(selectedFiles);
@@ -474,7 +492,7 @@ const DataIngestionPage: React.FC = () => {
     setPerFileConfigs({});
     setBatchSizeInfo(null);
     setFileSizeInfo(null);
-    setBatchResult(null);
+    // Batch result cleared (job queue handles results)
     setExpandedFileSettings({});
   };
 
@@ -509,7 +527,7 @@ const DataIngestionPage: React.FC = () => {
       return;
     }
 
-    setBatchResult(null);
+    // Batch result cleared (job queue handles results)
 
     // Merge with current selection (same logic as browse)
     const existingSet = new Set(selectedFiles);
@@ -661,7 +679,7 @@ const DataIngestionPage: React.FC = () => {
     }
   };
 
-  // Handle loading files (single or batch)
+  // Handle loading files (single or batch) - submits background jobs
   const handleLoadFile = async (): Promise<void> => {
     if (selectedFiles.length === 0) {
       showAlert('Please select a file first', 'warning');
@@ -684,7 +702,7 @@ const DataIngestionPage: React.FC = () => {
     }
 
     setIsLoading(true);
-    setBatchResult(null);
+    // Batch result cleared (job queue handles results)
     setAlert({ open: false, message: '', severity: 'info' });
 
     try {
@@ -695,65 +713,41 @@ const DataIngestionPage: React.FC = () => {
         ? additionalColumns.split(',').map((col) => col.trim()).filter((col) => col)
         : undefined;
 
-      // Single file: use existing single-file loading
+      // Single file: submit a single load job
       if (selectedFiles.length === 1) {
-        setProcessing(true, `Loading ${fileNames[selectedFiles[0]]}...`);
+        const response = await jobApi.submitLoadJob({
+          file_path: selectedFiles[0],
+          name: fileNames[selectedFiles[0]].trim(),
+          fmt: fileFormat,
+          rmf_file: rmfFile || undefined,
+          additional_columns: additionalColumnsArray,
+          high_precision: highPrecision,
+          skip_checks: skipChecks,
+          notes: eventNotes.trim() || undefined,
+          use_partial_loading: useTrueLazyLoading,
+          partial_mode: trueLazyMode,
+          time_range_start: useTrueLazyLoading && trueLazyMode === 'time_range' ? timeRangeStart : undefined,
+          time_range_end: useTrueLazyLoading && trueLazyMode === 'time_range' ? timeRangeEnd : undefined,
+          event_start_index: useTrueLazyLoading && trueLazyMode === 'event_count' ? eventCountStart : undefined,
+          event_count: useTrueLazyLoading && trueLazyMode === 'event_count' ? eventCount : undefined,
+        });
 
-        let response;
-        let loadMethod = '';
-
-        if (useTrueLazyLoading) {
-          if (trueLazyMode === 'time_range') {
-            response = await dataApi.loadEventListByTimeRange({
-              file_path: selectedFiles[0],
-              name: fileNames[selectedFiles[0]].trim(),
-              start_time: timeRangeStart,
-              end_time: timeRangeEnd,
-              fmt: fileFormat,
-              notes: eventNotes.trim() || undefined,
-            });
-            loadMethod = ` (Time Range: ${timeRangeStart}s - ${timeRangeEnd}s)`;
-          } else {
-            response = await dataApi.loadEventListByEventCount({
-              file_path: selectedFiles[0],
-              name: fileNames[selectedFiles[0]].trim(),
-              start_index: eventCountStart,
-              count: eventCount,
-              fmt: fileFormat,
-              notes: eventNotes.trim() || undefined,
-            });
-            loadMethod = ` (Events: ${eventCountStart} - ${eventCountStart + eventCount})`;
-          }
-        } else {
-          response = await dataApi.loadEventList({
-            file_path: selectedFiles[0],
-            name: fileNames[selectedFiles[0]].trim(),
-            fmt: fileFormat,
-            rmf_file: rmfFile || undefined,
-            additional_columns: additionalColumnsArray,
-            high_precision: highPrecision,
-            skip_checks: skipChecks,
-            notes: eventNotes.trim() || undefined,
-          });
-        }
-
-        if (response.success) {
-          showAlert(response.message || `Event List loaded successfully!${loadMethod}`, 'success', 'Data Loaded');
+        if (response.success && response.data) {
+          showAlert(
+            `Job submitted: ${response.data.display_name}. Check sidebar for progress.`,
+            'info',
+            'Job Submitted'
+          );
           // Save files to localStorage before clearing form
           saveLastLoadedFiles(selectedFiles, fileNames);
           setHasLastLoadedFiles(true);
           resetForm();
-          await fetchEventLists();
         } else {
-          showAlert(response.message || 'Failed to load Event List', 'error', 'Load Failed');
+          showAlert(response.message || 'Failed to submit load job', 'error', 'Job Submit Failed');
         }
       } else {
-        // Multiple files: use SSE streaming batch loading for real-time progress
-        setProcessing(true, `Loading ${selectedFiles.length} files...`);
-        setBatchProgress({ loading: true, total: selectedFiles.length, completed: 0 });
-
-        // Build file configs
-        const fileConfigs: SingleFileConfig[] = selectedFiles.map((f) => {
+        // Multiple files: submit a batch load job
+        const fileConfigs: BatchFileConfig[] = selectedFiles.map((f) => {
           const perFile = perFileConfigs[f] || {};
           return {
             file_path: f,
@@ -773,19 +767,7 @@ const DataIngestionPage: React.FC = () => {
           };
         });
 
-        // Track results incrementally via SSE streaming
-        const successful: BatchLoadSuccessItem[] = [];
-        const failed: BatchLoadFailedItem[] = [];
-        let finalSummary: {
-          total_time_ms: number;
-          success_count: number;
-          failure_count: number;
-          total_events: number;
-          workers_used: number;
-        } | null = null;
-
-        // Use SSE streaming to get real-time progress updates
-        for await (const event of dataApi.loadBatchEventListsSSE({
+        const response = await jobApi.submitBatchJob({
           files: fileConfigs,
           use_same_settings: useSameSettings,
           shared_fmt: fileFormat,
@@ -799,113 +781,27 @@ const DataIngestionPage: React.FC = () => {
           shared_time_range_end: useTrueLazyLoading ? timeRangeEnd : undefined,
           shared_event_start_index: useTrueLazyLoading ? eventCountStart : undefined,
           shared_event_count: useTrueLazyLoading ? eventCount : undefined,
-        })) {
-          // Log SSE events to console for debugging
-          console.log('[SSE Event]', event);
+        });
 
-          if (event.type === 'file_complete') {
-            // Update progress immediately
-            setBatchProgress((prev) =>
-              prev ? { ...prev, completed: event.completed } : null
-            );
-            setProcessing(true, `Loading files (${event.completed}/${event.total})...`);
-
-            // Track results
-            if (event.success && event.data) {
-              successful.push({
-                name: event.name,
-                file_path: event.file_path,
-                data: event.data,
-              });
-              // Log warnings if present
-              if (event.data.gti_warnings && event.data.gti_warnings.length > 0) {
-                console.warn(`[GTI Warnings] ${event.name}:`, event.data.gti_warnings);
-              }
-              if (event.data.stingray_warnings && event.data.stingray_warnings.length > 0) {
-                console.warn(`[Stingray Warnings] ${event.name}:`, event.data.stingray_warnings);
-              }
-              // Refresh the list to show the newly loaded file immediately
-              await fetchEventLists();
-            } else {
-              console.error(`[Load Failed] ${event.name}:`, event.error);
-              failed.push({
-                name: event.name,
-                file_path: event.file_path,
-                error: event.error || 'Unknown error',
-              });
-            }
-          } else if (event.type === 'complete') {
-            // Final summary
-            console.log('[Batch Complete]', event);
-            finalSummary = {
-              total_time_ms: event.total_time_ms,
-              success_count: event.success_count,
-              failure_count: event.failure_count,
-              total_events: event.total_events,
-              workers_used: event.workers_used,
-            };
-          } else if (event.type === 'error') {
-            // Pre-validation error
-            console.error('[Batch Error]', event.error);
-            showAlert(event.error, 'error', 'Batch Load Error');
-            setBatchProgress(null);
-            return;
-          }
-        }
-
-        // Set final batch result for display
-        setBatchProgress(null);
-        if (finalSummary) {
-          setBatchResult({
-            successful,
-            failed,
-            summary: {
-              total_files: selectedFiles.length,
-              success_count: finalSummary.success_count,
-              failure_count: finalSummary.failure_count,
-              total_events_loaded: finalSummary.total_events,
-              total_time_ms: finalSummary.total_time_ms,
-              workers_used: finalSummary.workers_used,
-            },
-          });
-
-          // Show appropriate message based on results
-          if (finalSummary.failure_count === 0) {
-            showAlert(
-              `Loaded ${finalSummary.success_count} files (${finalSummary.total_events.toLocaleString()} events) in ${finalSummary.total_time_ms.toFixed(0)}ms`,
-              'success',
-              'Batch Load Complete'
-            );
-          } else if (finalSummary.success_count > 0) {
-            const failedDetails = failed.map(f => `• ${f.name}: ${f.error}`).join('\n');
-            showAlert(
-              `Loaded ${finalSummary.success_count}/${selectedFiles.length} files (${finalSummary.total_events.toLocaleString()} events). ${finalSummary.failure_count} failed:\n${failedDetails}`,
-              'warning',
-              'Partial Success'
-            );
-          } else {
-            const failedDetails = failed.map(f => `• ${f.name}: ${f.error}`).join('\n');
-            showAlert(
-              `All ${selectedFiles.length} files failed to load:\n${failedDetails}`,
-              'error',
-              'Batch Load Failed'
-            );
-          }
-
-          // Always save files to localStorage and clear form after any load attempt
-          // User can use "Last Files" button to restore if needed
+        if (response.success && response.data) {
+          showAlert(
+            `Batch job submitted: ${selectedFiles.length} files. Check sidebar for progress.`,
+            'info',
+            'Batch Job Submitted'
+          );
+          // Save files to localStorage and clear form
           saveLastLoadedFiles(selectedFiles, fileNames);
           setHasLastLoadedFiles(true);
           resetForm();
+        } else {
+          showAlert(response.message || 'Failed to submit batch job', 'error', 'Batch Job Submit Failed');
         }
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-      showAlert(`Error: ${errorMessage}`, 'error', 'Load Error');
-      setBatchProgress(null);
+      showAlert(`Error: ${errorMessage}`, 'error', 'Job Submit Error');
     } finally {
       setIsLoading(false);
-      setProcessing(false);
     }
   };
 
@@ -928,7 +824,7 @@ const DataIngestionPage: React.FC = () => {
     setTimeRangeEnd(100);
     setEventCountStart(0);
     setEventCount(10000);
-    setBatchResult(null);
+    // Batch result cleared (job queue handles results)
   };
 
   // Handle deleting an event list
@@ -1034,7 +930,7 @@ const DataIngestionPage: React.FC = () => {
     }
   };
 
-  // Handle loading from URL with SSE streaming for progress
+  // Handle loading from URL - submits a background job
   const handleLoadFromUrl = async (): Promise<void> => {
     if (!urlInput.trim()) {
       showAlert('Please enter a URL', 'warning');
@@ -1055,50 +951,37 @@ const DataIngestionPage: React.FC = () => {
     }
 
     setIsLoadingUrl(true);
-    setUrlDownloadProgress(0);
-    setProcessing(true, `Downloading from URL...`);
     setAlert({ open: false, message: '', severity: 'info' });
 
     try {
       await apiClient.getPort();
 
-      // Use SSE streaming for progress updates
-      for await (const event of dataApi.loadEventListFromUrlSSE({
+      // Submit URL download job
+      const response = await jobApi.submitUrlJob({
         url: urlInput.trim(),
         name: urlEventListName.trim(),
         fmt: urlFormat,
         high_precision: highPrecision,
         skip_checks: skipChecks,
-      })) {
-        switch (event.type) {
-          case 'progress':
-            setUrlDownloadProgress(event.percent);
-            setProcessing(true, `Downloading... ${event.percent.toFixed(0)}%`);
-            break;
-          case 'processing':
-            setUrlDownloadProgress(100);
-            setProcessing(true, event.message);
-            break;
-          case 'complete':
-            showAlert(event.message || 'Event List loaded from URL successfully!', 'success', 'URL Data Loaded');
-            // Reset form
-            setUrlInput('');
-            setUrlEventListName('');
-            // Refresh the list
-            await fetchEventLists();
-            break;
-          case 'error':
-            showAlert(event.error || 'Failed to load Event List from URL', 'error', 'URL Load Failed');
-            break;
-        }
+      });
+
+      if (response.success && response.data) {
+        showAlert(
+          `URL download job submitted: ${response.data.display_name}. Check sidebar for progress.`,
+          'info',
+          'Job Submitted'
+        );
+        // Reset form
+        setUrlInput('');
+        setUrlEventListName('');
+      } else {
+        showAlert(response.message || 'Failed to submit URL job', 'error', 'Job Submit Failed');
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-      showAlert(`Error: ${errorMessage}`, 'error', 'URL Load Error');
+      showAlert(`Error: ${errorMessage}`, 'error', 'URL Job Submit Error');
     } finally {
       setIsLoadingUrl(false);
-      setUrlDownloadProgress(null);
-      setProcessing(false);
     }
   };
 
@@ -2067,18 +1950,7 @@ const DataIngestionPage: React.FC = () => {
                     : 'Load Event List')}
               </Button>
 
-              {/* Batch loading progress with real-time updates */}
-              {batchProgress && (
-                <Box sx={{ mt: 2 }}>
-                  <LinearProgress
-                    variant="determinate"
-                    value={(batchProgress.completed / batchProgress.total) * 100}
-                  />
-                  <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
-                    Loaded {batchProgress.completed} of {batchProgress.total} files...
-                  </Typography>
-                </Box>
-              )}
+              {/* Note: Batch loading progress is now shown in the sidebar job queue */}
             </Box>
           )}
 
@@ -2136,17 +2008,7 @@ const DataIngestionPage: React.FC = () => {
                 </Select>
               </FormControl>
 
-              {/* Download Progress */}
-              {urlDownloadProgress !== null && (
-                <Box sx={{ mb: 2 }}>
-                  <LinearProgress variant="determinate" value={urlDownloadProgress} />
-                  <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
-                    {urlDownloadProgress < 100
-                      ? `Downloading... ${urlDownloadProgress.toFixed(0)}%`
-                      : 'Processing file...'}
-                  </Typography>
-                </Box>
-              )}
+              {/* Note: Download progress is now shown in the sidebar job queue */}
 
               {/* Load Button */}
               <Button
@@ -2156,11 +2018,7 @@ const DataIngestionPage: React.FC = () => {
                 fullWidth
                 startIcon={isLoadingUrl ? <CircularProgress size={20} /> : <CloudUploadIcon />}
               >
-                {isLoadingUrl
-                  ? (urlDownloadProgress !== null && urlDownloadProgress < 100
-                    ? `Downloading ${urlDownloadProgress.toFixed(0)}%...`
-                    : 'Processing...')
-                  : 'Fetch from URL'}
+                {isLoadingUrl ? 'Submitting...' : 'Fetch from URL'}
               </Button>
             </Box>
           )}

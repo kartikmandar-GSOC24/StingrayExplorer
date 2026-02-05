@@ -75,10 +75,13 @@ interface UIState {
   setSearchQuery: (query: string) => void;
 }
 
+/** Notification type for UI alerts */
+export type NotificationType = 'info' | 'success' | 'warning' | 'error';
+
 export interface Notification {
   id: string;
   timestamp: Date;
-  type: 'info' | 'success' | 'warning' | 'error';
+  type: NotificationType;
   title: string;
   message: string;
   read: boolean;

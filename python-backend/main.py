@@ -16,8 +16,10 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routes import data_routes, lightcurve_routes, spectrum_routes, timing_routes, export_routes, log_routes, archive_routes
+from routes import data_routes, lightcurve_routes, spectrum_routes, timing_routes, export_routes, log_routes, archive_routes, job_routes
 from services.state_manager import StateManager
+from services.data_service import DataService
+from services.job_manager import JobManager
 from utils.performance_monitor import PerformanceMonitor
 from utils.log_stream import log_stream_manager
 
@@ -32,6 +34,8 @@ class StatusEndpointFilter(logging.Filter):
 # Global instances
 state_manager: StateManager = None
 performance_monitor: PerformanceMonitor = None
+data_service: DataService = None
+job_manager: JobManager = None
 
 
 def find_free_port(start_port: int = 8765, max_attempts: int = 100) -> int:
@@ -49,16 +53,20 @@ def find_free_port(start_port: int = 8765, max_attempts: int = 100) -> int:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan handler for startup/shutdown events."""
-    global state_manager, performance_monitor
+    global state_manager, performance_monitor, data_service, job_manager
 
     # Startup
     print("Starting Stingray Explorer Backend...")
     state_manager = StateManager()
     performance_monitor = PerformanceMonitor()
+    data_service = DataService(state_manager, performance_monitor)
+    job_manager = JobManager(state_manager, data_service, max_workers=4)
 
     # Store in app state for access in routes
     app.state.state_manager = state_manager
     app.state.performance_monitor = performance_monitor
+    app.state.data_service = data_service
+    app.state.job_manager = job_manager
 
     # Install log streaming to capture Python logs and warnings
     log_stream_manager.install(log_level=logging.DEBUG)
@@ -68,6 +76,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Shutdown
     print("Shutting down Stingray Explorer Backend...")
+    # Shutdown job manager
+    if job_manager:
+        job_manager.shutdown()
     # Uninstall log streaming
     log_stream_manager.uninstall()
 
@@ -98,6 +109,7 @@ def create_app() -> FastAPI:
     app.include_router(export_routes.router, prefix="/api/export", tags=["Export"])
     app.include_router(log_routes.router, prefix="/api/logs", tags=["Logs"])
     app.include_router(archive_routes.router, prefix="/api/archive", tags=["Archive"])
+    app.include_router(job_routes.router, prefix="/api/jobs", tags=["Jobs"])
 
     @app.get("/")
     async def root():

@@ -52,6 +52,9 @@ import PhaseogramPage from '@/pages/Pulsar/Phaseogram';
 // Simulator Page
 import SimulatorPage from '@/pages/Simulator';
 
+// Hooks
+import { useJobStream } from '@/hooks/useJobStream';
+
 // Theme Context
 interface ThemeContextType {
   darkMode: boolean;
@@ -213,6 +216,15 @@ const router = createHashRouter([
   },
 ]);
 
+/**
+ * Component that initializes the job stream SSE connection.
+ * Must be inside BackendContext.Provider to access backend state.
+ */
+const JobStreamInitializer: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  useJobStream();
+  return <>{children}</>;
+};
+
 // Main App Component
 const App: React.FC = () => {
   const [darkMode, setDarkMode] = useState<boolean>(() => {
@@ -278,7 +290,9 @@ const App: React.FC = () => {
         <BackendContext.Provider value={backendState}>
           <MuiThemeProvider theme={theme}>
             <CssBaseline />
-            <RouterProvider router={router} />
+            <JobStreamInitializer>
+              <RouterProvider router={router} />
+            </JobStreamInitializer>
           </MuiThemeProvider>
         </BackendContext.Provider>
       </ThemeContext.Provider>

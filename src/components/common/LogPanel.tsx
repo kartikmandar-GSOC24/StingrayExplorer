@@ -30,6 +30,13 @@ import { useLogStore, selectFilteredLogs, LogEntry } from '@/store/logStore';
 import { useBackendContext } from '@/App';
 import { logStreamClient } from '@/api/logApi';
 
+interface LogPanelProps {
+  /** Left offset to avoid overlapping left sidebar */
+  leftOffset?: number;
+  /** Right offset to avoid overlapping right toolbar */
+  rightOffset?: number;
+}
+
 /**
  * Format timestamp for display
  */
@@ -203,7 +210,7 @@ const RawLogView: React.FC<{ logs: LogEntry[] }> = ({ logs }) => {
 /**
  * LogPanel component - displays logs in a collapsible panel
  */
-const LogPanel: React.FC = () => {
+const LogPanel: React.FC<LogPanelProps> = ({ leftOffset = 0, rightOffset = 0 }) => {
   const {
     isOpen,
     togglePanel,
@@ -238,13 +245,10 @@ const LogPanel: React.FC = () => {
   // Connect to Python backend log stream via SSE when backend is ready
   useEffect(() => {
     if (backendReady) {
-      // Small delay to ensure backend is fully initialized
-      const timer = setTimeout(() => {
-        logStreamClient.connect();
-      }, 1000);
+      // Connect immediately - history replay ensures we don't miss startup logs
+      logStreamClient.connect();
 
       return () => {
-        clearTimeout(timer);
         logStreamClient.disconnect();
       };
     }
@@ -281,13 +285,14 @@ const LogPanel: React.FC = () => {
       sx={{
         position: 'fixed',
         bottom: 0,
-        left: 0,
-        right: 0,
+        left: leftOffset,
+        right: rightOffset,
         zIndex: 1200,
         borderRadius: '12px 12px 0 0',
         overflow: 'hidden',
         borderTop: '1px solid',
         borderColor: 'divider',
+        transition: 'left 225ms ease-in-out, right 225ms ease-in-out',
       }}
     >
       {/* Header */}

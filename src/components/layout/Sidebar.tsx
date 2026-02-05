@@ -20,6 +20,7 @@ import ScienceIcon from '@mui/icons-material/Science';
 import ChevronRightIcon from '@mui/icons-material/ChevronRight';
 import CloseIcon from '@mui/icons-material/Close';
 import { ThemeContext } from '../../App';
+import JobStatusPanel from './JobStatusPanel';
 
 // Sidebar widths
 const MAIN_DRAWER_WIDTH = 240;
@@ -355,7 +356,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
           position: 'fixed',
           top: '64px',
           left: 0,
-          height: 'calc(100vh - 64px - 32px)',
+          height: 'calc(100vh - 64px)',
           overflow: 'hidden',
           transition: 'width 225ms cubic-bezier(0.4, 0, 0.6, 1)',
           display: 'flex',
@@ -367,9 +368,11 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
           zIndex: (theme) => theme.zIndex.drawer,
         }}
       >
+        {/* Menu items - scrollable */}
         <Box
           sx={{
             ...scrollbarStyles,
+            flex: 1,
             opacity: open ? 1 : 0,
             transition: 'opacity 150ms',
             minWidth: MAIN_DRAWER_WIDTH,
@@ -377,6 +380,9 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
         >
           {renderMainMenu()}
         </Box>
+
+        {/* Job Status Panel - fixed at bottom */}
+        <JobStatusPanel sidebarOpen={open} />
       </Box>
 
       {/* Submenu Sidebar */}
@@ -385,7 +391,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
           position: 'fixed',
           top: '64px',
           left: open ? MAIN_DRAWER_WIDTH : 0,
-          height: 'calc(100vh - 64px - 32px)',
+          height: 'calc(100vh - 64px)',
           overflow: 'hidden',
           transition: 'all 225ms cubic-bezier(0.4, 0, 0.6, 1)',
           display: 'flex',

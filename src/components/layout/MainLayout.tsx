@@ -103,8 +103,8 @@ const MainLayout: React.FC = () => {
         <RightToolbar visible={!rightToolbarCollapsed} />
       </Box>
 
-      {/* Log Panel - at bottom of screen */}
-      <LogPanel />
+      {/* Log Panel - at bottom of main content area (avoids sidebars) */}
+      <LogPanel leftOffset={leftOffset} rightOffset={rightOffset} />
 
       {/* Toast notifications - auto-popup for new notifications */}
       <NotificationToast />

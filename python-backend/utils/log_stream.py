@@ -9,6 +9,7 @@ import asyncio
 import logging
 import queue
 import warnings
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Callable, Optional
 
@@ -38,19 +39,25 @@ class StreamingLogHandler(logging.Handler):
         logging.CRITICAL: "error",
     }
 
-    def __init__(self, log_queue: "queue.Queue[dict[str, Any]]") -> None:
+    def __init__(
+        self,
+        log_queue: "queue.Queue[dict[str, Any]]",
+        manager: "LogStreamManager",
+    ) -> None:
         """
         Initialize the handler with a queue for log entries.
 
         Args:
             log_queue: Thread-safe queue to push log entries to
+            manager: The LogStreamManager instance for history storage
         """
         super().__init__()
         self._queue = log_queue
+        self._manager = manager
 
     def emit(self, record: logging.LogRecord) -> None:
         """
-        Emit a log record by pushing it to the queue.
+        Emit a log record by pushing it to the queue and storing in history.
 
         Args:
             record: The log record to emit
@@ -75,6 +82,9 @@ class StreamingLogHandler(logging.Handler):
                 "logger": record.name,
                 "message": message,
             }
+
+            # Store in history for replay to new SSE clients
+            self._manager._add_to_history(log_entry)
 
             # Non-blocking put (drop if queue is full)
             try:
@@ -101,14 +111,16 @@ class LogStreamManager:
     connections and handles cleanup on shutdown.
     """
 
-    def __init__(self, max_queue_size: int = 1000) -> None:
+    def __init__(self, max_queue_size: int = 1000, max_history: int = 100) -> None:
         """
         Initialize the log stream manager.
 
         Args:
             max_queue_size: Maximum number of log entries to buffer
+            max_history: Maximum number of log entries to keep in history for replay
         """
         self._queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=max_queue_size)
+        self._history: deque[dict[str, Any]] = deque(maxlen=max_history)
         self._handler: Optional[StreamingLogHandler] = None
         self._original_showwarning: Optional[Callable[..., None]] = None
         self._installed = False
@@ -125,7 +137,7 @@ class LogStreamManager:
             return
 
         # Create and configure handler
-        self._handler = StreamingLogHandler(self._queue)
+        self._handler = StreamingLogHandler(self._queue, self)
         self._handler.setLevel(log_level)
 
         # Set formatter
@@ -169,6 +181,15 @@ class LogStreamManager:
         self._installed = False
         logging.getLogger(__name__).info("Log streaming uninstalled")
 
+    def _add_to_history(self, log_entry: dict[str, Any]) -> None:
+        """
+        Add a log entry to the history buffer for replay to new SSE clients.
+
+        Args:
+            log_entry: The log entry to store
+        """
+        self._history.append(log_entry)
+
     def _capture_warning(
         self,
         message: Warning | str,
@@ -204,6 +225,9 @@ class LogStreamManager:
             "message": warning_msg,
         }
 
+        # Store in history for replay to new SSE clients
+        self._add_to_history(log_entry)
+
         # Push to queue
         try:
             self._queue.put_nowait(log_entry)
@@ -225,6 +249,7 @@ class LogStreamManager:
         """
         Async generator that yields log entries for SSE streaming.
 
+        Replays history to new connections, then continues with live stream.
         Includes periodic heartbeat events to keep the connection alive.
 
         Args:
@@ -233,10 +258,19 @@ class LogStreamManager:
         Yields:
             Log entry dictionaries ready for JSON serialization
         """
+        # Clear history if this is a new session (no active connections)
+        # This prevents stale logs from previous Electron sessions being replayed
+        if self._active_connections == 0:
+            self._history.clear()
+
         self._active_connections += 1
         last_heartbeat = asyncio.get_event_loop().time()
 
         try:
+            # Replay history for new connections
+            for log_entry in list(self._history):
+                yield log_entry
+
             while True:
                 # Check for log entries in the queue
                 try:

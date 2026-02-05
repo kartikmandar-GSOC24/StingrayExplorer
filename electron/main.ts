@@ -7,35 +7,28 @@ import { createAppMenu } from './menu';
 let mainWindow: BrowserWindow | null = null;
 let pythonManager: PythonManager | null = null;
 let rendererReady = false;
-const logBuffer: LogMessage[] = [];
+const logHistory: LogMessage[] = [];  // Persistent history for replay
+const MAX_LOG_HISTORY = 100;
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 
 /**
  * Send a log message to the renderer process
- * Buffers logs until renderer signals it's ready
+ * Always stores in history for replay on new connections
  */
 function sendLog(level: LogLevel, message: string, source: LogSource = 'electron'): void {
   console.log(`[${source}] ${message}`);
   const logMessage: LogMessage = { level, source, message };
 
+  // Always store in history for replay
+  logHistory.push(logMessage);
+  if (logHistory.length > MAX_LOG_HISTORY) {
+    logHistory.shift();
+  }
+
+  // Send immediately if renderer ready
   if (rendererReady && mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('log:message', logMessage);
-  } else {
-    // Buffer logs until renderer is ready
-    logBuffer.push(logMessage);
-  }
-}
-
-/**
- * Flush buffered logs to the renderer
- */
-function flushLogBuffer(): void {
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    for (const log of logBuffer) {
-      mainWindow.webContents.send('log:message', log);
-    }
-    logBuffer.length = 0;
   }
 }
 
@@ -164,7 +157,9 @@ async function initializeApp(): Promise<void> {
 // Handle renderer ready signal
 ipcMain.on('log:rendererReady', () => {
   rendererReady = true;
-  flushLogBuffer();
+  // Note: We no longer replay log history here to avoid duplicate logs.
+  // Early startup logs are visible in the terminal.
+  // Real-time logs come through the Python SSE stream once the backend is ready.
 });
 
 // App lifecycle
