@@ -14,7 +14,7 @@ cleanup() {
     echo ""
     echo "Cleaning up..."
     # Kill any orphaned python backend processes (safety measure)
-    pkill -9 -f "python main.py" 2>/dev/null || true
+    pkill -9 -f "${PROJECT_ROOT}/python-backend/main.py" 2>/dev/null || true
     echo "Cleanup complete."
     exit 0
 }

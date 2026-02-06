@@ -21,7 +21,7 @@
     "package:linux": "npm run build && electron-builder --linux",
     "package:all": "npm run build && electron-builder -mwl",
     "python:install": "cd python-backend && pip install -r requirements.txt",
-    "python:dev": "cd python-backend && python main.py --port 8765",
+    "python:dev": "cd python-backend && python main.py 8765",
     "python:build": "cd python-backend && pyinstaller --onefile --name stingray-backend main.py",
     "lint": "eslint src --ext .ts,.tsx",
     "lint:fix": "eslint src --ext .ts,.tsx --fix",
