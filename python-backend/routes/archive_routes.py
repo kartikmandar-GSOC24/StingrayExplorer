@@ -6,7 +6,7 @@ X-ray observation data with progress tracking.
 """
 
 import json
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
@@ -48,6 +48,7 @@ class ListFilesRequest(BaseModel):
     mission: str
     obsid: str
     obs_time: Optional[str] = None  # Observation time (MJD or ISO string) for directory lookup
+    obs_data: Optional[Dict[str, Any]] = None  # Additional observation data (e.g., prnb for RXTE, ra/dec for locate_data)
     recursive: bool = True
     max_depth: int = 3
 
@@ -164,6 +165,7 @@ async def list_observation_files(
         mission=request.mission,
         obsid=request.obsid,
         obs_time=request.obs_time,
+        obs_data=request.obs_data,
         recursive=request.recursive,
         max_depth=request.max_depth,
     )

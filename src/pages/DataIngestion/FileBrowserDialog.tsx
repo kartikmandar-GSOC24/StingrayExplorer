@@ -40,6 +40,12 @@ import {
 } from '@/api/archiveApi';
 import { useUIStore } from '@/store/uiStore';
 
+interface ObsData {
+  ra?: number | null;
+  dec?: number | null;
+  prnb?: string;
+}
+
 interface FileBrowserDialogProps {
   open: boolean;
   onClose: () => void;
@@ -47,6 +53,7 @@ interface FileBrowserDialogProps {
   obsid: string;
   obsTime: string;
   targetName: string;
+  obsData?: ObsData;
   onDownloadComplete?: (filePath: string) => void;
 }
 
@@ -202,6 +209,7 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
   obsid,
   obsTime,
   targetName,
+  obsData,
   onDownloadComplete,
 }) => {
   const { addNotification } = useUIStore();
@@ -228,7 +236,7 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
     if (open) {
       loadFiles();
     }
-  }, [open, mission, obsid, obsTime]);
+  }, [open, mission, obsid, obsTime, obsData]);
 
   const loadFiles = async (): Promise<void> => {
     setLoading(true);
@@ -242,6 +250,7 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
         mission,
         obsid,
         obs_time: obsTime,
+        obs_data: obsData,
         recursive: true,
         max_depth: 3,
       });

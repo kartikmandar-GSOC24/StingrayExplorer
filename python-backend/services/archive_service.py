@@ -144,7 +144,17 @@ class ArchiveService(BaseService):
         name_cols = ["name", "target_name", "object", "src_name", "NAME", "TARGET_NAME", "OBJECT", "SRC_NAME"]
         ra_cols = ["ra", "ra_obj", "ra_pnt", "RA", "RA_OBJ", "RA_PNT"]
         dec_cols = ["dec", "dec_obj", "dec_pnt", "DEC", "DEC_OBJ", "DEC_PNT"]
-        exposure_cols = ["exposure", "ontime", "livetime", "good_time", "xrt_exposure", "EXPOSURE", "ONTIME", "LIVETIME", "GOOD_TIME", "XRT_EXPOSURE"]
+        # Mission-specific exposure columns:
+        # - NICER, Chandra, RXTE: "exposure"
+        # - NuSTAR: "exposure_a" (FPMA), also has exposure_b (FPMB)
+        # - XMM-Newton: "duration"
+        # - Swift: "xrt_exposure", "uvot_exposure", "bat_exposure"
+        exposure_cols = [
+            "exposure", "exposure_a", "duration",  # Primary columns for different missions
+            "ontime", "livetime", "good_time", "xrt_exposure",
+            "EXPOSURE", "EXPOSURE_A", "DURATION",  # Uppercase variants
+            "ONTIME", "LIVETIME", "GOOD_TIME", "XRT_EXPOSURE"
+        ]
         time_cols = ["time", "start_time", "date_obs", "tstart", "TIME", "START_TIME", "DATE_OBS", "TSTART"]
 
         # Get table column names once
@@ -161,6 +171,9 @@ class ArchiveService(BaseService):
                     return val
             return default
 
+        # RXTE-specific columns
+        prnb_cols = ["prnb", "PRNB"]
+
         for row in table:
             try:
                 obs = {
@@ -172,6 +185,13 @@ class ArchiveService(BaseService):
                     "time": str(get_column_value(row, time_cols, "")),
                     "catalog": catalog_name,
                 }
+
+                # Add mission-specific fields
+                # RXTE: Include proposal number for directory lookup
+                prnb = get_column_value(row, prnb_cols)
+                if prnb is not None:
+                    obs["prnb"] = str(prnb)
+
                 # Only include observations with valid obsid
                 if obs["obsid"]:
                     observations.append(obs)
@@ -702,6 +722,7 @@ class ArchiveService(BaseService):
         mission: str,
         obsid: str,
         obs_time: Optional[str] = None,
+        obs_data: Optional[Dict[str, Any]] = None,
         recursive: bool = True,
         max_depth: int = 3,
     ) -> Dict[str, Any]:
@@ -715,6 +736,7 @@ class ArchiveService(BaseService):
             mission: Mission key (e.g., "NICER", "NuSTAR")
             obsid: Observation ID
             obs_time: Observation time (MJD or ISO string) for directory lookup
+            obs_data: Additional observation data (e.g., prnb for RXTE, ra/dec for coordinate queries)
             recursive: Whether to recursively list subdirectories
             max_depth: Maximum recursion depth
 
@@ -732,11 +754,11 @@ class ArchiveService(BaseService):
                 )
 
             # Get base directory URL
-            base_url = self._get_observation_directory_url(mission, obsid, obs_time)
+            base_url = self._get_observation_directory_url(mission, obsid, obs_time, obs_data)
 
             if not base_url:
                 # Try locate_data as fallback
-                base_url = await self._locate_observation_directory(mission, obsid)
+                base_url = await self._locate_observation_directory(mission, obsid, obs_data)
 
             if not base_url:
                 return self.create_result(
@@ -868,7 +890,11 @@ class ArchiveService(BaseService):
         return count
 
     def _get_observation_directory_url(
-        self, mission: str, obsid: str, obs_time: Optional[str] = None
+        self,
+        mission: str,
+        obsid: str,
+        obs_time: Optional[str] = None,
+        obs_data: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """
         Construct the likely directory URL for an observation.
@@ -882,6 +908,7 @@ class ArchiveService(BaseService):
             obsid: Observation ID
             obs_time: Observation time (MJD float as string, or ISO date string)
                      Required for NICER and Swift to determine the date-based subdirectory
+            obs_data: Additional observation data (e.g., prnb for RXTE)
 
         Returns:
             Directory URL or None if pattern unknown
@@ -889,6 +916,7 @@ class ArchiveService(BaseService):
         from astropy.time import Time
 
         base_url = "https://heasarc.gsfc.nasa.gov/FTP"
+        obs_data = obs_data or {}
 
         # Helper to parse obs_time to YYYY_MM format
         def get_year_month(time_str: Optional[str]) -> Optional[str]:
@@ -941,7 +969,55 @@ class ArchiveService(BaseService):
             return f"{base_url}/xmm/data/rev0/{obsid}/"
 
         elif mission == "RXTE":
-            # RXTE: Complex structure, return None
+            # RXTE: /xte/data/archive/AO{cycle}/P{prnb}/{obsid}/
+            # prnb is the proposal number from the observation data
+            # The AO cycle can be estimated from the observation date or prnb
+            prnb = obs_data.get("prnb")
+            if prnb:
+                # Estimate AO cycle from prnb
+                # RXTE had AO cycles 1-16 (1996-2012)
+                # prnb format is typically 5 digits, early proposals are lower numbers
+                try:
+                    prnb_num = int(prnb)
+                    # Rough mapping based on proposal number ranges
+                    # This is an approximation - locate_data is more reliable
+                    if prnb_num < 10000:
+                        ao_cycle = "AO1"
+                    elif prnb_num < 20000:
+                        ao_cycle = "AO2"
+                    elif prnb_num < 30000:
+                        ao_cycle = "AO3"
+                    elif prnb_num < 40000:
+                        ao_cycle = "AO4"
+                    elif prnb_num < 50000:
+                        ao_cycle = "AO5"
+                    elif prnb_num < 60000:
+                        ao_cycle = "AO6"
+                    elif prnb_num < 70000:
+                        ao_cycle = "AO7"
+                    elif prnb_num < 80000:
+                        ao_cycle = "AO8"
+                    elif prnb_num < 90000:
+                        ao_cycle = "AO9"
+                    elif prnb_num < 93000:
+                        ao_cycle = "AO10"
+                    elif prnb_num < 94000:
+                        ao_cycle = "AO11"
+                    elif prnb_num < 95000:
+                        ao_cycle = "AO12"
+                    elif prnb_num < 96000:
+                        ao_cycle = "AO13"
+                    elif prnb_num < 97000:
+                        ao_cycle = "AO14"
+                    elif prnb_num < 98000:
+                        ao_cycle = "AO15"
+                    else:
+                        ao_cycle = "AO16"
+                    # Note: RXTE archive uses /xte/ not /rxte/ in the path
+                    return f"{base_url}/xte/data/archive/{ao_cycle}/P{prnb}/{obsid}/"
+                except (ValueError, TypeError):
+                    pass
+            # Cannot construct URL without prnb - fallback to locate_data
             return None
 
         return None
@@ -1034,7 +1110,10 @@ class ArchiveService(BaseService):
             }
 
     async def _locate_observation_directory(
-        self, mission: str, obsid: str
+        self,
+        mission: str,
+        obsid: str,
+        obs_data: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """
         Locate the observation directory URL using Heasarc.locate_data().
@@ -1042,9 +1121,14 @@ class ArchiveService(BaseService):
         This uses astroquery's Heasarc class to find the actual data location,
         which handles the complex directory structures of different missions.
 
+        The correct API usage is:
+        1. Query to get observation row(s) from the catalog
+        2. Call locate_data(table) with the query result table
+
         Args:
             mission: Mission key
             obsid: Observation ID
+            obs_data: Additional observation data (e.g., ra/dec for coordinate queries)
 
         Returns:
             Directory URL or None if not found
@@ -1053,27 +1137,94 @@ class ArchiveService(BaseService):
             from astroquery.heasarc import Heasarc
 
             catalog_name = SUPPORTED_CATALOGS[mission]["catalog"]
+            obs_data = obs_data or {}
 
-            # Use locate_data to find the observation
-            # This returns a Table with URLs
-            result = Heasarc.locate_data(
-                table=catalog_name,
-                obsid=obsid,
-            )
+            # Step 1: Query to get observation row
+            # We need the actual table row for locate_data
+            # Best approach: query by coordinates if available, then filter by obsid
+            table = None
+
+            # Try coordinate-based query if we have ra/dec
+            ra = obs_data.get("ra")
+            dec = obs_data.get("dec")
+            if ra is not None and dec is not None:
+                try:
+                    coords = SkyCoord(ra=float(ra) * u.deg, dec=float(dec) * u.deg)
+                    table = Heasarc.query_region(
+                        coords,
+                        catalog=catalog_name,
+                        radius=0.5 * u.deg,
+                    )
+                    print(f"Coordinate query for {mission} returned {len(table) if table else 0} results")
+                except Exception as coord_err:
+                    print(f"Coordinate query failed: {coord_err}")
+
+            # Fallback: try query_mission_list
+            if table is None or len(table) == 0:
+                try:
+                    table = Heasarc.query_mission_list(
+                        mission=catalog_name,
+                        fields="*",
+                        resultmax=100,  # Get more results to find our obsid
+                        cache=False,
+                    )
+                except Exception as list_err:
+                    print(f"query_mission_list failed: {list_err}")
+                    return None
+
+            if table is None or len(table) == 0:
+                print(f"No observations found in {catalog_name}")
+                return None
+
+            # Step 2: Filter to the specific obsid
+            obsid_cols = ["obsid", "obs_id", "observation_id", "OBSID", "OBS_ID"]
+            obsid_column = None
+            for col in obsid_cols:
+                if col in table.colnames:
+                    obsid_column = col
+                    break
+
+            if obsid_column is None:
+                print(f"Could not find obsid column in {catalog_name}")
+                return None
+
+            # Filter to the specific obsid
+            mask = [str(row[obsid_column]).strip() == str(obsid).strip() for row in table]
+            if not any(mask):
+                print(f"Obsid {obsid} not found in query results")
+                return None
+
+            filtered_table = table[mask][:1]
+
+            # Step 3: Call locate_data with the filtered table row
+            try:
+                result = Heasarc.locate_data(filtered_table)
+            except Exception as locate_err:
+                print(f"locate_data API call failed: {locate_err}")
+                return None
 
             if result is None or len(result) == 0:
                 return None
 
-            # Look for HEASARC HTTP URL
+            # Step 4: Extract the access_url from the result
+            # locate_data returns a table with columns: ID, access_url, sciserver, aws, etc.
+            if "access_url" in result.colnames:
+                for row in result:
+                    url = str(row["access_url"]).strip()
+                    if url and "heasarc.gsfc.nasa.gov" in url:
+                        # Clean up double slashes in path (common in HEASARC URLs)
+                        url = re.sub(r"([^:])//+", r"\1/", url)
+                        if not url.endswith("/"):
+                            url += "/"
+                        return url
+
+            # Fallback: look in any column for HEASARC URLs
             for row in result:
                 for col in result.colnames:
                     val = str(row[col])
-                    if "heasarc.gsfc.nasa.gov" in val and (
-                        "/FTP/" in val or "https://" in val
-                    ):
-                        # Clean up the URL
+                    if "heasarc.gsfc.nasa.gov" in val and "/FTP/" in val:
                         url = val.strip()
-                        # Ensure it ends with /
+                        url = re.sub(r"([^:])//+", r"\1/", url)
                         if not url.endswith("/"):
                             url += "/"
                         return url

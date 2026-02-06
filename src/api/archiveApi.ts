@@ -23,6 +23,8 @@ export interface HeasarcObservation {
   exposure: number | null;
   time: string;
   catalog: string;
+  // Mission-specific fields
+  prnb?: string;  // RXTE proposal number
 }
 
 /** Search result from HEASARC */
@@ -153,11 +155,20 @@ export const archiveApi = {
    *
    * Returns a tree structure of files with metadata including sizes,
    * file type classification, and download URLs.
+   *
+   * @param params.obs_data - Additional observation data for directory lookup:
+   *   - ra/dec: Coordinates for locate_data query (helps find directory)
+   *   - prnb: RXTE proposal number (required for RXTE)
    */
   async listObservationFiles(params: {
     mission: string;
     obsid: string;
     obs_time?: string;
+    obs_data?: {
+      ra?: number | null;
+      dec?: number | null;
+      prnb?: string;
+    };
     recursive?: boolean;
     max_depth?: number;
   }): Promise<ApiResponse<ListFilesResponse>> {
@@ -165,6 +176,7 @@ export const archiveApi = {
       mission: params.mission,
       obsid: params.obsid,
       obs_time: params.obs_time,
+      obs_data: params.obs_data,
       recursive: params.recursive ?? true,
       max_depth: params.max_depth ?? 3,
     });

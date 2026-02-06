@@ -36,6 +36,8 @@ import MyLocationIcon from '@mui/icons-material/MyLocation';
 import TextFieldsIcon from '@mui/icons-material/TextFields';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import FolderOpenIcon from '@mui/icons-material/FolderOpen';
+import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
+import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import {
   archiveApi,
   HeasarcCatalog,
@@ -49,6 +51,13 @@ interface HeasarcBrowserPanelProps {
 }
 
 type SearchMode = 'name' | 'coordinates';
+type SortOrder = 'none' | 'asc' | 'desc';
+
+interface ObsData {
+  ra?: number | null;
+  dec?: number | null;
+  prnb?: string;
+}
 
 interface FileBrowserState {
   open: boolean;
@@ -56,6 +65,7 @@ interface FileBrowserState {
   obsid: string;
   obsTime: string;
   targetName: string;
+  obsData?: ObsData;
 }
 
 const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded }) => {
@@ -88,6 +98,9 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
     targetName: '',
   });
 
+  // Sort state for Date/Time column
+  const [dateSortOrder, setDateSortOrder] = useState<SortOrder>('none');
+
   // Fetch supported catalogs on mount
   useEffect(() => {
     const fetchCatalogs = async (): Promise<void> => {
@@ -116,6 +129,7 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
     setSearchResults([]);
     setSearchMessage('');
     setResolvedCoords(null);
+    setDateSortOrder('none'); // Reset sort order on new search
 
     try {
       if (searchMode === 'name') {
@@ -204,6 +218,11 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
       obsid: obs.obsid,
       obsTime: obs.time,
       targetName: obs.name,
+      obsData: {
+        ra: obs.ra,
+        dec: obs.dec,
+        prnb: obs.prnb,
+      },
     });
   };
 
@@ -244,6 +263,68 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
   const formatCoord = (value: number | null, decimals: number = 4): string => {
     if (value === null || value === undefined) return 'N/A';
     return value.toFixed(decimals);
+  };
+
+  /**
+   * Convert Modified Julian Date (MJD) to human-readable date+time string.
+   * MJD is days since midnight on November 17, 1858.
+   * The fractional part represents the time of day.
+   */
+  const formatMjdToDateTime = (mjdString: string): string => {
+    if (!mjdString || mjdString === 'N/A') return 'N/A';
+
+    try {
+      const mjd = parseFloat(mjdString);
+      if (isNaN(mjd)) return 'N/A';
+
+      // MJD epoch: November 17, 1858 00:00:00 UTC
+      // Convert MJD to JavaScript Date
+      // JD = MJD + 2400000.5
+      // Unix epoch (Jan 1, 1970) = JD 2440587.5
+      // So: Unix days = MJD - 40587
+      const unixDays = mjd - 40587;
+      const unixMs = unixDays * 24 * 60 * 60 * 1000;
+      const date = new Date(unixMs);
+
+      // Format as DD-MM-YYYY HH:MM:SS
+      const day = date.getUTCDate().toString().padStart(2, '0');
+      const month = (date.getUTCMonth() + 1).toString().padStart(2, '0');
+      const year = date.getUTCFullYear();
+      const hours = date.getUTCHours().toString().padStart(2, '0');
+      const minutes = date.getUTCMinutes().toString().padStart(2, '0');
+      const seconds = date.getUTCSeconds().toString().padStart(2, '0');
+
+      return `${day}-${month}-${year} ${hours}:${minutes}:${seconds}`;
+    } catch {
+      return 'N/A';
+    }
+  };
+
+  // Handle Date/Time column header click for sorting
+  const handleDateSortClick = (): void => {
+    setDateSortOrder((prev) => {
+      if (prev === 'none') return 'asc';
+      if (prev === 'asc') return 'desc';
+      return 'none';
+    });
+  };
+
+  // Get sorted results based on current sort order
+  const getSortedResults = (): HeasarcObservation[] => {
+    if (dateSortOrder === 'none') {
+      return searchResults; // Original order from API
+    }
+
+    return [...searchResults].sort((a, b) => {
+      const mjdA = parseFloat(a.time) || 0;
+      const mjdB = parseFloat(b.time) || 0;
+
+      if (dateSortOrder === 'asc') {
+        return mjdA - mjdB; // Oldest first
+      } else {
+        return mjdB - mjdA; // Newest first
+      }
+    });
   };
 
   if (loadingCatalogs) {
@@ -392,12 +473,22 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                 <TableCell align="right">RA</TableCell>
                 <TableCell align="right">Dec</TableCell>
                 <TableCell align="right">Exposure</TableCell>
-                <TableCell>Date</TableCell>
+                <TableCell
+                  onClick={handleDateSortClick}
+                  sx={{ cursor: 'pointer', userSelect: 'none' }}
+                >
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                    Date/Time (UTC)
+                    {dateSortOrder === 'asc' && <ArrowUpwardIcon fontSize="small" />}
+                    {dateSortOrder === 'desc' && <ArrowDownwardIcon fontSize="small" />}
+                  </Box>
+                </TableCell>
+                <TableCell>MJD</TableCell>
                 <TableCell align="center">Action</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
-              {searchResults.map((obs) => (
+              {getSortedResults().map((obs) => (
                 <TableRow key={obs.obsid} hover>
                   <TableCell>
                     <Typography variant="body2" fontFamily="monospace">
@@ -434,6 +525,11 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                           : 'default'
                       }
                     />
+                  </TableCell>
+                  <TableCell>
+                    <Typography variant="body2">
+                      {formatMjdToDateTime(obs.time)}
+                    </Typography>
                   </TableCell>
                   <TableCell>
                     <Typography variant="body2" color="text.secondary">
@@ -477,6 +573,7 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
         obsid={fileBrowser.obsid}
         obsTime={fileBrowser.obsTime}
         targetName={fileBrowser.targetName}
+        obsData={fileBrowser.obsData}
         onDownloadComplete={handleDownloadComplete}
       />
 
