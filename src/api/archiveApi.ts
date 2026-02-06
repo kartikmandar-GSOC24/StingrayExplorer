@@ -25,6 +25,14 @@ export interface HeasarcObservation {
   catalog: string;
   // Mission-specific fields
   prnb?: string;  // RXTE proposal number
+  // Swift instrument-specific exposures
+  xrt_exposure?: number | null;
+  bat_exposure?: number | null;
+  uvot_exposure?: number | null;
+  // IXPE per-detector-unit exposures
+  exposure_du1?: number | null;
+  exposure_du2?: number | null;
+  exposure_du3?: number | null;
 }
 
 /** Search result from HEASARC */

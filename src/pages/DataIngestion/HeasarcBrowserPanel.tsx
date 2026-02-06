@@ -259,6 +259,38 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
     return `${(seconds / 3600).toFixed(2)} hr`;
   };
 
+  /**
+   * Format exposure for display, with Swift instrument awareness.
+   * For Swift observations where XRT exposure is 0 but BAT has data,
+   * shows BAT exposure with an instrument label.
+   */
+  const formatObservationExposure = (obs: HeasarcObservation): { label: string; instrument: string | null } => {
+    // For Swift, check instrument-specific exposures
+    if (selectedMission === 'Swift' && obs.xrt_exposure !== undefined) {
+      const xrt = obs.xrt_exposure ?? 0;
+      const bat = obs.bat_exposure ?? 0;
+      const uvot = obs.uvot_exposure ?? 0;
+
+      if (xrt > 0) {
+        return { label: formatExposure(xrt), instrument: 'XRT' };
+      }
+      if (bat > 0) {
+        return { label: formatExposure(bat), instrument: 'BAT' };
+      }
+      if (uvot > 0) {
+        return { label: formatExposure(uvot), instrument: 'UVOT' };
+      }
+      return { label: '0s', instrument: null };
+    }
+
+    // For IXPE, show main exposure (per-DU breakdown available in tooltip)
+    if (selectedMission === 'IXPE' && obs.exposure_du1 !== undefined) {
+      return { label: formatExposure(obs.exposure), instrument: null };
+    }
+
+    return { label: formatExposure(obs.exposure), instrument: null };
+  };
+
   // Format coordinates
   const formatCoord = (value: number | null, decimals: number = 4): string => {
     if (value === null || value === undefined) return 'N/A';
@@ -513,18 +545,38 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                     </Typography>
                   </TableCell>
                   <TableCell align="right">
-                    <Chip
-                      label={formatExposure(obs.exposure)}
-                      size="small"
-                      variant="outlined"
-                      color={
-                        obs.exposure && obs.exposure > 10000
-                          ? 'success'
-                          : obs.exposure && obs.exposure > 1000
-                          ? 'primary'
-                          : 'default'
-                      }
-                    />
+                    {(() => {
+                      const { label, instrument } = formatObservationExposure(obs);
+                      const effectiveExposure = instrument === 'BAT'
+                        ? obs.bat_exposure ?? 0
+                        : instrument === 'UVOT'
+                        ? obs.uvot_exposure ?? 0
+                        : obs.exposure ?? 0;
+                      return (
+                        <Tooltip
+                          title={
+                            selectedMission === 'Swift' && obs.xrt_exposure !== undefined
+                              ? `XRT: ${formatExposure(obs.xrt_exposure ?? 0)} | BAT: ${formatExposure(obs.bat_exposure ?? 0)} | UVOT: ${formatExposure(obs.uvot_exposure ?? 0)}`
+                              : selectedMission === 'IXPE' && obs.exposure_du1 !== undefined
+                              ? `DU1: ${formatExposure(obs.exposure_du1 ?? 0)} | DU2: ${formatExposure(obs.exposure_du2 ?? 0)} | DU3: ${formatExposure(obs.exposure_du3 ?? 0)}`
+                              : ''
+                          }
+                        >
+                          <Chip
+                            label={instrument ? `${label} (${instrument})` : label}
+                            size="small"
+                            variant="outlined"
+                            color={
+                              effectiveExposure > 10000
+                                ? 'success'
+                                : effectiveExposure > 1000
+                                ? 'primary'
+                                : 'default'
+                            }
+                          />
+                        </Tooltip>
+                      );
+                    })()}
                   </TableCell>
                   <TableCell>
                     <Typography variant="body2">

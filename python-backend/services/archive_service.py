@@ -52,6 +52,31 @@ SUPPORTED_CATALOGS = {
         "display_name": "RXTE",
         "description": "Rossi X-ray Timing Explorer",
     },
+    "IXPE": {
+        "catalog": "ixmaster",
+        "display_name": "IXPE",
+        "description": "Imaging X-ray Polarimetry Explorer",
+    },
+    "Suzaku": {
+        "catalog": "suzamaster",
+        "display_name": "Suzaku",
+        "description": "Suzaku X-ray Satellite",
+    },
+    "ASCA": {
+        "catalog": "ascamaster",
+        "display_name": "ASCA",
+        "description": "Advanced Satellite for Cosmology and Astrophysics",
+    },
+    "XRISM": {
+        "catalog": "xrismmastr",
+        "display_name": "XRISM",
+        "description": "X-Ray Imaging and Spectroscopy Mission",
+    },
+    "Hitomi": {
+        "catalog": "hitomaster",
+        "display_name": "Hitomi",
+        "description": "Hitomi (ASTRO-H) X-ray Satellite",
+    },
 }
 
 
@@ -140,7 +165,8 @@ class ArchiveService(BaseService):
 
         # Column mapping varies by catalog - try common column names
         # HEASARC returns lowercase column names from astroquery
-        obsid_cols = ["obsid", "obs_id", "observation_id", "seq_num", "OBSID", "OBS_ID", "OBSERVATION_ID", "SEQ_NUM"]
+        obsid_cols = ["obsid", "obs_id", "observation_id", "seq_num", "sequence_number",
+                      "OBSID", "OBS_ID", "OBSERVATION_ID", "SEQ_NUM", "SEQUENCE_NUMBER"]
         name_cols = ["name", "target_name", "object", "src_name", "NAME", "TARGET_NAME", "OBJECT", "SRC_NAME"]
         ra_cols = ["ra", "ra_obj", "ra_pnt", "RA", "RA_OBJ", "RA_PNT"]
         dec_cols = ["dec", "dec_obj", "dec_pnt", "DEC", "DEC_OBJ", "DEC_PNT"]
@@ -149,12 +175,33 @@ class ArchiveService(BaseService):
         # - NuSTAR: "exposure_a" (FPMA), also has exposure_b (FPMB)
         # - XMM-Newton: "duration"
         # - Swift: "xrt_exposure", "uvot_exposure", "bat_exposure"
-        exposure_cols = [
-            "exposure", "exposure_a", "duration",  # Primary columns for different missions
-            "ontime", "livetime", "good_time", "xrt_exposure",
-            "EXPOSURE", "EXPOSURE_A", "DURATION",  # Uppercase variants
-            "ONTIME", "LIVETIME", "GOOD_TIME", "XRT_EXPOSURE"
-        ]
+        #   Swift catalog has NO generic "exposure" column, so we must
+        #   prioritize instrument-specific columns for Swift.
+        if catalog_name == "Swift":
+            # For Swift, prefer xrt_exposure first (X-ray timing), then
+            # fall back to bat_exposure (BAT-only triggers have 0 XRT exposure)
+            exposure_cols = [
+                "xrt_exposure", "XRT_EXPOSURE",
+                "bat_exposure", "BAT_EXPOSURE",
+                "uvot_exposure", "UVOT_EXPOSURE",
+                "exposure", "duration", "ontime", "livetime",
+                "EXPOSURE", "DURATION", "ONTIME", "LIVETIME",
+            ]
+        elif catalog_name == "IXPE":
+            # IXPE has per-detector-unit exposures: exposure_1, exposure_2, exposure_3
+            # The main "exposure" column also exists
+            exposure_cols = [
+                "exposure", "exposure_1", "exposure_2", "exposure_3",
+                "ontime_1", "ontime_2", "ontime_3",
+                "EXPOSURE", "EXPOSURE_1", "EXPOSURE_2", "EXPOSURE_3",
+            ]
+        else:
+            exposure_cols = [
+                "exposure", "exposure_a", "duration",
+                "ontime", "livetime", "good_time", "xrt_exposure",
+                "EXPOSURE", "EXPOSURE_A", "DURATION",
+                "ONTIME", "LIVETIME", "GOOD_TIME", "XRT_EXPOSURE",
+            ]
         time_cols = ["time", "start_time", "date_obs", "tstart", "TIME", "START_TIME", "DATE_OBS", "TSTART"]
 
         # Get table column names once
@@ -187,6 +234,35 @@ class ArchiveService(BaseService):
                 }
 
                 # Add mission-specific fields
+                # Swift: Include per-instrument exposures and pick the best
+                # non-zero exposure for the main "exposure" field
+                if catalog_name == "Swift":
+                    swift_xrt_cols = ["xrt_exposure", "XRT_EXPOSURE"]
+                    swift_bat_cols = ["bat_exposure", "BAT_EXPOSURE"]
+                    swift_uvot_cols = ["uvot_exposure", "UVOT_EXPOSURE"]
+                    xrt_exp = _to_python_float(get_column_value(row, swift_xrt_cols))
+                    bat_exp = _to_python_float(get_column_value(row, swift_bat_cols))
+                    uvot_exp = _to_python_float(get_column_value(row, swift_uvot_cols))
+                    obs["xrt_exposure"] = xrt_exp
+                    obs["bat_exposure"] = bat_exp
+                    obs["uvot_exposure"] = uvot_exp
+                    # Use the best non-zero instrument exposure as the main
+                    # exposure value (prefer XRT > BAT > UVOT)
+                    if not obs["exposure"] or obs["exposure"] == 0:
+                        for inst_exp in [xrt_exp, bat_exp, uvot_exp]:
+                            if inst_exp and inst_exp > 0:
+                                obs["exposure"] = inst_exp
+                                break
+
+                # IXPE: Include per-detector-unit exposures
+                if catalog_name == "IXPE":
+                    ixpe_du1_cols = ["exposure_1", "EXPOSURE_1"]
+                    ixpe_du2_cols = ["exposure_2", "EXPOSURE_2"]
+                    ixpe_du3_cols = ["exposure_3", "EXPOSURE_3"]
+                    obs["exposure_du1"] = _to_python_float(get_column_value(row, ixpe_du1_cols))
+                    obs["exposure_du2"] = _to_python_float(get_column_value(row, ixpe_du2_cols))
+                    obs["exposure_du3"] = _to_python_float(get_column_value(row, ixpe_du3_cols))
+
                 # RXTE: Include proposal number for directory lookup
                 prnb = get_column_value(row, prnb_cols)
                 if prnb is not None:
@@ -486,6 +562,21 @@ class ArchiveService(BaseService):
 
         elif mission == "RXTE":
             urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dxtemaster&obsid={obsid}"
+
+        elif mission == "IXPE":
+            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dixmaster&obsid={obsid}"
+
+        elif mission == "Suzaku":
+            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dsuzamaster&obsid={obsid}"
+
+        elif mission == "ASCA":
+            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dascamaster&obsid={obsid}"
+
+        elif mission == "XRISM":
+            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dxrismmastr&obsid={obsid}"
+
+        elif mission == "Hitomi":
+            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dhitomaster&obsid={obsid}"
 
         return urls
 
@@ -1018,6 +1109,39 @@ class ArchiveService(BaseService):
                 except (ValueError, TypeError):
                     pass
             # Cannot construct URL without prnb - fallback to locate_data
+            return None
+
+        elif mission == "IXPE":
+            # IXPE: /ixpe/data/obs/NN/OBSID/
+            # NN = first 2 digits of obsid (e.g., 02001099 -> /obs/02/02001099/)
+            if len(obsid) >= 2:
+                return f"{base_url}/ixpe/data/obs/{obsid[:2]}/{obsid}/"
+            return None
+
+        elif mission == "Suzaku":
+            # Suzaku: /suzaku/data/obs/N/OBSID/
+            # N = first digit of obsid
+            if obsid and obsid[0].isdigit():
+                return f"{base_url}/suzaku/data/obs/{obsid[0]}/{obsid}/"
+            return None
+
+        elif mission == "ASCA":
+            # ASCA: /asca/data/rev2/OBSID/
+            # Flat structure, direct obsid directory
+            return f"{base_url}/asca/data/rev2/{obsid}/"
+
+        elif mission == "XRISM":
+            # XRISM: /xrism/data/obs/N/OBSID/
+            # N = first digit of obsid
+            if obsid and obsid[0].isdigit():
+                return f"{base_url}/xrism/data/obs/{obsid[0]}/{obsid}/"
+            return None
+
+        elif mission == "Hitomi":
+            # Hitomi: /hitomi/data/obs/N/OBSID/
+            # N = first digit of obsid
+            if obsid and obsid[0].isdigit():
+                return f"{base_url}/hitomi/data/obs/{obsid[0]}/{obsid}/"
             return None
 
         return None
