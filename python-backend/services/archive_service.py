@@ -276,6 +276,15 @@ class ArchiveService(BaseService):
                         get_column_value(row, nicer_fpm_cols)
                     )
 
+                # NuSTAR: Include FPMB exposure, observation mode, issue flag
+                if catalog_name == "NuSTAR":
+                    exp_b_cols = ["exposure_b", "EXPOSURE_B"]
+                    obs_mode_cols = ["observation_mode", "OBSERVATION_MODE"]
+                    issue_cols = ["issue_flag", "ISSUE_FLAG"]
+                    obs["exposure_b"] = _to_python_float(get_column_value(row, exp_b_cols))
+                    obs["observation_mode"] = str(get_column_value(row, obs_mode_cols, ""))
+                    obs["issue_flag"] = _to_python_int(get_column_value(row, issue_cols))
+
                 # RXTE: Include proposal number for directory lookup
                 prnb = get_column_value(row, prnb_cols)
                 if prnb is not None:
@@ -1184,11 +1193,15 @@ class ArchiveService(BaseService):
             return None
 
         elif mission == "NuSTAR":
-            # NuSTAR: /nustar/data/obs/YY/Z/OBSID/
-            # YY = obsid[1:3], Z = obsid[3]
-            # Example: 10610025001 -> /nustar/data/obs/06/1/10610025001/
+            # NuSTAR ObsID format: CPPttxxxvvv (11 digits)
+            #   C = source category (1 digit): 1=calibration, 3=ToO, 6=AGN, 8=galactic
+            #   PP = proposal/cycle (2 digits): 00=primary, 01+=extended missions
+            # HEASARC archive path: /nustar/data/obs/PP/C/OBSID/
+            #   PP = obsid[1:3] (proposal cycle)
+            #   C  = obsid[0]  (source category)
+            # Example: 60002023006 -> /nustar/data/obs/00/6/60002023006/
             if len(obsid) >= 4:
-                return f"{base_url}/nustar/data/obs/{obsid[1:3]}/{obsid[3]}/{obsid}/"
+                return f"{base_url}/nustar/data/obs/{obsid[1:3]}/{obsid[0]}/{obsid}/"
             return None
 
         elif mission == "Chandra":

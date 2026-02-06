@@ -40,6 +40,7 @@ import FolderOpenIcon from '@mui/icons-material/FolderOpen';
 import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
 import FilterListIcon from '@mui/icons-material/FilterList';
+import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import {
   archiveApi,
   HeasarcCatalog,
@@ -110,8 +111,9 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
   // Sort state for Date/Time column
   const [dateSortOrder, setDateSortOrder] = useState<SortOrder>('none');
 
-  // Whether NICER is the selected mission (for showing processing_status)
+  // Mission-specific display flags
   const isNicer = selectedMission === 'NICER';
+  const isNuSTAR = selectedMission === 'NuSTAR';
 
   // Fetch supported catalogs on mount
   useEffect(() => {
@@ -344,6 +346,13 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
         return { label: formatExposure(uvot), instrument: 'UVOT' };
       }
       return { label: '0s', instrument: null };
+    }
+
+    // For NuSTAR: only show FPMA label when FPMB data is also available (ADQL/ObsID search)
+    // query_region() doesn't return exposure_b, so don't mislead with "FPMA" label
+    if (selectedMission === 'NuSTAR') {
+      const instrument = obs.exposure_b != null ? 'FPMA' : null;
+      return { label: formatExposure(obs.exposure), instrument };
     }
 
     // For IXPE, show main exposure (per-DU breakdown available in tooltip)
@@ -689,16 +698,32 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                 </TableCell>
                 <TableCell>MJD</TableCell>
                 {isNicer && <TableCell>Status</TableCell>}
+                {isNuSTAR && <TableCell>Mode</TableCell>}
                 <TableCell align="center">Action</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
               {getSortedResults().map((obs) => (
-                <TableRow key={obs.obsid} hover>
+                <TableRow
+                  key={obs.obsid}
+                  hover
+                  sx={
+                    isNuSTAR && obs.observation_mode?.toUpperCase() === 'SLEW'
+                      ? { opacity: 0.5 }
+                      : undefined
+                  }
+                >
                   <TableCell>
-                    <Typography variant="body2" fontFamily="monospace">
-                      {obs.obsid}
-                    </Typography>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                      <Typography variant="body2" fontFamily="monospace">
+                        {obs.obsid}
+                      </Typography>
+                      {isNuSTAR && obs.issue_flag === 1 && (
+                        <Tooltip title="Known issues may affect analysis">
+                          <WarningAmberIcon fontSize="small" color="warning" />
+                        </Tooltip>
+                      )}
+                    </Box>
                   </TableCell>
                   <TableCell>
                     <Tooltip title={obs.name}>
@@ -730,6 +755,10 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                           title={
                             selectedMission === 'Swift' && obs.xrt_exposure !== undefined
                               ? `XRT: ${formatExposure(obs.xrt_exposure ?? 0)} | BAT: ${formatExposure(obs.bat_exposure ?? 0)} | UVOT: ${formatExposure(obs.uvot_exposure ?? 0)}`
+                              : selectedMission === 'NuSTAR' && obs.exposure_b != null
+                              ? `FPMA: ${formatExposure(obs.exposure ?? 0)} | FPMB: ${formatExposure(obs.exposure_b)}`
+                              : selectedMission === 'NuSTAR'
+                              ? `Exposure: ${formatExposure(obs.exposure ?? 0)}`
                               : selectedMission === 'IXPE' && obs.exposure_du1 !== undefined
                               ? `DU1: ${formatExposure(obs.exposure_du1 ?? 0)} | DU2: ${formatExposure(obs.exposure_du2 ?? 0)} | DU3: ${formatExposure(obs.exposure_du3 ?? 0)}`
                               : ''
@@ -770,6 +799,30 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                             size="small"
                             color={getStatusColor(obs.processing_status)}
                             variant="outlined"
+                          />
+                        </Tooltip>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">
+                          —
+                        </Typography>
+                      )}
+                    </TableCell>
+                  )}
+                  {isNuSTAR && (
+                    <TableCell>
+                      {obs.observation_mode ? (
+                        <Tooltip title={
+                          obs.observation_mode.toUpperCase() === 'SCIENCE'
+                            ? 'Normal science observation — telescope pointed at target'
+                            : obs.observation_mode.toUpperCase() === 'SLEW'
+                            ? 'Telescope slewing between targets — data usually not useful for analysis'
+                            : obs.observation_mode
+                        }>
+                          <Chip
+                            label={obs.observation_mode}
+                            size="small"
+                            variant="outlined"
+                            color={obs.observation_mode.toUpperCase() === 'SCIENCE' ? 'success' : 'default'}
                           />
                         </Tooltip>
                       ) : (

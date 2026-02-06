@@ -33,6 +33,10 @@ export interface HeasarcObservation {
   exposure_du1?: number | null;
   exposure_du2?: number | null;
   exposure_du3?: number | null;
+  // NuSTAR-specific fields
+  exposure_b?: number | null;     // FPMB exposure (seconds)
+  observation_mode?: string;       // "SCIENCE" or "SLEW"
+  issue_flag?: number | null;      // 0=OK, 1=known issues
   // NICER-specific fields
   processing_status?: string;
   num_fpm?: number | null;
