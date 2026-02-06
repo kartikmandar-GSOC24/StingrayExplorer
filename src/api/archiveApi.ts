@@ -33,6 +33,9 @@ export interface HeasarcObservation {
   exposure_du1?: number | null;
   exposure_du2?: number | null;
   exposure_du3?: number | null;
+  // NICER-specific fields
+  processing_status?: string;
+  num_fpm?: number | null;
 }
 
 /** Search result from HEASARC */
@@ -40,7 +43,7 @@ export interface SearchResult {
   observations: HeasarcObservation[];
   count: number;
   mission: string;
-  radius: number;
+  radius?: number;
   // For name search
   source_name?: string;
   resolved_ra?: number;
@@ -48,6 +51,8 @@ export interface SearchResult {
   // For coordinate search
   ra?: number;
   dec?: number;
+  // For obsid search
+  obsid?: string;
 }
 
 /** Download URLs for an observation */
@@ -120,12 +125,18 @@ export const archiveApi = {
     mission: string;
     radius?: number;
     max_results?: number;
+    min_exposure?: number;
+    start_date?: string;  // ISO "YYYY-MM-DD"
+    end_date?: string;    // ISO "YYYY-MM-DD"
   }): Promise<ApiResponse<SearchResult>> {
     return apiClient.post('/api/archive/search/name', {
       source_name: params.source_name,
       mission: params.mission,
       radius: params.radius ?? 0.5,
       max_results: params.max_results ?? 100,
+      min_exposure: params.min_exposure,
+      start_date: params.start_date,
+      end_date: params.end_date,
     });
   },
 
@@ -138,6 +149,9 @@ export const archiveApi = {
     mission: string;
     radius?: number;
     max_results?: number;
+    min_exposure?: number;
+    start_date?: string;  // ISO "YYYY-MM-DD"
+    end_date?: string;    // ISO "YYYY-MM-DD"
   }): Promise<ApiResponse<SearchResult>> {
     return apiClient.post('/api/archive/search/coordinates', {
       ra: params.ra,
@@ -145,6 +159,22 @@ export const archiveApi = {
       mission: params.mission,
       radius: params.radius ?? 0.5,
       max_results: params.max_results ?? 100,
+      min_exposure: params.min_exposure,
+      start_date: params.start_date,
+      end_date: params.end_date,
+    });
+  },
+
+  /**
+   * Search HEASARC by Observation ID
+   */
+  async searchByObsid(params: {
+    obsid: string;
+    mission: string;
+  }): Promise<ApiResponse<SearchResult>> {
+    return apiClient.post('/api/archive/search/obsid', {
+      obsid: params.obsid,
+      mission: params.mission,
     });
   },
 

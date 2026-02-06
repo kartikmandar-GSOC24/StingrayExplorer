@@ -221,6 +221,10 @@ class ArchiveService(BaseService):
         # RXTE-specific columns
         prnb_cols = ["prnb", "PRNB"]
 
+        # NICER-specific columns
+        nicer_status_cols = ["processing_status", "PROCESSING_STATUS"]
+        nicer_fpm_cols = ["num_fpm", "NUM_FPM"]
+
         for row in table:
             try:
                 obs = {
@@ -263,6 +267,15 @@ class ArchiveService(BaseService):
                     obs["exposure_du2"] = _to_python_float(get_column_value(row, ixpe_du2_cols))
                     obs["exposure_du3"] = _to_python_float(get_column_value(row, ixpe_du3_cols))
 
+                # NICER: Include processing status and number of FPMs
+                if catalog_name == "NICER":
+                    obs["processing_status"] = str(
+                        get_column_value(row, nicer_status_cols, "")
+                    )
+                    obs["num_fpm"] = _to_python_int(
+                        get_column_value(row, nicer_fpm_cols)
+                    )
+
                 # RXTE: Include proposal number for directory lookup
                 prnb = get_column_value(row, prnb_cols)
                 if prnb is not None:
@@ -277,12 +290,65 @@ class ArchiveService(BaseService):
 
         return observations
 
+    def _apply_table_filters(
+        self,
+        table: Any,
+        min_exposure: Optional[float] = None,
+        time_range: Optional[Tuple[float, float]] = None,
+    ) -> Any:
+        """
+        Apply post-query filters to an astropy Table.
+
+        Args:
+            table: Astropy Table from HEASARC query
+            min_exposure: Minimum exposure time in seconds
+            time_range: Tuple of (mjd_start, mjd_end) for date filtering
+
+        Returns:
+            Filtered astropy Table
+        """
+        if table is None or len(table) == 0:
+            return table
+
+        if min_exposure is not None:
+            exposure_col = None
+            for col in ["exposure", "exposure_a", "duration", "ontime",
+                        "xrt_exposure", "bat_exposure"]:
+                if col in table.colnames:
+                    exposure_col = col
+                    break
+            if exposure_col is not None:
+                try:
+                    table = table[table[exposure_col] >= min_exposure]
+                except Exception:
+                    pass
+
+        if time_range is not None:
+            time_col = None
+            for col in ["time", "start_time", "date_obs", "tstart"]:
+                if col in table.colnames:
+                    time_col = col
+                    break
+            if time_col is not None:
+                try:
+                    mjd_start, mjd_end = time_range
+                    table = table[
+                        (table[time_col] >= mjd_start)
+                        & (table[time_col] <= mjd_end)
+                    ]
+                except Exception:
+                    pass
+
+        return table
+
     def search_by_name(
         self,
         source_name: str,
         mission: str,
         radius: float = 0.5,
         max_results: int = 100,
+        min_exposure: Optional[float] = None,
+        time_range: Optional[Tuple[float, float]] = None,
     ) -> Dict[str, Any]:
         """
         Search HEASARC for observations by source name.
@@ -295,6 +361,8 @@ class ArchiveService(BaseService):
             mission: Mission key (e.g., "NICER", "NuSTAR")
             radius: Search radius in degrees
             max_results: Maximum number of results to return
+            min_exposure: Minimum exposure time in seconds (post-query filter)
+            time_range: Tuple of (mjd_start, mjd_end) for date filtering
 
         Returns:
             Result dictionary with observations
@@ -340,6 +408,9 @@ class ArchiveService(BaseService):
                     error=str(e),
                 )
 
+            # Apply post-query filters
+            table = self._apply_table_filters(table, min_exposure, time_range)
+
             # Convert to observations
             observations = self._table_to_observations(table, mission)
 
@@ -376,6 +447,8 @@ class ArchiveService(BaseService):
         mission: str,
         radius: float = 0.5,
         max_results: int = 100,
+        min_exposure: Optional[float] = None,
+        time_range: Optional[Tuple[float, float]] = None,
     ) -> Dict[str, Any]:
         """
         Search HEASARC for observations by coordinates.
@@ -386,6 +459,8 @@ class ArchiveService(BaseService):
             mission: Mission key (e.g., "NICER", "NuSTAR")
             radius: Search radius in degrees
             max_results: Maximum number of results to return
+            min_exposure: Minimum exposure time in seconds (post-query filter)
+            time_range: Tuple of (mjd_start, mjd_end) for date filtering
 
         Returns:
             Result dictionary with observations
@@ -424,6 +499,9 @@ class ArchiveService(BaseService):
                     error=str(e),
                 )
 
+            # Apply post-query filters
+            table = self._apply_table_filters(table, min_exposure, time_range)
+
             # Convert to observations
             observations = self._table_to_observations(table, mission)
 
@@ -453,26 +531,25 @@ class ArchiveService(BaseService):
                 mission=mission,
             )
 
-    def get_observation_download_urls(
+    def search_by_obsid(
         self,
-        mission: str,
         obsid: str,
+        mission: str,
     ) -> Dict[str, Any]:
         """
-        Get download URLs for an observation.
+        Search HEASARC for an observation by its ObsID using ADQL TAP query.
 
-        Uses Heasarc.locate_data() to find available download URLs
-        from HEASARC, SciServer, and AWS.
+        This does not require coordinates — it directly queries the catalog
+        by observation ID.
 
         Args:
+            obsid: Observation ID to search for
             mission: Mission key (e.g., "NICER", "NuSTAR")
-            obsid: Observation ID
 
         Returns:
-            Result dictionary with download URLs
+            Result dictionary with observations
         """
         try:
-            # Import here to avoid startup delay
             from astroquery.heasarc import Heasarc
 
             # Validate mission
@@ -484,26 +561,94 @@ class ArchiveService(BaseService):
                     error=f"Supported missions: {list(SUPPORTED_CATALOGS.keys())}",
                 )
 
+            if not obsid or not obsid.strip():
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message="Please enter an Observation ID",
+                    error="Empty obsid",
+                )
+
             catalog_info = SUPPORTED_CATALOGS[mission]
             catalog_name = catalog_info["catalog"]
 
-            # First, get the observation row from the catalog
-            # We need to query by obsid to get the table row needed for locate_data
-            try:
-                # Query with obsid filter
-                table = Heasarc.query_mission_list(
-                    mission=catalog_name,
-                    fields="*",
-                    resultmax=1,
-                    cache=False,
-                )
-                # Filter for the specific obsid
-                # This is a workaround since direct obsid queries aren't always supported
-            except Exception:
-                pass
+            # Sanitize obsid for ADQL
+            safe_obsid = obsid.strip().replace("'", "''")
+            adql = f"SELECT * FROM {catalog_name} WHERE obsid = '{safe_obsid}'"
 
-            # For now, construct URLs based on known HEASARC patterns
-            # This is more reliable than using locate_data which may not work for all missions
+            try:
+                tap_result = Heasarc.query_tap(adql, maxrec=10)
+                table = tap_result.to_table()
+            except Exception as e:
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"HEASARC ObsID query failed: {str(e)}",
+                    error=str(e),
+                )
+
+            if table is None or len(table) == 0:
+                return self.create_result(
+                    success=True,
+                    data={
+                        "observations": [],
+                        "count": 0,
+                        "obsid": obsid,
+                        "mission": mission,
+                    },
+                    message=f"No observations found for ObsID '{obsid}' in {mission}",
+                )
+
+            # Convert to observations
+            observations = self._table_to_observations(table, mission)
+
+            return self.create_result(
+                success=True,
+                data={
+                    "observations": observations,
+                    "count": len(observations),
+                    "obsid": obsid,
+                    "mission": mission,
+                },
+                message=f"Found {len(observations)} observation(s) for ObsID '{obsid}' in {mission}",
+            )
+
+        except Exception as e:
+            return self.handle_error(
+                e,
+                "Searching HEASARC by ObsID",
+                obsid=obsid,
+                mission=mission,
+            )
+
+    def get_observation_download_urls(
+        self,
+        mission: str,
+        obsid: str,
+    ) -> Dict[str, Any]:
+        """
+        Get download URLs for an observation.
+
+        Constructs browse URLs based on known HEASARC patterns.
+
+        Args:
+            mission: Mission key (e.g., "NICER", "NuSTAR")
+            obsid: Observation ID
+
+        Returns:
+            Result dictionary with download URLs
+        """
+        try:
+            # Validate mission
+            if mission not in SUPPORTED_CATALOGS:
+                return self.create_result(
+                    success=False,
+                    data=None,
+                    message=f"Unsupported mission: {mission}",
+                    error=f"Supported missions: {list(SUPPORTED_CATALOGS.keys())}",
+                )
+
+            # Construct URLs based on known HEASARC patterns
             urls = self._construct_download_urls(mission, obsid)
 
             return self.create_result(
@@ -748,6 +893,12 @@ class ArchiveService(BaseService):
             File type: 'event', 'calibration', 'auxiliary', 'log', 'other'
         """
         filename_lower = filename.lower()
+
+        # Strip compression suffixes for pattern matching
+        for ext in ('.gz', '.bz2', '.z', '.zip'):
+            if filename_lower.endswith(ext):
+                filename_lower = filename_lower[:-len(ext)]
+                break
 
         # Event file patterns
         event_patterns = [
@@ -1283,17 +1434,30 @@ class ArchiveService(BaseService):
                 except Exception as coord_err:
                     print(f"Coordinate query failed: {coord_err}")
 
-            # Fallback: try query_mission_list
+            # Fallback: use ADQL via query_tap to find the observation by obsid
             if table is None or len(table) == 0:
                 try:
-                    table = Heasarc.query_mission_list(
-                        mission=catalog_name,
-                        fields="*",
-                        resultmax=100,  # Get more results to find our obsid
-                        cache=False,
-                    )
-                except Exception as list_err:
-                    print(f"query_mission_list failed: {list_err}")
+                    safe_obsid = obsid.strip().replace("'", "''")
+                    adql = f"SELECT * FROM {catalog_name} WHERE obsid = '{safe_obsid}'"
+                    tap_result = Heasarc.query_tap(adql, maxrec=1)
+                    tap_table = tap_result.to_table()
+                    if tap_table is not None and len(tap_table) > 0:
+                        # TAP results lack __row column, so locate_data won't work.
+                        # Instead, extract time and construct URL directly.
+                        time_cols = ["time", "start_time", "date_obs", "tstart"]
+                        obs_time_val = None
+                        for tc in time_cols:
+                            if tc in tap_table.colnames:
+                                obs_time_val = str(tap_table[0][tc])
+                                break
+                        if obs_time_val:
+                            url = self._get_observation_directory_url(
+                                mission, obsid, obs_time_val, obs_data
+                            )
+                            if url:
+                                return url
+                except Exception as adql_err:
+                    print(f"ADQL obsid query failed: {adql_err}")
                     return None
 
             if table is None or len(table) == 0:

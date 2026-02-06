@@ -6,7 +6,7 @@ X-ray observation data with progress tracking.
 """
 
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
@@ -25,6 +25,45 @@ def get_archive_service(request: Request) -> ArchiveService:
     )
 
 
+def _iso_dates_to_mjd_range(
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> Optional[Tuple[float, float]]:
+    """
+    Convert ISO date strings to MJD time range tuple.
+
+    Args:
+        start_date: Start date in ISO format "YYYY-MM-DD" or None
+        end_date: End date in ISO format "YYYY-MM-DD" or None
+
+    Returns:
+        Tuple of (mjd_start, mjd_end) or None if neither date is provided
+    """
+    if not start_date and not end_date:
+        return None
+
+    from astropy.time import Time
+
+    # Use wide defaults when only one bound is specified
+    mjd_start = 0.0  # Before any real observation
+    mjd_end = 99999.0  # Far future
+
+    if start_date:
+        try:
+            mjd_start = Time(start_date, format="iso").mjd
+        except Exception:
+            pass
+
+    if end_date:
+        try:
+            # Add ~1 day to include the end date fully
+            mjd_end = Time(end_date, format="iso").mjd + 1.0
+        except Exception:
+            pass
+
+    return (mjd_start, mjd_end)
+
+
 # Request/Response Models
 class SearchByNameRequest(BaseModel):
     """Request model for searching by source name."""
@@ -32,6 +71,9 @@ class SearchByNameRequest(BaseModel):
     mission: str
     radius: float = 0.5  # Search radius in degrees
     max_results: int = 100
+    min_exposure: Optional[float] = None  # Minimum exposure in seconds
+    start_date: Optional[str] = None  # ISO date string "YYYY-MM-DD"
+    end_date: Optional[str] = None  # ISO date string "YYYY-MM-DD"
 
 
 class SearchByCoordinatesRequest(BaseModel):
@@ -41,6 +83,15 @@ class SearchByCoordinatesRequest(BaseModel):
     mission: str
     radius: float = 0.5  # Search radius in degrees
     max_results: int = 100
+    min_exposure: Optional[float] = None  # Minimum exposure in seconds
+    start_date: Optional[str] = None  # ISO date string "YYYY-MM-DD"
+    end_date: Optional[str] = None  # ISO date string "YYYY-MM-DD"
+
+
+class SearchByObsidRequest(BaseModel):
+    """Request model for searching by Observation ID."""
+    obsid: str
+    mission: str
 
 
 class ListFilesRequest(BaseModel):
@@ -90,11 +141,14 @@ async def search_by_name(
         radius: Search radius in degrees (default: 0.5)
         max_results: Maximum number of results (default: 100)
     """
+    time_range = _iso_dates_to_mjd_range(request.start_date, request.end_date)
     return service.search_by_name(
         source_name=request.source_name,
         mission=request.mission,
         radius=request.radius,
         max_results=request.max_results,
+        min_exposure=request.min_exposure,
+        time_range=time_range,
     )
 
 
@@ -113,12 +167,36 @@ async def search_by_coordinates(
         radius: Search radius in degrees (default: 0.5)
         max_results: Maximum number of results (default: 100)
     """
+    time_range = _iso_dates_to_mjd_range(request.start_date, request.end_date)
     return service.search_by_coordinates(
         ra=request.ra,
         dec=request.dec,
         mission=request.mission,
         radius=request.radius,
         max_results=request.max_results,
+        min_exposure=request.min_exposure,
+        time_range=time_range,
+    )
+
+
+@router.post("/search/obsid")
+async def search_by_obsid(
+    request: SearchByObsidRequest,
+    service: ArchiveService = Depends(get_archive_service),
+):
+    """
+    Search HEASARC for an observation by its Observation ID.
+
+    Uses ADQL TAP query to directly look up the observation —
+    no coordinates needed.
+
+    Args:
+        obsid: Observation ID (e.g., "4010080142")
+        mission: Mission to search (e.g., "NICER", "NuSTAR")
+    """
+    return service.search_by_obsid(
+        obsid=request.obsid,
+        mission=request.mission,
     )
 
 

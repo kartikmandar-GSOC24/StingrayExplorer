@@ -15,7 +15,6 @@ import {
   InputLabel,
   Select,
   MenuItem,
-  Alert,
   CircularProgress,
   Table,
   TableBody,
@@ -29,15 +28,18 @@ import {
   ToggleButtonGroup,
   Tooltip,
   IconButton,
+  Collapse,
 } from '@mui/material';
 import SearchIcon from '@mui/icons-material/Search';
 import PublicIcon from '@mui/icons-material/Public';
 import MyLocationIcon from '@mui/icons-material/MyLocation';
 import TextFieldsIcon from '@mui/icons-material/TextFields';
+import TagIcon from '@mui/icons-material/Tag';
 import OpenInNewIcon from '@mui/icons-material/OpenInNew';
 import FolderOpenIcon from '@mui/icons-material/FolderOpen';
 import ArrowUpwardIcon from '@mui/icons-material/ArrowUpward';
 import ArrowDownwardIcon from '@mui/icons-material/ArrowDownward';
+import FilterListIcon from '@mui/icons-material/FilterList';
 import {
   archiveApi,
   HeasarcCatalog,
@@ -50,7 +52,7 @@ interface HeasarcBrowserPanelProps {
   onDataLoaded?: () => void;
 }
 
-type SearchMode = 'name' | 'coordinates';
+type SearchMode = 'name' | 'coordinates' | 'obsid';
 type SortOrder = 'none' | 'asc' | 'desc';
 
 interface ObsData {
@@ -82,12 +84,19 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
   const [ra, setRa] = useState<string>('');
   const [dec, setDec] = useState<string>('');
   const [searchRadius, setSearchRadius] = useState<number>(0.5);
+  const [obsidInput, setObsidInput] = useState<string>('');
+  const [maxResults, setMaxResults] = useState<number>(100);
+
+  // Filter state
+  const [showFilters, setShowFilters] = useState<boolean>(false);
+  const [minExposure, setMinExposure] = useState<string>('');
+  const [startDate, setStartDate] = useState<string>('');
+  const [endDate, setEndDate] = useState<string>('');
 
   // Search results state
   const [isSearching, setIsSearching] = useState<boolean>(false);
   const [searchResults, setSearchResults] = useState<HeasarcObservation[]>([]);
   const [searchMessage, setSearchMessage] = useState<string>('');
-  const [resolvedCoords, setResolvedCoords] = useState<{ ra: number; dec: number } | null>(null);
 
   // File browser dialog state
   const [fileBrowser, setFileBrowser] = useState<FileBrowserState>({
@@ -100,6 +109,9 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
 
   // Sort state for Date/Time column
   const [dateSortOrder, setDateSortOrder] = useState<SortOrder>('none');
+
+  // Whether NICER is the selected mission (for showing processing_status)
+  const isNicer = selectedMission === 'NICER';
 
   // Fetch supported catalogs on mount
   useEffect(() => {
@@ -123,16 +135,62 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
     fetchCatalogs();
   }, [addNotification]);
 
+  /** Build filter params for name/coordinate searches */
+  const getFilterParams = (): {
+    min_exposure?: number;
+    start_date?: string;
+    end_date?: string;
+  } => {
+    const params: { min_exposure?: number; start_date?: string; end_date?: string } = {};
+    const minExpVal = parseFloat(minExposure);
+    if (!isNaN(minExpVal) && minExpVal > 0) {
+      params.min_exposure = minExpVal;
+    }
+    if (startDate) {
+      params.start_date = startDate;
+    }
+    if (endDate) {
+      params.end_date = endDate;
+    }
+    return params;
+  };
+
   // Handle search
   const handleSearch = async (): Promise<void> => {
     setIsSearching(true);
     setSearchResults([]);
     setSearchMessage('');
-    setResolvedCoords(null);
     setDateSortOrder('none'); // Reset sort order on new search
 
     try {
-      if (searchMode === 'name') {
+      if (searchMode === 'obsid') {
+        // ObsID search
+        if (!obsidInput.trim()) {
+          addNotification({
+            type: 'warning',
+            title: 'Missing Input',
+            message: 'Please enter an Observation ID',
+          });
+          setIsSearching(false);
+          return;
+        }
+
+        const response = await archiveApi.searchByObsid({
+          obsid: obsidInput.trim(),
+          mission: selectedMission,
+        });
+
+        if (response.success && response.data) {
+          setSearchResults(response.data.observations);
+          setSearchMessage(response.message);
+        } else {
+          addNotification({
+            type: 'error',
+            title: 'Search Failed',
+            message: response.message || 'Search failed',
+          });
+        }
+      } else if (searchMode === 'name') {
         if (!sourceName.trim()) {
           addNotification({
             type: 'warning',
@@ -147,15 +205,18 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
           source_name: sourceName.trim(),
           mission: selectedMission,
           radius: searchRadius,
+          max_results: maxResults,
+          ...getFilterParams(),
         });
 
         if (response.success && response.data) {
           setSearchResults(response.data.observations);
           setSearchMessage(response.message);
           if (response.data.resolved_ra !== undefined && response.data.resolved_dec !== undefined) {
-            setResolvedCoords({
-              ra: response.data.resolved_ra,
-              dec: response.data.resolved_dec,
+            addNotification({
+              type: 'info',
+              title: 'Source Resolved',
+              message: `Source resolved to: RA = ${response.data.resolved_ra.toFixed(4)}, Dec = ${response.data.resolved_dec.toFixed(4)}`,
             });
           }
         } else {
@@ -185,6 +246,8 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
           dec: decNum,
           mission: selectedMission,
           radius: searchRadius,
+          max_results: maxResults,
+          ...getFilterParams(),
         });
 
         if (response.success && response.data) {
@@ -359,6 +422,25 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
     });
   };
 
+  /** Get processing status color for NICER Chip */
+  const getStatusColor = (status: string | undefined): 'success' | 'warning' | 'default' => {
+    if (!status) return 'default';
+    const upper = status.toUpperCase();
+    if (upper === 'VALIDATED') return 'success';
+    if (upper === 'PROCESSED') return 'warning';
+    return 'default';
+  };
+
+  /** Get processing status tooltip description */
+  const getStatusTooltip = (status: string | undefined): string => {
+    if (!status) return '';
+    const upper = status.toUpperCase();
+    if (upper === 'VALIDATED') return 'Data is fully processed, quality-checked, and available in the archive';
+    if (upper === 'PROCESSED') return 'Data has been processed but not yet validated by the NICER team';
+    if (upper === 'NOTPROCESSED') return 'Data has not been processed yet';
+    return status;
+  };
+
   if (loadingCatalogs) {
     return (
       <Box sx={{ display: 'flex', justifyContent: 'center', p: 4 }}>
@@ -376,7 +458,7 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
       </Box>
 
       <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-        Search NASA's HEASARC archive for X-ray observations by source name or coordinates
+        Search NASA&apos;s HEASARC archive for X-ray observations by source name, coordinates, or ObsID
       </Typography>
 
       {/* Mission Selector */}
@@ -403,7 +485,7 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
         <ToggleButtonGroup
           value={searchMode}
           exclusive
-          onChange={(_, value) => value && setSearchMode(value)}
+          onChange={(_, value: SearchMode | null) => value && setSearchMode(value)}
           size="small"
           fullWidth
         >
@@ -415,11 +497,15 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
             <MyLocationIcon sx={{ mr: 1 }} />
             Coordinates
           </ToggleButton>
+          <ToggleButton value="obsid">
+            <TagIcon sx={{ mr: 1 }} />
+            ObsID
+          </ToggleButton>
         </ToggleButtonGroup>
       </Box>
 
       {/* Search Inputs */}
-      {searchMode === 'name' ? (
+      {searchMode === 'name' && (
         <TextField
           label="Source Name"
           value={sourceName}
@@ -431,7 +517,9 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
           helperText="Enter an astronomical source name (resolved via SIMBAD/NED)"
           onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
         />
-      ) : (
+      )}
+
+      {searchMode === 'coordinates' && (
         <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
           <TextField
             label="RA (degrees)"
@@ -458,16 +546,107 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
         </Box>
       )}
 
-      {/* Search Radius */}
-      <TextField
-        label="Search Radius (degrees)"
-        value={searchRadius}
-        onChange={(e) => setSearchRadius(parseFloat(e.target.value) || 0.5)}
-        size="small"
-        sx={{ mb: 2, width: 200 }}
-        type="number"
-        inputProps={{ step: 0.1, min: 0.01, max: 10 }}
-      />
+      {searchMode === 'obsid' && (
+        <TextField
+          label="Observation ID"
+          value={obsidInput}
+          onChange={(e) => setObsidInput(e.target.value)}
+          fullWidth
+          size="small"
+          sx={{ mb: 2 }}
+          placeholder="e.g., 4010080142"
+          helperText="Enter an exact Observation ID to look up"
+          onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+        />
+      )}
+
+      {/* Search Radius + Max Results (hidden for ObsID mode) */}
+      {searchMode !== 'obsid' && (
+        <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+          <TextField
+            label="Search Radius (degrees)"
+            value={searchRadius}
+            onChange={(e) => setSearchRadius(parseFloat(e.target.value) || 0.5)}
+            size="small"
+            sx={{ width: 200 }}
+            type="number"
+            inputProps={{ step: 0.1, min: 0.01, max: 10 }}
+          />
+          <TextField
+            label="Max Results"
+            value={maxResults}
+            onChange={(e) => {
+              const val = parseInt(e.target.value, 10);
+              if (!isNaN(val) && val > 0) setMaxResults(val);
+            }}
+            size="small"
+            sx={{ width: 140 }}
+            type="number"
+            inputProps={{ min: 1, step: 50 }}
+          />
+        </Box>
+      )}
+
+      {/* Filters (shown for name/coordinates modes) */}
+      {searchMode !== 'obsid' && (
+        <Box sx={{ mb: 2 }}>
+          <Button
+            size="small"
+            startIcon={<FilterListIcon />}
+            onClick={() => setShowFilters(!showFilters)}
+            sx={{ mb: 1, textTransform: 'none' }}
+          >
+            {showFilters ? 'Hide Filters' : 'Show Filters'}
+          </Button>
+          <Collapse in={showFilters}>
+            <Paper variant="outlined" sx={{ p: 2 }}>
+              <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap', alignItems: 'center' }}>
+                <TextField
+                  label="Min Exposure (s)"
+                  value={minExposure}
+                  onChange={(e) => setMinExposure(e.target.value)}
+                  size="small"
+                  sx={{ width: 160 }}
+                  type="number"
+                  inputProps={{ min: 0, step: 100 }}
+                  placeholder="e.g., 1000"
+                />
+                <TextField
+                  label="Start Date"
+                  value={startDate}
+                  onChange={(e) => setStartDate(e.target.value)}
+                  size="small"
+                  sx={{ width: 180 }}
+                  type="date"
+                  InputLabelProps={{ shrink: true }}
+                />
+                <TextField
+                  label="End Date"
+                  value={endDate}
+                  onChange={(e) => setEndDate(e.target.value)}
+                  size="small"
+                  sx={{ width: 180 }}
+                  type="date"
+                  InputLabelProps={{ shrink: true }}
+                />
+                {(minExposure || startDate || endDate) && (
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      setMinExposure('');
+                      setStartDate('');
+                      setEndDate('');
+                    }}
+                    sx={{ textTransform: 'none' }}
+                  >
+                    Clear Filters
+                  </Button>
+                )}
+              </Box>
+            </Paper>
+          </Collapse>
+        </Box>
+      )}
 
       {/* Search Button */}
       <Button
@@ -480,13 +659,6 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
       >
         {isSearching ? 'Searching...' : 'Search HEASARC'}
       </Button>
-
-      {/* Resolved Coordinates Info */}
-      {resolvedCoords && (
-        <Alert severity="info" sx={{ mb: 2 }}>
-          Source resolved to: RA = {formatCoord(resolvedCoords.ra)}, Dec = {formatCoord(resolvedCoords.dec)}
-        </Alert>
-      )}
 
       {/* Search Results */}
       {searchMessage && (
@@ -516,6 +688,7 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                   </Box>
                 </TableCell>
                 <TableCell>MJD</TableCell>
+                {isNicer && <TableCell>Status</TableCell>}
                 <TableCell align="center">Action</TableCell>
               </TableRow>
             </TableHead>
@@ -588,6 +761,24 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                       {obs.time || 'N/A'}
                     </Typography>
                   </TableCell>
+                  {isNicer && (
+                    <TableCell>
+                      {obs.processing_status ? (
+                        <Tooltip title={getStatusTooltip(obs.processing_status)}>
+                          <Chip
+                            label={obs.processing_status}
+                            size="small"
+                            color={getStatusColor(obs.processing_status)}
+                            variant="outlined"
+                          />
+                        </Tooltip>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">
+                          —
+                        </Typography>
+                      )}
+                    </TableCell>
+                  )}
                   <TableCell align="center">
                     <Box sx={{ display: 'flex', gap: 0.5, justifyContent: 'center' }}>
                       <Tooltip title="Browse and download files">
@@ -637,7 +828,7 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
         <Typography variant="body2" color="text.secondary" component="div">
           <ol style={{ margin: '8px 0', paddingLeft: 20 }}>
             <li>Select a mission (e.g., NICER, NuSTAR)</li>
-            <li>Enter a source name or coordinates</li>
+            <li>Enter a source name, coordinates, or ObsID</li>
             <li>Click Search to find observations</li>
             <li>Click the folder icon to browse available files</li>
             <li>Select an event file and click Download & Load</li>
@@ -646,6 +837,7 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
         <Typography variant="caption" color="text.secondary">
           The file browser shows all available files in the observation directory.
           Event files are marked with a star icon.
+          Use &quot;Show Filters&quot; to filter by minimum exposure or date range.
         </Typography>
       </Box>
     </Box>
