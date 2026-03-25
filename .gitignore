@@ -1,4 +1,6 @@
 /.DS_Store
+.DS_Store
+._*
 .idea/
 __pycache__/
 files/loaded-data/
