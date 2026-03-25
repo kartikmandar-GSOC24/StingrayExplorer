@@ -285,6 +285,37 @@ class ArchiveService(BaseService):
                     obs["observation_mode"] = str(get_column_value(row, obs_mode_cols, ""))
                     obs["issue_flag"] = _to_python_int(get_column_value(row, issue_cols))
 
+                # XMM-Newton: Include per-instrument exposures, modes, and status
+                # query_region() returns: status, data_in_heasarc (always available)
+                # ADQL/TAP returns: pn_time, pn_mode, mos1_time, mos1_mode,
+                #   mos2_time, mos2_mode (only via ObsID search)
+                if catalog_name == "XMM-Newton":
+                    pn_time_cols = ["pn_time", "PN_TIME"]
+                    pn_mode_cols = ["pn_mode", "PN_MODE"]
+                    mos1_time_cols = ["mos1_time", "MOS1_TIME"]
+                    mos1_mode_cols = ["mos1_mode", "MOS1_MODE"]
+                    mos2_time_cols = ["mos2_time", "MOS2_TIME"]
+                    mos2_mode_cols = ["mos2_mode", "MOS2_MODE"]
+                    status_cols = ["status", "STATUS"]
+                    data_avail_cols = ["data_in_heasarc", "DATA_IN_HEASARC"]
+                    obs["pn_time"] = _to_python_float(get_column_value(row, pn_time_cols))
+                    obs["pn_mode"] = str(get_column_value(row, pn_mode_cols, ""))
+                    obs["mos1_time"] = _to_python_float(get_column_value(row, mos1_time_cols))
+                    obs["mos1_mode"] = str(get_column_value(row, mos1_mode_cols, ""))
+                    obs["mos2_time"] = _to_python_float(get_column_value(row, mos2_time_cols))
+                    obs["mos2_mode"] = str(get_column_value(row, mos2_mode_cols, ""))
+                    obs["xmm_status"] = str(get_column_value(row, status_cols, ""))
+                    obs["data_in_heasarc"] = str(get_column_value(row, data_avail_cols, ""))
+
+                # Chandra: Include detector, grating, status
+                if catalog_name == "Chandra":
+                    detector_cols = ["detector", "DETECTOR"]
+                    grating_cols = ["grating", "GRATING"]
+                    chandra_status_cols = ["status", "STATUS"]
+                    obs["detector"] = str(get_column_value(row, detector_cols, ""))
+                    obs["grating"] = str(get_column_value(row, grating_cols, ""))
+                    obs["chandra_status"] = str(get_column_value(row, chandra_status_cols, ""))
+
                 # RXTE: Include proposal number for directory lookup
                 prnb = get_column_value(row, prnb_cols)
                 if prnb is not None:
@@ -943,6 +974,10 @@ class ArchiveService(BaseService):
             "orbit",
             "housekeeping",
             "hk",
+            "_asol",   # Chandra aspect solution
+            "_dtf",    # Chandra dead time factor (HRC)
+            "_bpix",   # Chandra bad pixel list
+            "_fov",    # Chandra field of view
         ]
         if any(p in filename_lower for p in aux_patterns):
             return "auxiliary"

@@ -40,6 +40,19 @@ export interface HeasarcObservation {
   // NICER-specific fields
   processing_status?: string;
   num_fpm?: number | null;
+  // XMM-Newton-specific fields (per-instrument data only via ObsID/ADQL search)
+  pn_time?: number | null;      // EPIC-PN exposure (seconds)
+  pn_mode?: string;             // EPIC-PN observation mode
+  mos1_time?: number | null;    // EPIC-MOS1 exposure (seconds)
+  mos1_mode?: string;           // EPIC-MOS1 observation mode
+  mos2_time?: number | null;    // EPIC-MOS2 exposure (seconds)
+  mos2_mode?: string;           // EPIC-MOS2 observation mode
+  xmm_status?: string;          // "archived" or "scheduled"
+  data_in_heasarc?: string;     // "Y" or "N"
+  // Chandra-specific fields
+  detector?: string;            // "ACIS-I", "ACIS-S", "HRC-I", "HRC-S"
+  grating?: string;             // "NONE", "HETG", "LETG"
+  chandra_status?: string;      // "archived", "observed", "scheduled", etc.
 }
 
 /** Search result from HEASARC */

@@ -114,6 +114,15 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
   // Mission-specific display flags
   const isNicer = selectedMission === 'NICER';
   const isNuSTAR = selectedMission === 'NuSTAR';
+  const isXMM = selectedMission === 'XMM-Newton';
+  const isChandra = selectedMission === 'Chandra';
+
+  // XMM-Newton: per-instrument data only available via ADQL (ObsID search)
+  // Show Instruments column only when at least one result has the data
+  const hasXmmInstrumentData = isXMM && searchResults.some((obs) => obs.pn_time != null);
+
+  // Chandra: show Detector column only when at least one result has detector info
+  const hasDetectorData = isChandra && searchResults.some((obs) => obs.detector);
 
   // Fetch supported catalogs on mount
   useEffect(() => {
@@ -360,6 +369,16 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
       return { label: formatExposure(obs.exposure), instrument: null };
     }
 
+    // For Chandra, show exposure with detector context
+    if (selectedMission === 'Chandra') {
+      return { label: formatExposure(obs.exposure), instrument: null };
+    }
+
+    // For XMM-Newton, show duration as main exposure
+    if (selectedMission === 'XMM-Newton') {
+      return { label: formatExposure(obs.exposure), instrument: null };
+    }
+
     return { label: formatExposure(obs.exposure), instrument: null };
   };
 
@@ -448,6 +467,96 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
     if (upper === 'PROCESSED') return 'Data has been processed but not yet validated by the NICER team';
     if (upper === 'NOTPROCESSED') return 'Data has not been processed yet';
     return status;
+  };
+
+  /** Get XMM-Newton status display label (capitalize raw HEASARC value) */
+  const getXmmStatusLabel = (status: string | undefined): string => {
+    if (!status) return '';
+    const upper = status.toUpperCase();
+    if (upper === 'ARCHIVED') return 'Archived';
+    if (upper === 'SCHEDULED') return 'Scheduled';
+    return status;
+  };
+
+  /** Get XMM-Newton status chip color */
+  const getXmmStatusColor = (status: string | undefined): 'success' | 'warning' | 'default' => {
+    if (!status) return 'default';
+    const upper = status.toUpperCase();
+    if (upper === 'ARCHIVED') return 'success';
+    if (upper === 'SCHEDULED') return 'warning';
+    return 'default';
+  };
+
+  /** Get XMM-Newton status tooltip description */
+  const getXmmStatusTooltip = (status: string | undefined, dataInHeasarc: string | undefined): string => {
+    if (!status) return '';
+    const upper = status.toUpperCase();
+    const dataAvail = dataInHeasarc === 'Y'
+      ? 'Data files available in HEASARC'
+      : dataInHeasarc === 'N'
+      ? 'Data files not yet available in HEASARC'
+      : '';
+    if (upper === 'ARCHIVED') return `Observation completed and archived. ${dataAvail}`;
+    if (upper === 'SCHEDULED') return `Observation scheduled but not yet executed. ${dataAvail}`;
+    return `${status}. ${dataAvail}`;
+  };
+
+  /** Get Chandra status display label */
+  const getChandraStatusLabel = (status: string | undefined): string => {
+    if (!status) return '';
+    const upper = status.toUpperCase();
+    if (upper === 'ARCHIVED') return 'Archived';
+    if (upper === 'OBSERVED') return 'Observed';
+    if (upper === 'SCHEDULED') return 'Scheduled';
+    return status;
+  };
+
+  /** Get Chandra status chip color */
+  const getChandraStatusColor = (status: string | undefined): 'success' | 'primary' | 'default' => {
+    if (!status) return 'default';
+    const upper = status.toUpperCase();
+    if (upper === 'ARCHIVED') return 'success';
+    if (upper === 'OBSERVED') return 'primary';
+    return 'default';
+  };
+
+  /** Get Chandra status tooltip description */
+  const getChandraStatusTooltip = (status: string | undefined): string => {
+    if (!status) return '';
+    const upper = status.toUpperCase();
+    if (upper === 'ARCHIVED') return 'Observation data processed and available for download';
+    if (upper === 'OBSERVED') return 'Observation completed, data processing in progress';
+    if (upper === 'SCHEDULED') return 'Observation scheduled but not yet executed';
+    return status;
+  };
+
+  /** Format Chandra detector + grating display */
+  const formatChandraDetector = (obs: HeasarcObservation): { label: string; tooltip: string } => {
+    const detector = obs.detector || '';
+    const grating = obs.grating || '';
+    if (!detector) return { label: '', tooltip: '' };
+
+    const hasGrating = grating && grating.toUpperCase() !== 'NONE';
+    const label = hasGrating ? `${detector} / ${grating}` : detector;
+
+    let tooltip = detector;
+    if (detector.toUpperCase() === 'ACIS-S') {
+      tooltip = hasGrating
+        ? `ACIS-S with ${grating} grating — spectroscopy mode`
+        : 'ACIS-S — CCD array, supports CC mode (2.85ms timing)';
+    } else if (detector.toUpperCase() === 'ACIS-I') {
+      tooltip = hasGrating
+        ? `ACIS-I with ${grating} grating`
+        : 'ACIS-I — imaging array, 3.3s standard frame time';
+    } else if (detector.toUpperCase() === 'HRC-I') {
+      tooltip = 'HRC-I — microchannel plate, 16\u03BCs time resolution';
+    } else if (detector.toUpperCase() === 'HRC-S') {
+      tooltip = hasGrating
+        ? `HRC-S with ${grating} grating — high-resolution spectroscopy`
+        : 'HRC-S — microchannel plate, LETG readout optimized';
+    }
+
+    return { label, tooltip };
   };
 
   if (loadingCatalogs) {
@@ -699,6 +808,10 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                 <TableCell>MJD</TableCell>
                 {isNicer && <TableCell>Status</TableCell>}
                 {isNuSTAR && <TableCell>Mode</TableCell>}
+                {isXMM && <TableCell>Status</TableCell>}
+                {hasXmmInstrumentData && <TableCell>Instruments</TableCell>}
+                {hasDetectorData && <TableCell>Detector</TableCell>}
+                {isChandra && <TableCell>Status</TableCell>}
                 <TableCell align="center">Action</TableCell>
               </TableRow>
             </TableHead>
@@ -709,6 +822,10 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                   hover
                   sx={
                     isNuSTAR && obs.observation_mode?.toUpperCase() === 'SLEW'
+                      ? { opacity: 0.5 }
+                      : isXMM && (obs.data_in_heasarc === 'N' || (obs.xmm_status && obs.xmm_status.toUpperCase() !== 'ARCHIVED'))
+                      ? { opacity: 0.5 }
+                      : isChandra && obs.chandra_status && !['archived', 'observed'].includes(obs.chandra_status.toLowerCase())
                       ? { opacity: 0.5 }
                       : undefined
                   }
@@ -761,6 +878,12 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                               ? `Exposure: ${formatExposure(obs.exposure ?? 0)}`
                               : selectedMission === 'IXPE' && obs.exposure_du1 !== undefined
                               ? `DU1: ${formatExposure(obs.exposure_du1 ?? 0)} | DU2: ${formatExposure(obs.exposure_du2 ?? 0)} | DU3: ${formatExposure(obs.exposure_du3 ?? 0)}`
+                              : selectedMission === 'Chandra' && obs.detector
+                              ? `Exposure: ${formatExposure(obs.exposure ?? 0)} (${obs.detector}${obs.grating && obs.grating.toUpperCase() !== 'NONE' ? `, ${obs.grating}` : ', no grating'})`
+                              : selectedMission === 'XMM-Newton' && obs.pn_time != null
+                              ? `PN: ${formatExposure(obs.pn_time)} (${obs.pn_mode || '?'}) | MOS1: ${formatExposure(obs.mos1_time ?? 0)} (${obs.mos1_mode || '?'}) | MOS2: ${formatExposure(obs.mos2_time ?? 0)} (${obs.mos2_mode || '?'})`
+                              : selectedMission === 'XMM-Newton'
+                              ? `Duration: ${formatExposure(obs.exposure ?? 0)}`
                               : ''
                           }
                         >
@@ -829,6 +952,85 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
                         <Typography variant="body2" color="text.secondary">
                           —
                         </Typography>
+                      )}
+                    </TableCell>
+                  )}
+                  {isXMM && (
+                    <TableCell>
+                      <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
+                        {obs.xmm_status ? (
+                          <Tooltip title={getXmmStatusTooltip(obs.xmm_status, obs.data_in_heasarc)}>
+                            <Chip
+                              label={getXmmStatusLabel(obs.xmm_status)}
+                              size="small"
+                              variant="outlined"
+                              color={getXmmStatusColor(obs.xmm_status)}
+                            />
+                          </Tooltip>
+                        ) : (
+                          <Typography variant="body2" color="text.secondary">—</Typography>
+                        )}
+                        {obs.data_in_heasarc === 'N' && (
+                          <Tooltip title="Data not available in HEASARC archive">
+                            <WarningAmberIcon fontSize="small" color="warning" />
+                          </Tooltip>
+                        )}
+                      </Box>
+                    </TableCell>
+                  )}
+                  {hasXmmInstrumentData && (
+                    <TableCell>
+                      <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap', alignItems: 'center' }}>
+                        {(obs.pn_time ?? 0) > 0 && (
+                          <Tooltip title={`EPIC-PN: ${formatExposure(obs.pn_time ?? 0)} — ${obs.pn_mode || 'Unknown mode'}`}>
+                            <Chip label={`PN${obs.pn_mode ? ` (${obs.pn_mode.split(' ')[0]})` : ''}`} size="small" variant="outlined" color="primary" />
+                          </Tooltip>
+                        )}
+                        {(obs.mos1_time ?? 0) > 0 && (
+                          <Tooltip title={`EPIC-MOS1: ${formatExposure(obs.mos1_time ?? 0)} — ${obs.mos1_mode || 'Unknown mode'}`}>
+                            <Chip label={`MOS1${obs.mos1_mode ? ` (${obs.mos1_mode.split(' ')[0]})` : ''}`} size="small" variant="outlined" />
+                          </Tooltip>
+                        )}
+                        {(obs.mos2_time ?? 0) > 0 && (
+                          <Tooltip title={`EPIC-MOS2: ${formatExposure(obs.mos2_time ?? 0)} — ${obs.mos2_mode || 'Unknown mode'}`}>
+                            <Chip label={`MOS2${obs.mos2_mode ? ` (${obs.mos2_mode.split(' ')[0]})` : ''}`} size="small" variant="outlined" />
+                          </Tooltip>
+                        )}
+                        {(obs.pn_time ?? 0) === 0 && (obs.mos1_time ?? 0) === 0 && (obs.mos2_time ?? 0) === 0 && (
+                          <Typography variant="body2" color="text.secondary">—</Typography>
+                        )}
+                      </Box>
+                    </TableCell>
+                  )}
+                  {hasDetectorData && (
+                    <TableCell>
+                      {obs.detector ? (
+                        <Tooltip title={formatChandraDetector(obs).tooltip}>
+                          <Chip
+                            label={formatChandraDetector(obs).label}
+                            size="small"
+                            variant="outlined"
+                            color="primary"
+                          />
+                        </Tooltip>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">—</Typography>
+                      )}
+                    </TableCell>
+                  )}
+                  {isChandra && (
+                    <TableCell>
+                      {obs.chandra_status ? (
+                        <Tooltip title={getChandraStatusTooltip(obs.chandra_status)}>
+                          <Chip
+                            label={getChandraStatusLabel(obs.chandra_status)}
+                            size="small"
+                            variant="outlined"
+                            color={getChandraStatusColor(obs.chandra_status)}
+                          />
+                        </Tooltip>
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">—</Typography>
                       )}
                     </TableCell>
                   )}
