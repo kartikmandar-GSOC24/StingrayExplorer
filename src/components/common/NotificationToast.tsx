@@ -92,7 +92,27 @@ const NotificationToast: React.FC = () => {
         sx={{
           minWidth: 300,
           maxWidth: 450,
-          boxShadow: 6,
+          backdropFilter: 'blur(12px) saturate(150%)',
+          WebkitBackdropFilter: 'blur(12px) saturate(150%)',
+          border: '1px solid',
+          borderColor: () => {
+            const colors: Record<string, string> = {
+              success: 'rgba(34, 197, 94, 0.3)',
+              error: 'rgba(239, 68, 68, 0.3)',
+              warning: 'rgba(245, 158, 11, 0.3)',
+              info: 'rgba(59, 130, 246, 0.3)',
+            };
+            return colors[currentNotification.type] || 'rgba(148, 163, 184, 0.12)';
+          },
+          boxShadow: () => {
+            const glows: Record<string, string> = {
+              success: '0 4px 24px rgba(34, 197, 94, 0.15)',
+              error: '0 4px 24px rgba(239, 68, 68, 0.15)',
+              warning: '0 4px 24px rgba(245, 158, 11, 0.15)',
+              info: '0 4px 24px rgba(59, 130, 246, 0.15)',
+            };
+            return glows[currentNotification.type] || '0 4px 24px rgba(0,0,0,0.1)';
+          },
           '& .MuiAlert-message': {
             width: '100%',
           },
@@ -108,7 +128,7 @@ const NotificationToast: React.FC = () => {
           </IconButton>
         }
       >
-        <AlertTitle sx={{ fontWeight: 600 }}>
+        <AlertTitle sx={{ fontWeight: 600, fontFamily: '"JetBrains Mono", monospace', fontSize: '0.85rem' }}>
           {currentNotification.title}
         </AlertTitle>
         <Typography

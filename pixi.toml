@@ -1,4 +1,4 @@
-[project]
+[workspace]
 name = "stingray-explorer"
 version = "1.0.0"
 description = "Desktop application for X-ray timing analysis using the Stingray library"

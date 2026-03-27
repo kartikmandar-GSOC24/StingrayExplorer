@@ -258,8 +258,10 @@ export class PythonManager {
     if (isDev) {
       // Development: run main.py from python-backend directory
       // The cwd is set to python-backend in the spawn call
+      // Use pixi environment Python if available, otherwise fall back to system python
+      const pixiPython = path.join(app.getAppPath(), '.pixi', 'envs', 'default', 'bin', 'python');
       return {
-        pythonPath: 'python',
+        pythonPath: pixiPython,
         args: ['main.py'],
       };
     } else {

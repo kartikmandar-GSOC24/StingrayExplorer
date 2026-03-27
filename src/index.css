@@ -1,5 +1,51 @@
-/* Global Styles for Stingray Explorer */
+/* ==========================================================================
+   Stingray Explorer — Observatory Dark Global Styles
+   ========================================================================== */
 
+/* Font Imports (self-hosted via @fontsource) */
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/700.css';
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/400-italic.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-sans/600.css';
+@import '@fontsource/ibm-plex-sans/700.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/700.css';
+
+/* --------------------------------------------------------------------------
+   CSS Custom Properties
+   -------------------------------------------------------------------------- */
+:root {
+  /* Glass effects */
+  --glass-blur: 12px;
+  --glass-saturation: 150%;
+  --glass-bg-dark: rgba(18, 24, 41, 0.6);
+  --glass-bg-light: rgba(255, 255, 255, 0.7);
+  --glass-border: rgba(148, 163, 184, 0.12);
+
+  /* Glow effects */
+  --glow-primary: rgba(0, 212, 170, 0.15);
+  --glow-secondary: rgba(59, 130, 246, 0.15);
+  --glow-stingray: rgba(94, 173, 97, 0.12);
+
+  /* Grain */
+  --grain-opacity: 0.03;
+
+  /* Transitions */
+  --transition-smooth: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --transition-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* Font stacks */
+  --font-display: 'JetBrains Mono', 'Fira Code', 'Source Code Pro', monospace;
+  --font-body: 'IBM Plex Sans', 'Source Sans 3', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'IBM Plex Mono', 'Fira Code', monospace;
+}
+
+/* --------------------------------------------------------------------------
+   Reset & Base
+   -------------------------------------------------------------------------- */
 * {
   margin: 0;
   padding: 0;
@@ -14,16 +60,36 @@ body,
 }
 
 body {
-  font-family: 'Roboto', 'Helvetica', 'Arial', sans-serif;
+  font-family: var(--font-body);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   overflow: hidden;
 }
 
-/* Custom scrollbar */
+/* --------------------------------------------------------------------------
+   Grain Texture Overlay (atmospheric depth)
+   -------------------------------------------------------------------------- */
+body::after {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 9999;
+  opacity: var(--grain-opacity);
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='1'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 256px 256px;
+}
+
+/* --------------------------------------------------------------------------
+   Scrollbar — Teal-tinted, thin
+   -------------------------------------------------------------------------- */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
@@ -31,33 +97,40 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background-color: rgba(0, 0, 0, 0.2);
-  border-radius: 4px;
+  background-color: rgba(0, 212, 170, 0.2);
+  border-radius: 3px;
+  transition: background-color 0.2s ease;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(0, 0, 0, 0.3);
+  background-color: rgba(0, 212, 170, 0.4);
 }
 
-/* Dark mode scrollbar */
-.dark ::-webkit-scrollbar-thumb {
-  background-color: rgba(255, 255, 255, 0.2);
+/* Light mode scrollbar */
+[data-theme='light'] ::-webkit-scrollbar-thumb {
+  background-color: rgba(13, 155, 122, 0.2);
 }
 
-.dark ::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(255, 255, 255, 0.3);
+[data-theme='light'] ::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(13, 155, 122, 0.35);
 }
 
-/* Selection color */
+/* --------------------------------------------------------------------------
+   Selection & Focus
+   -------------------------------------------------------------------------- */
 ::selection {
-  background-color: rgba(94, 173, 97, 0.3);
+  background-color: rgba(0, 212, 170, 0.3);
+  color: #e2e8f0;
 }
 
-/* Focus outline for accessibility */
 :focus-visible {
-  outline: 2px solid #5ead61;
+  outline: 2px solid rgba(0, 212, 170, 0.6);
   outline-offset: 2px;
 }
+
+/* --------------------------------------------------------------------------
+   Utility Classes
+   -------------------------------------------------------------------------- */
 
 /* Prevent text selection on UI elements */
 .no-select {
@@ -74,19 +147,78 @@ body {
   -webkit-app-region: no-drag;
 }
 
-/* Plotly chart container */
+/* Glass surface utility */
+.glass-surface {
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation));
+  border: 1px solid var(--glass-border);
+}
+
+/* Glow hover utility */
+.glow-hover {
+  transition: box-shadow 0.3s var(--transition-smooth),
+              border-color 0.3s var(--transition-smooth);
+}
+
+.glow-hover:hover {
+  box-shadow: 0 0 20px var(--glow-primary), 0 0 40px rgba(0, 212, 170, 0.05);
+  border-color: rgba(0, 212, 170, 0.3);
+}
+
+/* Stagger reveal — children animate in sequence */
+.stagger-reveal > * {
+  opacity: 0;
+  animation: fadeInUp 0.5s var(--transition-smooth) forwards;
+}
+
+.stagger-reveal > *:nth-child(1) { animation-delay: 0ms; }
+.stagger-reveal > *:nth-child(2) { animation-delay: 80ms; }
+.stagger-reveal > *:nth-child(3) { animation-delay: 160ms; }
+.stagger-reveal > *:nth-child(4) { animation-delay: 240ms; }
+.stagger-reveal > *:nth-child(5) { animation-delay: 320ms; }
+.stagger-reveal > *:nth-child(6) { animation-delay: 400ms; }
+.stagger-reveal > *:nth-child(7) { animation-delay: 480ms; }
+.stagger-reveal > *:nth-child(8) { animation-delay: 560ms; }
+
+/* Gradient border bottom */
+.gradient-border-bottom {
+  border-image: linear-gradient(to right, #00d4aa, #3b82f6, transparent) 1;
+}
+
+/* Force display font */
+.text-display {
+  font-family: var(--font-display) !important;
+}
+
+/* Force mono font */
+.text-mono {
+  font-family: var(--font-mono) !important;
+}
+
+/* --------------------------------------------------------------------------
+   Plotly Chart Container
+   -------------------------------------------------------------------------- */
 .js-plotly-plot {
   width: 100% !important;
   height: 100% !important;
 }
 
-/* Animation utilities */
+/* --------------------------------------------------------------------------
+   Keyframe Animations
+   -------------------------------------------------------------------------- */
 @keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fadeInUp {
   from {
     opacity: 0;
+    transform: translateY(16px);
   }
   to {
     opacity: 1;
+    transform: translateY(0);
   }
 }
 
@@ -101,6 +233,36 @@ body {
   }
 }
 
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes glowPulse {
+  0%, 100% { box-shadow: 0 0 8px var(--glow-primary); }
+  50% { box-shadow: 0 0 20px var(--glow-primary); }
+}
+
+@keyframes borderGlow {
+  0%, 100% { border-color: rgba(0, 212, 170, 0.2); }
+  50% { border-color: rgba(0, 212, 170, 0.5); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes statusPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+@keyframes starTwinkle {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+/* Animation utility classes */
 .animate-fade-in {
   animation: fadeIn 0.2s ease-in-out;
 }
@@ -109,19 +271,17 @@ body {
   animation: slideIn 0.3s ease-out;
 }
 
+.animate-fade-in-up {
+  animation: fadeInUp 0.5s var(--transition-smooth);
+}
+
 /* Loading spinner */
 .loading-spinner {
   display: inline-block;
   width: 24px;
   height: 24px;
-  border: 3px solid rgba(0, 0, 0, 0.1);
+  border: 3px solid rgba(0, 212, 170, 0.1);
   border-radius: 50%;
-  border-top-color: #5ead61;
+  border-top-color: #00d4aa;
   animation: spin 1s ease-in-out infinite;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
 }

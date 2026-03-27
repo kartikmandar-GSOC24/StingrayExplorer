@@ -21,7 +21,7 @@ const PageTemplate: React.FC<PageTemplateProps> = ({
   children,
 }) => {
   return (
-    <Box>
+    <Box className="stagger-reveal">
       {/* Header */}
       <Box sx={{ mb: 3 }}>
         {category && (
@@ -30,10 +30,25 @@ const PageTemplate: React.FC<PageTemplateProps> = ({
             size="small"
             color="primary"
             variant="outlined"
-            sx={{ mb: 1 }}
+            sx={{
+              mb: 1,
+              fontFamily: '"JetBrains Mono", monospace',
+              fontSize: '0.7rem',
+              letterSpacing: '0.04em',
+            }}
           />
         )}
-        <Typography variant="h4" gutterBottom>
+        <Typography
+          variant="h4"
+          gutterBottom
+          sx={{
+            fontFamily: '"JetBrains Mono", monospace',
+            textShadow: (theme) =>
+              theme.palette.mode === 'dark'
+                ? '0 0 30px rgba(0, 212, 170, 0.08)'
+                : 'none',
+          }}
+        >
           {title}
         </Typography>
         {description && (
@@ -58,9 +73,33 @@ const PageTemplate: React.FC<PageTemplateProps> = ({
 
       {/* Page content */}
       {children || (
-        <Paper variant="outlined" sx={{ p: 4, textAlign: 'center' }}>
-          <ConstructionIcon sx={{ fontSize: 64, color: 'text.disabled', mb: 2 }} />
-          <Typography variant="h6" color="text.secondary">
+        <Paper
+          variant="outlined"
+          sx={{
+            p: 4,
+            textAlign: 'center',
+            backgroundColor: (theme) =>
+              theme.palette.mode === 'dark'
+                ? 'rgba(18, 24, 41, 0.4)'
+                : 'rgba(255, 255, 255, 0.6)',
+            backdropFilter: 'blur(8px)',
+            border: '1px solid',
+            borderColor: 'divider',
+          }}
+        >
+          <ConstructionIcon
+            sx={{
+              fontSize: 64,
+              color: 'text.disabled',
+              mb: 2,
+              animation: 'statusPulse 3s ease-in-out infinite',
+            }}
+          />
+          <Typography
+            variant="h6"
+            color="text.secondary"
+            sx={{ fontFamily: '"JetBrains Mono", monospace' }}
+          >
             {title}
           </Typography>
           <Typography variant="body2" color="text.disabled">

@@ -84,6 +84,11 @@ const MainLayout: React.FC = () => {
             flexDirection: 'column',
             overflow: 'hidden',
             backgroundColor: 'background.default',
+            // Subtle inset shadow where content meets sidebars
+            boxShadow: (theme) =>
+              theme.palette.mode === 'dark'
+                ? 'inset 4px 0 12px -4px rgba(0,0,0,0.3), inset -4px 0 12px -4px rgba(0,0,0,0.3)'
+                : 'inset 4px 0 8px -4px rgba(0,0,0,0.04), inset -4px 0 8px -4px rgba(0,0,0,0.04)',
           }}
         >
           {/* Page content */}

@@ -274,7 +274,8 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
       sx={{
         width: TOOLBAR_WIDTH,
         height: `calc(100vh - ${HEADER_HEIGHT}px)`,
-        backgroundColor: 'background.paper',
+        backgroundColor: (theme) =>
+          theme.palette.mode === 'dark' ? '#0d1220' : '#f8f9fb',
         borderLeft: '1px solid',
         borderColor: 'divider',
         display: 'flex',
@@ -341,6 +342,8 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
               backgroundColor: backendReady ? 'success.main' : 'error.main',
               border: '1px solid',
               borderColor: 'background.paper',
+              animation: backendReady ? 'statusPulse 3s ease-in-out infinite' : 'none',
+              boxShadow: backendReady ? '0 0 6px rgba(34, 197, 94, 0.4)' : 'none',
             }}
           />
         </Box>
@@ -375,7 +378,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
         </IconButton>
       </Tooltip>
 
-      <Divider sx={{ width: '80%', my: 0.5 }} />
+      <Divider sx={{ width: '60%', my: 0.5, borderImage: (theme) => theme.palette.mode === 'dark' ? 'linear-gradient(to right, transparent, rgba(0, 212, 170, 0.2), transparent) 1' : 'none' }} />
 
       {/* === Actions Section === */}
 
@@ -414,7 +417,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
       {/* Spacer */}
       <Box sx={{ flex: 1 }} />
 
-      <Divider sx={{ width: '80%', my: 0.5 }} />
+      <Divider sx={{ width: '60%', my: 0.5, borderImage: (theme) => theme.palette.mode === 'dark' ? 'linear-gradient(to right, transparent, rgba(0, 212, 170, 0.2), transparent) 1' : 'none' }} />
 
       {/* === Bottom Section === */}
 
@@ -460,7 +463,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
         {monitoringActive && appResources ? (
           <Box sx={{ mb: 2 }}>
             {/* Total App Usage */}
-            <Box sx={{ p: 1.5, bgcolor: 'primary.50', borderRadius: 1, mb: 1.5, border: '1px solid', borderColor: 'primary.200' }}>
+            <Box sx={{ p: 1.5, bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(0, 212, 170, 0.06)' : 'rgba(13, 155, 122, 0.05)', borderRadius: 1, mb: 1.5, border: '1px solid', borderColor: (theme) => theme.palette.mode === 'dark' ? 'rgba(0, 212, 170, 0.15)' : 'rgba(13, 155, 122, 0.15)' }}>
               <Typography variant="caption" color="primary.main" fontWeight="bold" sx={{ display: 'block', mb: 1 }}>
                 TOTAL APP USAGE
               </Typography>
@@ -679,7 +682,7 @@ const RightToolbar: React.FC<RightToolbarProps> = ({ visible = true }) => {
               onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
             />
             <Box>
-              <Typography variant="h6">Stingray Explorer</Typography>
+              <Typography variant="h6" sx={{ fontFamily: '"JetBrains Mono", monospace' }}>Stingray Explorer</Typography>
               <Typography variant="caption" color="text.secondary">
                 {version ? `Version ${version}` : 'Desktop Application'} | © {new Date().getFullYear()} Kartik Mandar
               </Typography>

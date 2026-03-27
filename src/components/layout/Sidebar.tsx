@@ -54,10 +54,6 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
   const [activeSubmenu, setActiveSubmenu] = useState<string | null>(null);
   const [showSubmenu, setShowSubmenu] = useState<boolean>(true);
 
-  // Scrollbar colors based on theme
-  const scrollbarThumbColor = darkMode ? 'rgba(255, 255, 255, 0.3)' : 'rgba(0, 0, 0, 0.2)';
-  const scrollbarThumbHoverColor = darkMode ? 'rgba(255, 255, 255, 0.5)' : 'rgba(0, 0, 0, 0.3)';
-
   // Notify parent of submenu state changes
   useEffect(() => {
     onSubmenuStateChange(!!activeSubmenu && showSubmenu);
@@ -184,32 +180,72 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
     ],
   };
 
+  // Active item styling
+  const getItemSx = (isActive: boolean) => ({
+    pl: 2,
+    position: 'relative' as const,
+    '&::before': isActive
+      ? {
+          content: '""',
+          position: 'absolute',
+          left: 0,
+          top: '20%',
+          bottom: '20%',
+          width: '3px',
+          borderRadius: '0 2px 2px 0',
+          backgroundColor: 'primary.main',
+          boxShadow: darkMode
+            ? '0 0 8px rgba(0, 212, 170, 0.4), 0 0 16px rgba(0, 212, 170, 0.15)'
+            : '0 0 6px rgba(13, 155, 122, 0.3)',
+        }
+      : {},
+    backgroundColor: isActive
+      ? darkMode
+        ? 'rgba(0, 212, 170, 0.08)'
+        : 'rgba(13, 155, 122, 0.08)'
+      : 'transparent',
+    '&:hover': {
+      backgroundColor: darkMode
+        ? 'rgba(0, 212, 170, 0.06)'
+        : 'rgba(13, 155, 122, 0.06)',
+    },
+  });
+
   const renderMainMenu = (): React.ReactNode => (
-    <List>
-      {menuItems.map((item) => (
-        <ListItem key={item.text} disablePadding>
-          <ListItemButton
-            onClick={() => handleMenuClick(item)}
-            selected={!item.hasSubmenu && location.pathname === item.path}
-            sx={{
-              backgroundColor:
-                !item.hasSubmenu && location.pathname === item.path
-                  ? 'rgba(94, 173, 97, 0.12)'
-                  : 'transparent',
-              borderLeft:
-                !item.hasSubmenu && location.pathname === item.path ? '4px solid' : 'none',
-              borderColor: 'primary.main',
-              '&:hover': {
-                backgroundColor: 'rgba(94, 173, 97, 0.08)',
-              },
-            }}
-          >
-            <ListItemIcon sx={{ color: 'primary.main' }}>{item.icon}</ListItemIcon>
-            <ListItemText primary={item.text} />
-            {item.hasSubmenu && <ChevronRightIcon />}
-          </ListItemButton>
-        </ListItem>
-      ))}
+    <List sx={{ py: 1 }}>
+      {menuItems.map((item) => {
+        const isActive = !item.hasSubmenu && location.pathname === item.path;
+        return (
+          <ListItem key={item.text} disablePadding>
+            <ListItemButton
+              onClick={() => handleMenuClick(item)}
+              selected={isActive}
+              sx={getItemSx(isActive)}
+            >
+              <ListItemIcon
+                sx={{
+                  color: isActive ? 'primary.main' : 'text.secondary',
+                  minWidth: 40,
+                  transition: 'color 0.2s ease',
+                  filter: isActive && darkMode ? 'drop-shadow(0 0 4px rgba(0, 212, 170, 0.3))' : 'none',
+                }}
+              >
+                {item.icon}
+              </ListItemIcon>
+              <ListItemText
+                primary={item.text}
+                primaryTypographyProps={{
+                  fontSize: '0.875rem',
+                  fontWeight: isActive ? 600 : 400,
+                }}
+              />
+              {item.hasSubmenu && (
+                <ChevronRightIcon sx={{ color: 'text.secondary', fontSize: 18 }} />
+              )}
+            </ListItemButton>
+          </ListItem>
+        );
+      })}
     </List>
   );
 
@@ -227,18 +263,38 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
         <Box
           sx={{
             p: 2,
-            borderBottom: 1,
-            borderColor: 'divider',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
+            borderBottom: '1px solid',
+            borderColor: 'divider',
+            position: 'relative',
+            '&::after': {
+              content: '""',
+              position: 'absolute',
+              bottom: 0,
+              left: 0,
+              right: 0,
+              height: '1px',
+              background: darkMode
+                ? 'linear-gradient(to right, rgba(0, 212, 170, 0.3), transparent)'
+                : 'linear-gradient(to right, rgba(13, 155, 122, 0.3), transparent)',
+            },
           }}
         >
-          <Typography variant="subtitle1" fontWeight="bold">
+          <Typography
+            variant="subtitle2"
+            sx={{
+              fontFamily: '"JetBrains Mono", monospace',
+              fontWeight: 600,
+              letterSpacing: '0.02em',
+              fontSize: '0.8rem',
+            }}
+          >
             {activeItem.text}
           </Typography>
           <IconButton size="small" onClick={() => setShowSubmenu(false)} sx={{ ml: 1 }}>
-            <CloseIcon fontSize="small" />
+            <CloseIcon sx={{ fontSize: 16 }} />
           </IconButton>
         </Box>
 
@@ -248,19 +304,21 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
           Object.entries(categories).map(([category, items]) => (
             <React.Fragment key={category}>
               <Typography
-                variant="caption"
+                variant="overline"
                 sx={{
                   display: 'block',
                   px: 2,
-                  py: 1,
-                  fontWeight: 'bold',
-                  backgroundColor: darkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)',
-                  borderBottom: '1px solid',
-                  borderColor: 'divider',
-                  mt: 1,
-                  textTransform: 'uppercase',
-                  letterSpacing: '0.5px',
-                  fontSize: '0.7rem',
+                  pt: 1.5,
+                  pb: 0.5,
+                  fontFamily: '"JetBrains Mono", monospace',
+                  fontWeight: 500,
+                  fontSize: '0.65rem',
+                  letterSpacing: '0.08em',
+                  color: 'text.secondary',
+                  borderTop: '1px solid',
+                  borderColor: darkMode
+                    ? 'rgba(148, 163, 184, 0.06)'
+                    : 'rgba(30, 41, 59, 0.06)',
                 }}
               >
                 {category}
@@ -268,60 +326,52 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
               <List dense disablePadding>
                 {activeItem.submenuItems
                   ?.filter((subItem) => items.includes(subItem.text))
-                  .map((subItem) => (
-                    <ListItem key={subItem.text} disablePadding>
-                      <ListItemButton
-                        onClick={() => navigate(subItem.path)}
-                        selected={location.pathname === subItem.path}
-                        sx={{
-                          pl: 2,
-                          backgroundColor:
-                            location.pathname === subItem.path
-                              ? 'rgba(94, 173, 97, 0.12)'
-                              : 'transparent',
-                          borderLeft:
-                            location.pathname === subItem.path ? '4px solid' : 'none',
-                          borderColor: 'primary.main',
-                          '&:hover': {
-                            backgroundColor: 'rgba(94, 173, 97, 0.08)',
-                          },
-                        }}
-                      >
-                        <ListItemText
-                          primary={subItem.text}
-                          primaryTypographyProps={{ fontSize: '0.875rem' }}
-                        />
-                      </ListItemButton>
-                    </ListItem>
-                  ))}
+                  .map((subItem) => {
+                    const isActive = location.pathname === subItem.path;
+                    return (
+                      <ListItem key={subItem.text} disablePadding>
+                        <ListItemButton
+                          onClick={() => navigate(subItem.path)}
+                          selected={isActive}
+                          sx={getItemSx(isActive)}
+                        >
+                          <ListItemText
+                            primary={subItem.text}
+                            primaryTypographyProps={{
+                              fontSize: '0.8rem',
+                              fontWeight: isActive ? 600 : 400,
+                            }}
+                          />
+                        </ListItemButton>
+                      </ListItem>
+                    );
+                  })}
               </List>
             </React.Fragment>
           ))
         ) : (
           // Flat list for other menus
-          <List dense>
-            {activeItem.submenuItems?.map((subItem) => (
-              <ListItem key={subItem.text} disablePadding>
-                <ListItemButton
-                  onClick={() => navigate(subItem.path)}
-                  selected={location.pathname === subItem.path}
-                  sx={{
-                    pl: 2,
-                    backgroundColor:
-                      location.pathname === subItem.path
-                        ? 'rgba(94, 173, 97, 0.12)'
-                        : 'transparent',
-                    borderLeft: location.pathname === subItem.path ? '4px solid' : 'none',
-                    borderColor: 'primary.main',
-                    '&:hover': {
-                      backgroundColor: 'rgba(94, 173, 97, 0.08)',
-                    },
-                  }}
-                >
-                  <ListItemText primary={subItem.text} />
-                </ListItemButton>
-              </ListItem>
-            ))}
+          <List dense sx={{ py: 0.5 }}>
+            {activeItem.submenuItems?.map((subItem) => {
+              const isActive = location.pathname === subItem.path;
+              return (
+                <ListItem key={subItem.text} disablePadding>
+                  <ListItemButton
+                    onClick={() => navigate(subItem.path)}
+                    selected={isActive}
+                    sx={getItemSx(isActive)}
+                  >
+                    <ListItemText
+                      primary={subItem.text}
+                      primaryTypographyProps={{
+                        fontSize: '0.85rem',
+                        fontWeight: isActive ? 600 : 400,
+                      }}
+                    />
+                  </ListItemButton>
+                </ListItem>
+              );
+            })}
           </List>
         )}
       </>
@@ -333,20 +383,23 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
     overflow: 'auto',
     height: '100%',
     '&::-webkit-scrollbar': {
-      width: '6px',
+      width: '4px',
       backgroundColor: 'transparent',
     },
     '&::-webkit-scrollbar-thumb': {
-      backgroundColor: scrollbarThumbColor,
-      borderRadius: '6px',
+      backgroundColor: darkMode ? 'rgba(0, 212, 170, 0.2)' : 'rgba(13, 155, 122, 0.15)',
+      borderRadius: '4px',
       '&:hover': {
-        backgroundColor: scrollbarThumbHoverColor,
+        backgroundColor: darkMode ? 'rgba(0, 212, 170, 0.35)' : 'rgba(13, 155, 122, 0.3)',
       },
     },
     '&::-webkit-scrollbar-track': {
       backgroundColor: 'transparent',
     },
   };
+
+  // Sidebar background — slightly darker than paper for depth
+  const sidebarBg = darkMode ? '#0d1220' : '#f8f9fb';
 
   return (
     <>
@@ -358,13 +411,13 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
           left: 0,
           height: 'calc(100vh - 64px)',
           overflow: 'hidden',
-          transition: 'width 225ms cubic-bezier(0.4, 0, 0.6, 1)',
+          transition: 'width 225ms cubic-bezier(0.22, 0.61, 0.36, 1)',
           display: 'flex',
           flexDirection: 'column',
           borderRight: '1px solid',
           borderColor: 'divider',
           width: open ? MAIN_DRAWER_WIDTH : 0,
-          backgroundColor: 'background.paper',
+          backgroundColor: sidebarBg,
           zIndex: (theme) => theme.zIndex.drawer,
         }}
       >
@@ -393,13 +446,13 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
           left: open ? MAIN_DRAWER_WIDTH : 0,
           height: 'calc(100vh - 64px)',
           overflow: 'hidden',
-          transition: 'all 225ms cubic-bezier(0.4, 0, 0.6, 1)',
+          transition: 'all 225ms cubic-bezier(0.22, 0.61, 0.36, 1)',
           display: 'flex',
           flexDirection: 'column',
           borderRight: '1px solid',
           borderColor: 'divider',
           width: open && !!activeSubmenu && showSubmenu ? SUB_DRAWER_WIDTH : 0,
-          backgroundColor: 'background.paper',
+          backgroundColor: darkMode ? '#101726' : '#ffffff',
           zIndex: (theme) => theme.zIndex.drawer,
         }}
       >

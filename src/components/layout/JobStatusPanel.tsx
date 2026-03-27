@@ -179,7 +179,19 @@ const JobStatusPanel: React.FC<JobStatusPanelProps> = ({ sidebarOpen }) => {
       sx={{
         borderTop: '1px solid',
         borderColor: 'divider',
-        backgroundColor: darkMode ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.02)',
+        backgroundColor: darkMode ? 'rgba(0, 212, 170, 0.02)' : 'rgba(13, 155, 122, 0.02)',
+        position: 'relative',
+        '&::before': {
+          content: '""',
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          height: '1px',
+          background: darkMode
+            ? 'linear-gradient(to right, rgba(0, 212, 170, 0.2), transparent)'
+            : 'linear-gradient(to right, rgba(13, 155, 122, 0.2), transparent)',
+        },
       }}
     >
       {/* Header */}
@@ -196,13 +208,13 @@ const JobStatusPanel: React.FC<JobStatusPanelProps> = ({ sidebarOpen }) => {
       >
         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
           <Badge badgeContent={activeCount} color="primary" max={99}>
-            <Typography variant="subtitle2" fontWeight="bold">
+            <Typography variant="subtitle2" sx={{ fontFamily: '"JetBrains Mono", monospace', fontWeight: 600, fontSize: '0.75rem' }}>
               Jobs
             </Typography>
           </Badge>
           <Tooltip title={isConnected ? 'Connected' : 'Disconnected'}>
             {isConnected ? (
-              <WifiIcon fontSize="small" color="success" sx={{ fontSize: 14 }} />
+              <WifiIcon fontSize="small" color="success" sx={{ fontSize: 14, filter: darkMode ? 'drop-shadow(0 0 4px rgba(34, 197, 94, 0.4))' : 'none' }} />
             ) : (
               <WifiOffIcon fontSize="small" color="error" sx={{ fontSize: 14 }} />
             )}
@@ -297,15 +309,6 @@ const JobStatusPanel: React.FC<JobStatusPanelProps> = ({ sidebarOpen }) => {
         </Box>
       </Collapse>
 
-      {/* CSS for spinning animation */}
-      <style>
-        {`
-          @keyframes spin {
-            from { transform: rotate(0deg); }
-            to { transform: rotate(360deg); }
-          }
-        `}
-      </style>
     </Box>
   );
 };

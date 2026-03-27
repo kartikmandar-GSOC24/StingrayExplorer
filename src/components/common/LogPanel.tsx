@@ -113,17 +113,17 @@ const LogRow: React.FC<{ log: LogEntry }> = ({ log }) => {
         gap: 1,
         py: 0.5,
         px: 1,
-        fontFamily: 'monospace',
+        fontFamily: '"JetBrains Mono", "IBM Plex Mono", monospace',
         fontSize: '0.8rem',
         '&:hover': {
-          backgroundColor: 'action.hover',
+          backgroundColor: 'rgba(0, 212, 170, 0.03)',
         },
       }}
     >
       <Typography
         variant="caption"
         sx={{
-          fontFamily: 'monospace',
+          fontFamily: '"JetBrains Mono", "IBM Plex Mono", monospace',
           color: 'text.secondary',
           minWidth: '70px',
           flexShrink: 0,
@@ -147,7 +147,7 @@ const LogRow: React.FC<{ log: LogEntry }> = ({ log }) => {
       <Typography
         variant="body2"
         sx={{
-          fontFamily: 'monospace',
+          fontFamily: '"JetBrains Mono", "IBM Plex Mono", monospace',
           color: getLevelColor(log.level),
           whiteSpace: 'pre-wrap',
           wordBreak: 'break-word',
@@ -180,7 +180,7 @@ const RawLogView: React.FC<{ logs: LogEntry[] }> = ({ logs }) => {
       sx={{
         m: 0,
         p: 1,
-        fontFamily: 'monospace',
+        fontFamily: '"JetBrains Mono", "IBM Plex Mono", monospace',
         fontSize: '0.8rem',
         lineHeight: 1.4,
         whiteSpace: 'pre-wrap',
@@ -293,6 +293,20 @@ const LogPanel: React.FC<LogPanelProps> = ({ leftOffset = 0, rightOffset = 0 }) 
         borderTop: '1px solid',
         borderColor: 'divider',
         transition: 'left 225ms ease-in-out, right 225ms ease-in-out',
+        '&::before': {
+          content: '""',
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          right: 0,
+          height: '1px',
+          background: (theme: any) =>
+            theme.palette.mode === 'dark'
+              ? 'linear-gradient(to right, #00d4aa, #3b82f6, transparent)'
+              : 'linear-gradient(to right, #0d9b7a, #2563eb, transparent)',
+          opacity: 0.4,
+          zIndex: 1,
+        },
       }}
     >
       {/* Header */}
@@ -315,7 +329,7 @@ const LogPanel: React.FC<LogPanelProps> = ({ leftOffset = 0, rightOffset = 0 }) 
       >
         <Stack direction="row" alignItems="center" spacing={1}>
           <Terminal fontSize="small" />
-          <Typography variant="subtitle2">Console</Typography>
+          <Typography variant="subtitle2" sx={{ fontFamily: '"JetBrains Mono", monospace', fontSize: '0.8rem' }}>Console</Typography>
           <Chip
             label={logs.length}
             size="small"
@@ -428,7 +442,8 @@ const LogPanel: React.FC<LogPanelProps> = ({ leftOffset = 0, rightOffset = 0 }) 
             sx={{
               flex: 1,
               overflow: 'auto',
-              backgroundColor: 'background.default',
+              backgroundColor: (theme) =>
+                theme.palette.mode === 'dark' ? '#080c16' : '#fafbfc',
               '&::-webkit-scrollbar': {
                 width: 8,
               },

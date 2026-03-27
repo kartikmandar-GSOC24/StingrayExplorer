@@ -2954,10 +2954,10 @@ const DataIngestionPage: React.FC = () => {
                                 key={index}
                                 sx={{
                                   backgroundColor: issue.status === 'pass'
-                                    ? 'rgba(46, 125, 50, 0.08)'
+                                    ? 'rgba(34, 197, 94, 0.06)'
                                     : issue.status === 'fail'
-                                      ? 'rgba(211, 47, 47, 0.08)'
-                                      : 'rgba(158, 158, 158, 0.08)'
+                                      ? 'rgba(239, 68, 68, 0.06)'
+                                      : 'rgba(148, 163, 184, 0.06)'
                                 }}
                               >
                                 <TableCell>

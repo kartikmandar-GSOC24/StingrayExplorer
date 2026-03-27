@@ -76,9 +76,27 @@ const Header: React.FC<HeaderProps> = ({
       elevation={0}
       sx={{
         zIndex: (theme) => theme.zIndex.drawer + 1,
-        backgroundColor: 'background.paper',
+        backgroundColor: (theme) =>
+          theme.palette.mode === 'dark'
+            ? 'rgba(10, 14, 26, 0.8)'
+            : 'rgba(255, 255, 255, 0.8)',
+        backdropFilter: 'blur(12px) saturate(150%)',
+        WebkitBackdropFilter: 'blur(12px) saturate(150%)',
         borderBottom: '1px solid',
         borderColor: 'divider',
+        '&::after': {
+          content: '""',
+          position: 'absolute',
+          bottom: 0,
+          left: 0,
+          right: 0,
+          height: '1px',
+          background: (theme) =>
+            theme.palette.mode === 'dark'
+              ? 'linear-gradient(to right, #00d4aa, #3b82f6, transparent)'
+              : 'linear-gradient(to right, #0d9b7a, #2563eb, transparent)',
+          opacity: 0.4,
+        },
       }}
     >
       <Toolbar>
@@ -107,7 +125,12 @@ const Header: React.FC<HeaderProps> = ({
             sx={{
               color: 'text.primary',
               fontWeight: 600,
+              fontFamily: '"JetBrains Mono", monospace',
               letterSpacing: '-0.5px',
+              textShadow: (theme) =>
+                theme.palette.mode === 'dark'
+                  ? '0 0 20px rgba(0, 212, 170, 0.15)'
+                  : 'none',
             }}
           >
             Stingray Explorer
@@ -120,6 +143,7 @@ const Header: React.FC<HeaderProps> = ({
           sx={{
             ml: 2,
             color: 'text.secondary',
+            fontStyle: 'italic',
             display: { xs: 'none', md: 'block' },
           }}
         >
@@ -141,21 +165,34 @@ const Header: React.FC<HeaderProps> = ({
                   alignItems: 'center',
                   width: 300,
                   height: 36,
-                  px: 1,
+                  px: 1.5,
                   mr: 2,
+                  backgroundColor: (theme) =>
+                    theme.palette.mode === 'dark'
+                      ? 'rgba(18, 24, 41, 0.6)'
+                      : 'rgba(240, 242, 245, 0.8)',
+                  backdropFilter: 'blur(8px)',
+                  border: '1px solid',
+                  borderColor: 'divider',
+                  transition: 'border-color 0.2s ease, box-shadow 0.2s ease',
+                  '&:focus-within': {
+                    borderColor: 'primary.main',
+                    boxShadow: (theme) =>
+                      `0 0 0 3px ${theme.palette.mode === 'dark' ? 'rgba(0, 212, 170, 0.12)' : 'rgba(13, 155, 122, 0.1)'}`,
+                  },
                 }}
-                elevation={2}
+                elevation={0}
               >
-                <SearchIcon sx={{ color: 'text.secondary', mr: 1 }} />
+                <SearchIcon sx={{ color: 'text.secondary', mr: 1, fontSize: 18 }} />
                 <InputBase
                   placeholder="Search pages, features..."
                   value={localSearchQuery}
                   onChange={(e) => setLocalSearchQuery(e.target.value)}
                   autoFocus
-                  sx={{ flex: 1, fontSize: '0.875rem' }}
+                  sx={{ flex: 1, fontSize: '0.8rem', fontFamily: '"IBM Plex Sans", sans-serif' }}
                 />
-                <IconButton size="small" onClick={handleSearchClose}>
-                  <CloseIcon fontSize="small" />
+                <IconButton size="small" onClick={handleSearchClose} sx={{ p: 0.5 }}>
+                  <CloseIcon sx={{ fontSize: 16 }} />
                 </IconButton>
               </Paper>
             </Fade>
@@ -178,8 +215,10 @@ const Header: React.FC<HeaderProps> = ({
             icon={
               <CircleIcon
                 sx={{
-                  fontSize: 12,
-                  color: isReady ? '#4caf50' : error ? '#f44336' : '#ff9800',
+                  fontSize: 10,
+                  color: isReady ? '#22c55e' : error ? '#ef4444' : '#f59e0b',
+                  animation: isReady ? 'glowPulse 3s ease-in-out infinite' : 'none',
+                  filter: isReady ? 'drop-shadow(0 0 4px rgba(34, 197, 94, 0.5))' : 'none',
                 }}
               />
             }
@@ -189,6 +228,14 @@ const Header: React.FC<HeaderProps> = ({
             color={isReady ? 'success' : error ? 'error' : 'warning'}
             sx={{
               mr: 2,
+              fontFamily: '"IBM Plex Sans", sans-serif',
+              fontSize: '0.7rem',
+              fontWeight: 500,
+              backgroundColor: (theme) =>
+                theme.palette.mode === 'dark'
+                  ? 'rgba(18, 24, 41, 0.5)'
+                  : 'rgba(240, 242, 245, 0.5)',
+              backdropFilter: 'blur(4px)',
             }}
           />
         </Tooltip>

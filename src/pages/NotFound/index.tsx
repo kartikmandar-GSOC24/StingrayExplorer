@@ -16,8 +16,21 @@ const NotFoundPage: React.FC = () => {
         minHeight: '60vh',
         textAlign: 'center',
       }}
+      className="stagger-reveal"
     >
-      <Typography variant="h1" color="primary" fontWeight="bold" sx={{ mb: 2 }}>
+      <Typography
+        variant="h1"
+        color="primary"
+        sx={{
+          fontFamily: '"JetBrains Mono", monospace',
+          fontWeight: 700,
+          mb: 2,
+          textShadow: (theme) =>
+            theme.palette.mode === 'dark'
+              ? '0 0 40px rgba(0, 212, 170, 0.2)'
+              : 'none',
+        }}
+      >
         404
       </Typography>
       <Typography variant="h5" color="text.secondary" sx={{ mb: 4 }}>

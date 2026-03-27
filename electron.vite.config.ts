@@ -11,6 +11,7 @@ export default defineConfig({
       rollupOptions: {
         input: resolve(__dirname, 'electron/main.ts'),
         output: {
+          format: 'es',
           entryFileNames: '[name].js',
         },
       },
@@ -24,6 +25,7 @@ export default defineConfig({
       rollupOptions: {
         input: resolve(__dirname, 'electron/preload.ts'),
         output: {
+          format: 'cjs',
           entryFileNames: '[name].js',
         },
       },
