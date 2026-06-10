@@ -103,7 +103,11 @@ class SpectrumService(BaseService):
 
         except Exception as e:
             return self.handle_error(
-                e, "Creating power spectrum", event_list=event_list_name, dt=dt, norm=norm
+                e,
+                "Creating power spectrum",
+                event_list=event_list_name,
+                dt=dt,
+                norm=norm,
             )
 
     def create_averaged_power_spectrum(
@@ -431,7 +435,8 @@ class SpectrumService(BaseService):
             if log:
                 rebinned = spectrum.rebin_log(rebin_factor)
             else:
-                rebinned = spectrum.rebin(rebin_factor)
+                # stingray rebin()'s positional arg is df (Hz), not a factor; use f=
+                rebinned = spectrum.rebin(f=rebin_factor)
 
             if output_name:
                 self.state.add_spectrum_data(output_name, rebinned)
@@ -442,6 +447,7 @@ class SpectrumService(BaseService):
                 "freq": rebinned.freq.tolist(),
                 "power": power_list,
                 "power_phase": phase_list,
+                "norm": getattr(rebinned, "norm", None),
                 "n_freq": len(rebinned.freq),
             }
 
@@ -464,11 +470,13 @@ class SpectrumService(BaseService):
             summaries = []
             for name, spec in spec_data:
                 spec_type = type(spec).__name__
-                summaries.append({
-                    "name": name,
-                    "type": spec_type,
-                    "n_freq": len(spec.freq) if hasattr(spec, "freq") else None,
-                })
+                summaries.append(
+                    {
+                        "name": name,
+                        "type": spec_type,
+                        "n_freq": len(spec.freq) if hasattr(spec, "freq") else None,
+                    }
+                )
 
             return self.create_result(
                 success=True,

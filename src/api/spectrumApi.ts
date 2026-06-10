@@ -10,9 +10,9 @@ export interface PowerSpectrumData {
   freq: number[];
   power: Array<number | null>;
   power_phase?: Array<number | null> | null;
-  norm: string;
+  norm?: string;
   n_freq: number;
-  df: number;
+  df?: number;
   freq_range?: [number, number];
   segment_size?: number;
   n_segments?: number;

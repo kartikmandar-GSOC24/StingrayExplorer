@@ -1,6 +1,7 @@
 import json
 
 import numpy as np
+import pytest
 
 from services.spectrum_service import SpectrumService, _finite_list
 
@@ -44,7 +45,12 @@ def test_rebin_of_stored_cross_spectrum_serializes(loaded_state):
 
 
 def test_finite_list_maps_nonfinite_to_none():
-    assert _finite_list(np.array([1.0, np.nan, np.inf, -np.inf])) == [1.0, None, None, None]
+    assert _finite_list(np.array([1.0, np.nan, np.inf, -np.inf])) == [
+        1.0,
+        None,
+        None,
+        None,
+    ]
 
 
 def test_cross_spectrum_power_is_magnitude(loaded_state):
@@ -56,6 +62,19 @@ def test_cross_spectrum_power_is_magnitude(loaded_state):
     expected_phase = np.angle(np.asarray(cs.power))
     assert np.allclose(result["data"]["power"], expected_mag)
     assert np.allclose(result["data"]["power_phase"], expected_phase)
+
+
+def test_linear_rebin_scales_df_by_factor(loaded_state):
+    svc = SpectrumService(loaded_state)
+    created = svc.create_power_spectrum("ev1", dt=0.0625, output_name="ps_lin")
+    assert created["success"], created
+    base_df = created["data"]["df"]
+    result = svc.rebin_spectrum("ps_lin", rebin_factor=2.0, log=False)
+    assert result["success"], result
+    freq = result["data"]["freq"]
+    new_df = freq[1] - freq[0]
+    assert new_df == pytest.approx(2.0 * base_df, rel=1e-6)
+    assert result["data"]["norm"] == created["data"]["norm"]
 
 
 def test_dynamical_power_spectrum_serializes(loaded_state):

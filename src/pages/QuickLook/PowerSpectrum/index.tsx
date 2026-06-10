@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Box,
@@ -40,17 +40,24 @@ const PowerSpectrumPage: React.FC = () => {
   const [rebinFactor, setRebinFactor] = useState('0.02');
   const [logRebin, setLogRebin] = useState(true);
   const [lastStoredName, setLastStoredName] = useState<string | null>(null);
+  const lastActionRef = useRef<'create' | 'rebin'>('create');
   const { result, running, error, run } = useAnalysisRunner<PowerSpectrumData>('Power Spectrum');
 
   useEffect(() => {
-    if (result?.name) setLastStoredName(result.name);
+    if (result?.name) {
+      setLastStoredName(result.name);
+    } else if (result && lastActionRef.current === 'create') {
+      setLastStoredName(null);
+    }
   }, [result]);
 
   const dtNum = parsePositiveNumber(dt);
   const rebinNum = parsePositiveNumber(rebinFactor);
   const canRun = eventList !== '' && dtNum !== null && !running;
+  const rebinValid = logRebin ? rebinNum !== null : rebinNum !== null && rebinNum > 1;
 
   const handleRun = (): void => {
+    lastActionRef.current = 'create';
     if (!dtNum) return;
     void run(() =>
       spectrumApi.createPowerSpectrum({
@@ -63,6 +70,7 @@ const PowerSpectrumPage: React.FC = () => {
   };
 
   const handleRebin = (): void => {
+    lastActionRef.current = 'rebin';
     if (!lastStoredName || !rebinNum) return;
     void run(() =>
       spectrumApi.rebinSpectrum({ name: lastStoredName, rebin_factor: rebinNum, log: logRebin })
@@ -142,18 +150,29 @@ const PowerSpectrumPage: React.FC = () => {
                   <Stack spacing={2}>
                     <Typography variant="subtitle2">Rebin '{lastStoredName}'</Typography>
                     <TextField
-                      label={logRebin ? 'Log rebin fraction f' : 'Linear rebin factor'}
+                      label={logRebin ? 'Log rebin fraction f' : 'Linear rebin factor (× df)'}
                       size="small"
                       value={rebinFactor}
                       onChange={(e) => setRebinFactor(e.target.value)}
-                      error={rebinFactor !== '' && rebinNum === null}
-                      helperText={logRebin ? 'Each bin grows by (1 + f)' : ' '}
+                      error={rebinFactor !== '' && !rebinValid}
+                      helperText={logRebin ? 'Each bin grows by (1 + f)' : 'Must be > 1'}
                     />
                     <FormControlLabel
-                      control={<Switch checked={logRebin} onChange={(e) => setLogRebin(e.target.checked)} />}
+                      control={
+                        <Switch
+                          checked={logRebin}
+                          onChange={(e) => {
+                            const checked = e.target.checked;
+                            setLogRebin(checked);
+                            if (!checked && rebinNum !== null && rebinNum <= 1) {
+                              setRebinFactor('2');
+                            }
+                          }}
+                        />
+                      }
                       label="Logarithmic"
                     />
-                    <Button variant="outlined" disabled={!rebinNum || running} onClick={handleRebin}>
+                    <Button variant="outlined" disabled={!rebinValid || running} onClick={handleRebin}>
                       Rebin
                     </Button>
                   </Stack>
