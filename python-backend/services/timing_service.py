@@ -12,6 +12,14 @@ from stingray import Bispectrum, DynamicalPowerspectrum
 from .base_service import BaseService
 
 
+def _finite_list(arr) -> list:
+    """Convert a float array to a list, replacing non-finite values with None."""
+    values = np.asarray(arr, dtype=float)
+    if np.isfinite(values).all():
+        return values.tolist()
+    return [float(v) if np.isfinite(v) else None for v in values]
+
+
 class TimingService(BaseService):
     """
     Service for timing analysis operations.
@@ -125,17 +133,18 @@ class TimingService(BaseService):
             lc = event_list.to_lc(dt=dt)
             dps = DynamicalPowerspectrum(lc, segment_size=segment_size, norm="leahy")
 
-            # Calculate integrated power in each frequency band
+            # Calculate integrated power in each frequency band.
+            # dps.dyn_ps has shape (n_freq, n_time); mask along axis 0 (freq).
             power_colors = {}
             for band_name, (f_min, f_max) in freq_ranges.items():
                 mask = (dps.freq >= f_min) & (dps.freq < f_max)
-                integrated_power = dps.dyn_ps[:, mask].mean(axis=1)
-                power_colors[band_name] = integrated_power.tolist()
+                integrated_power = dps.dyn_ps[mask, :].mean(axis=0)
+                power_colors[band_name] = _finite_list(integrated_power)
 
             result_data = {
                 "name": output_name,
                 "power_colors": power_colors,
-                "time": dps.time.tolist(),
+                "time": dps.time.astype(float).tolist(),
                 "freq_ranges": freq_ranges,
             }
 
@@ -212,20 +221,30 @@ class TimingService(BaseService):
                 norm="leahy",
             )
 
-            # Calculate time lags
-            freq = cs.freq
-            time_lags = np.angle(cs.unnorm_power) / (2 * np.pi * freq)
+            # Stingray's time_lag() returns (lag, lag_err) for averaged spectra.
+            lag_result = cs.time_lag()
+            if isinstance(lag_result, tuple):
+                time_lags, time_lags_err = lag_result
+            else:
+                time_lags, time_lags_err = lag_result, None
 
-            # Filter by frequency range if provided
+            freq = np.asarray(cs.freq, dtype=float)
+            time_lags = np.real(np.asarray(time_lags))
+            if time_lags_err is not None:
+                time_lags_err = np.real(np.asarray(time_lags_err))
+
             if freq_range:
                 mask = (freq >= freq_range[0]) & (freq <= freq_range[1])
                 freq = freq[mask]
                 time_lags = time_lags[mask]
+                if time_lags_err is not None:
+                    time_lags_err = time_lags_err[mask]
 
             result_data = {
                 "name": output_name,
                 "freq": freq.tolist(),
-                "time_lags": time_lags.tolist(),
+                "time_lags": _finite_list(time_lags),
+                "time_lags_err": _finite_list(time_lags_err) if time_lags_err is not None else None,
                 "freq_range": freq_range,
             }
 
@@ -301,13 +320,24 @@ class TimingService(BaseService):
                 norm="leahy",
             )
 
-            # Calculate coherence
-            coherence = np.abs(cs.unnorm_power) ** 2
+            # Stingray's coherence() returns (coherence, uncertainty) for
+            # averaged cross spectra (Vaughan & Nowak 1997).
+            coh_result = cs.coherence()
+            if isinstance(coh_result, tuple):
+                coherence_vals, coherence_err = coh_result
+            else:
+                coherence_vals, coherence_err = coh_result, None
 
+            coherence_vals = np.real(np.asarray(coherence_vals))
             result_data = {
                 "name": output_name,
                 "freq": cs.freq.tolist(),
-                "coherence": coherence.tolist(),
+                "coherence": _finite_list(coherence_vals),
+                "coherence_err": _finite_list(np.real(np.asarray(coherence_err)))
+                if coherence_err is not None
+                else None,
+                "segment_size": segment_size,
+                "n_segments": int(cs.m) if hasattr(cs, "m") else None,
             }
 
             if output_name:
