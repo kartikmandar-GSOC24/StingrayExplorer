@@ -21,7 +21,7 @@ import PlotlyChart from '@/components/plots/PlotlyChart';
 import EventListSelector from '@/components/analysis/EventListSelector';
 import { useAnalysisRunner } from '@/hooks/useAnalysisRunner';
 import { timingApi, TimeLagsData } from '@/api/timingApi';
-import { parsePositiveNumber, parseNumber } from '@/utils/numbers';
+import { parsePositiveNumber } from '@/utils/numbers';
 
 const TimeLagsPage: React.FC = () => {
   const [eventList1, setEventList1] = useState('');
@@ -35,9 +35,25 @@ const TimeLagsPage: React.FC = () => {
 
   const dtNum = parsePositiveNumber(dt);
   const segNum = parsePositiveNumber(segmentSize);
-  const fMin = parseNumber(freqMin);
-  const fMax = parseNumber(freqMax);
-  const canRun = eventList1 !== '' && eventList2 !== '' && dtNum !== null && segNum !== null && !running;
+  const fMin = parsePositiveNumber(freqMin);
+  const fMax = parsePositiveNumber(freqMax);
+  const freqRangePartial = (fMin !== null) !== (fMax !== null);
+  const freqRangeInverted = fMin !== null && fMax !== null && fMax <= fMin;
+  const freqRangeValid = !freqRangePartial && !freqRangeInverted;
+  const canRun =
+    eventList1 !== '' &&
+    eventList2 !== '' &&
+    dtNum !== null &&
+    segNum !== null &&
+    freqRangeValid &&
+    !running;
+
+  const freqHelperText = (raw: string, parsed: number | null): string => {
+    if (raw !== '' && parsed === null) return 'Must be a positive number';
+    if (freqRangePartial) return 'Fill both or leave both blank';
+    if (freqRangeInverted) return 'f max must be > f min';
+    return ' ';
+  };
 
   const handleRun = (): void => {
     if (!dtNum || !segNum) return;
@@ -107,12 +123,16 @@ const TimeLagsPage: React.FC = () => {
                     size="small"
                     value={freqMin}
                     onChange={(e) => setFreqMin(e.target.value)}
+                    error={(freqMin !== '' && fMin === null) || freqRangePartial || freqRangeInverted}
+                    helperText={freqHelperText(freqMin, fMin)}
                   />
                   <TextField
                     label="f max (Hz)"
                     size="small"
                     value={freqMax}
                     onChange={(e) => setFreqMax(e.target.value)}
+                    error={(freqMax !== '' && fMax === null) || freqRangePartial || freqRangeInverted}
+                    helperText={freqHelperText(freqMax, fMax)}
                   />
                 </Box>
                 <Button
