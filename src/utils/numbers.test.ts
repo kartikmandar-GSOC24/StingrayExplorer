@@ -12,6 +12,7 @@ describe('parsePositiveNumber', () => {
     expect(parsePositiveNumber('-1')).toBeNull();
     expect(parsePositiveNumber('abc')).toBeNull();
     expect(parsePositiveNumber('')).toBeNull();
+    expect(parsePositiveNumber('1e999')).toBeNull();
   });
 });
 
@@ -25,5 +26,6 @@ describe('parseNumber', () => {
     expect(parseNumber('1e999')).toBeNull();
     expect(parseNumber('x')).toBeNull();
     expect(parseNumber('')).toBeNull();
+    expect(parseNumber('   ')).toBeNull();
   });
 });
