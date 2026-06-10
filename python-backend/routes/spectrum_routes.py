@@ -2,6 +2,7 @@
 API routes for spectrum operations.
 """
 
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Request
@@ -75,7 +76,8 @@ async def create_power_spectrum(
     service: SpectrumService = Depends(get_spectrum_service),
 ):
     """Create a power spectrum from an EventList."""
-    return service.create_power_spectrum(
+    return await asyncio.to_thread(
+        service.create_power_spectrum,
         event_list_name=request.event_list_name,
         dt=request.dt,
         norm=request.norm,
@@ -89,7 +91,8 @@ async def create_averaged_power_spectrum(
     service: SpectrumService = Depends(get_spectrum_service),
 ):
     """Create an averaged power spectrum from an EventList."""
-    return service.create_averaged_power_spectrum(
+    return await asyncio.to_thread(
+        service.create_averaged_power_spectrum,
         event_list_name=request.event_list_name,
         dt=request.dt,
         segment_size=request.segment_size,
@@ -104,7 +107,8 @@ async def create_cross_spectrum(
     service: SpectrumService = Depends(get_spectrum_service),
 ):
     """Create a cross spectrum from two EventLists."""
-    return service.create_cross_spectrum(
+    return await asyncio.to_thread(
+        service.create_cross_spectrum,
         event_list_1_name=request.event_list_1_name,
         event_list_2_name=request.event_list_2_name,
         dt=request.dt,
@@ -119,7 +123,8 @@ async def create_averaged_cross_spectrum(
     service: SpectrumService = Depends(get_spectrum_service),
 ):
     """Create an averaged cross spectrum from two EventLists."""
-    return service.create_averaged_cross_spectrum(
+    return await asyncio.to_thread(
+        service.create_averaged_cross_spectrum,
         event_list_1_name=request.event_list_1_name,
         event_list_2_name=request.event_list_2_name,
         dt=request.dt,
@@ -135,7 +140,8 @@ async def create_dynamical_power_spectrum(
     service: SpectrumService = Depends(get_spectrum_service),
 ):
     """Create a dynamical power spectrum from an EventList."""
-    return service.create_dynamical_power_spectrum(
+    return await asyncio.to_thread(
+        service.create_dynamical_power_spectrum,
         event_list_name=request.event_list_name,
         dt=request.dt,
         segment_size=request.segment_size,
@@ -150,7 +156,8 @@ async def rebin_spectrum(
     service: SpectrumService = Depends(get_spectrum_service),
 ):
     """Rebin a spectrum."""
-    return service.rebin_spectrum(
+    return await asyncio.to_thread(
+        service.rebin_spectrum,
         name=request.name,
         rebin_factor=request.rebin_factor,
         log=request.log,
@@ -163,7 +170,7 @@ async def list_spectra(
     service: SpectrumService = Depends(get_spectrum_service),
 ):
     """List all loaded spectra."""
-    return service.list_spectra()
+    return await asyncio.to_thread(service.list_spectra)
 
 
 @router.delete("/{name}")
@@ -172,4 +179,4 @@ async def delete_spectrum(
     service: SpectrumService = Depends(get_spectrum_service),
 ):
     """Delete a spectrum from state."""
-    return service.delete_spectrum(name)
+    return await asyncio.to_thread(service.delete_spectrum, name)

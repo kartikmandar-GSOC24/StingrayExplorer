@@ -2,6 +2,7 @@
 API routes for timing analysis operations.
 """
 
+import asyncio
 from typing import Dict, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Request
@@ -62,7 +63,8 @@ async def create_bispectrum(
     service: TimingService = Depends(get_timing_service),
 ):
     """Create a bispectrum from an EventList."""
-    return service.create_bispectrum(
+    return await asyncio.to_thread(
+        service.create_bispectrum,
         event_list_name=request.event_list_name,
         dt=request.dt,
         maxlag=request.maxlag,
@@ -78,7 +80,8 @@ async def calculate_power_colors(
     service: TimingService = Depends(get_timing_service),
 ):
     """Calculate power colors from frequency bands."""
-    return service.calculate_power_colors(
+    return await asyncio.to_thread(
+        service.calculate_power_colors,
         event_list_name=request.event_list_name,
         dt=request.dt,
         segment_size=request.segment_size,
@@ -93,7 +96,8 @@ async def calculate_time_lags(
     service: TimingService = Depends(get_timing_service),
 ):
     """Calculate time lags between two event lists."""
-    return service.calculate_time_lags(
+    return await asyncio.to_thread(
+        service.calculate_time_lags,
         event_list_1_name=request.event_list_1_name,
         event_list_2_name=request.event_list_2_name,
         dt=request.dt,
@@ -109,7 +113,8 @@ async def calculate_coherence(
     service: TimingService = Depends(get_timing_service),
 ):
     """Calculate coherence between two event lists."""
-    return service.calculate_coherence(
+    return await asyncio.to_thread(
+        service.calculate_coherence,
         event_list_1_name=request.event_list_1_name,
         event_list_2_name=request.event_list_2_name,
         dt=request.dt,

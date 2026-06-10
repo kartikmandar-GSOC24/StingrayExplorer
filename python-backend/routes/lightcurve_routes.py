@@ -2,6 +2,7 @@
 API routes for Lightcurve operations.
 """
 
+import asyncio
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -50,7 +51,8 @@ async def create_lightcurve_from_event_list(
     service: LightcurveService = Depends(get_lightcurve_service),
 ):
     """Create a Lightcurve from an EventList."""
-    return service.create_lightcurve_from_event_list(
+    return await asyncio.to_thread(
+        service.create_lightcurve_from_event_list,
         event_list_name=request.event_list_name,
         dt=request.dt,
         output_name=request.output_name,
@@ -65,7 +67,8 @@ async def create_lightcurve_from_arrays(
     service: LightcurveService = Depends(get_lightcurve_service),
 ):
     """Create a Lightcurve from time and count arrays."""
-    return service.create_lightcurve_from_arrays(
+    return await asyncio.to_thread(
+        service.create_lightcurve_from_arrays,
         times=request.times,
         counts=request.counts,
         dt=request.dt,
@@ -79,7 +82,8 @@ async def rebin_lightcurve(
     service: LightcurveService = Depends(get_lightcurve_service),
 ):
     """Rebin a lightcurve."""
-    return service.rebin_lightcurve(
+    return await asyncio.to_thread(
+        service.rebin_lightcurve,
         name=request.name,
         rebin_factor=request.rebin_factor,
         output_name=request.output_name,
@@ -94,7 +98,9 @@ async def get_lightcurve_data(
     service: LightcurveService = Depends(get_lightcurve_service),
 ):
     """Get lightcurve data for plotting."""
-    return service.get_lightcurve_data(name, max_points=max_points)
+    return await asyncio.to_thread(
+        service.get_lightcurve_data, name, max_points=max_points
+    )
 
 
 @router.get("/")
@@ -102,7 +108,7 @@ async def list_lightcurves(
     service: LightcurveService = Depends(get_lightcurve_service),
 ):
     """List all loaded lightcurves."""
-    return service.list_lightcurves()
+    return await asyncio.to_thread(service.list_lightcurves)
 
 
 @router.delete("/{name}")
@@ -111,4 +117,4 @@ async def delete_lightcurve(
     service: LightcurveService = Depends(get_lightcurve_service),
 ):
     """Delete a lightcurve from state."""
-    return service.delete_lightcurve(name)
+    return await asyncio.to_thread(service.delete_lightcurve, name)
