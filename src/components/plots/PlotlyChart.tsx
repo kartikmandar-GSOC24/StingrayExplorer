@@ -11,6 +11,12 @@ export interface PlotlyChartProps {
   height?: number | string;
 }
 
+const PLOT_CONFIG: Partial<Config> = {
+  responsive: true,
+  displaylogo: false,
+  modeBarButtonsToRemove: ['lasso2d', 'select2d', 'autoScale2d'],
+};
+
 const PlotlyChart: React.FC<PlotlyChartProps> = ({ data, layout = {}, height = 440 }) => {
   const theme = useTheme();
   const isDark = theme.palette.mode === 'dark';
@@ -32,12 +38,6 @@ const PlotlyChart: React.FC<PlotlyChartProps> = ({ data, layout = {}, height = 4
     yaxis: { gridcolor: gridColor, zeroline: false, ...layout.yaxis },
   };
 
-  const config: Partial<Config> = {
-    responsive: true,
-    displaylogo: false,
-    modeBarButtonsToRemove: ['lasso2d', 'select2d', 'autoScale2d'],
-  };
-
   return (
     <Suspense
       fallback={
@@ -49,7 +49,7 @@ const PlotlyChart: React.FC<PlotlyChartProps> = ({ data, layout = {}, height = 4
       <Plot
         data={data}
         layout={mergedLayout}
-        config={config}
+        config={PLOT_CONFIG}
         useResizeHandler
         style={{ width: '100%', height }}
       />

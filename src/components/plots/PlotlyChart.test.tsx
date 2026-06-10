@@ -7,6 +7,8 @@ vi.mock('react-plotly.js', () => ({
       data-testid="plotly-mock"
       data-traces={data.length}
       data-xtype={(layout.xaxis as { type?: string })?.type ?? 'linear'}
+      data-ytype={(layout.yaxis as { type?: string })?.type ?? 'linear'}
+      data-xgrid={(layout.xaxis as { gridcolor?: string })?.gridcolor ?? ''}
     />
   ),
 }));
@@ -18,11 +20,13 @@ describe('PlotlyChart', () => {
     render(
       <PlotlyChart
         data={[{ x: [1, 2], y: [3, 4], type: 'scatter' }]}
-        layout={{ xaxis: { type: 'log' } }}
+        layout={{ xaxis: { type: 'log' }, yaxis: { type: 'log' } }}
       />
     );
     await waitFor(() => expect(screen.getByTestId('plotly-mock')).toBeInTheDocument());
     expect(screen.getByTestId('plotly-mock').dataset.traces).toBe('1');
     expect(screen.getByTestId('plotly-mock').dataset.xtype).toBe('log');
+    expect(screen.getByTestId('plotly-mock').dataset.ytype).toBe('log');
+    expect(screen.getByTestId('plotly-mock').dataset.xgrid).not.toBe('');
   });
 });
