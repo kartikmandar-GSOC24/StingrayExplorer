@@ -26,7 +26,7 @@ export function useAnalysisRunner<T>(label: string) {
       setState((s) => ({ ...s, running: true, error: null }));
       try {
         const res = await call();
-        if (res.success && res.data !== null) {
+        if (res.success && res.data != null) {
           setState({ result: res.data, running: false, error: null });
           addNotification({ type: 'success', title: label, message: res.message || 'Done' });
         } else {

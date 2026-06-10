@@ -49,6 +49,24 @@ describe('useAnalysisRunner', () => {
     expect(useUIStore.getState().notifications[0].type).toBe('error');
   });
 
+  it('reset clears result, error, and running', async () => {
+    const { result } = renderHook(() => useAnalysisRunner<{ v: number }>('Test Op'));
+    await act(async () => {
+      await result.current.run(async () => ({
+        success: true,
+        data: { v: 7 },
+        message: '',
+        error: null,
+      }));
+    });
+    act(() => {
+      result.current.reset();
+    });
+    expect(result.current.result).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(result.current.running).toBe(false);
+  });
+
   it('captures thrown errors (network failures)', async () => {
     const { result } = renderHook(() => useAnalysisRunner('Test Op'));
     await act(async () => {
