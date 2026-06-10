@@ -29,12 +29,14 @@ def _power_to_lists(power) -> tuple:
         mag = np.abs(arr)
         phase = np.angle(arr)
         return _finite_list(mag), _finite_list(phase)
-    return _finite_list(arr.astype(float)), None
+    return _finite_list(arr), None
 
 
 def _finite_list(arr) -> list:
     """Convert a float array to a list, replacing non-finite values with None."""
     values = np.asarray(arr, dtype=float)
+    if np.isfinite(values).all():
+        return values.tolist()
     return [float(v) if np.isfinite(v) else None for v in values]
 
 
@@ -373,8 +375,8 @@ class SpectrumService(BaseService):
             dps_data = {
                 "name": output_name,
                 "freq": dps.freq.tolist(),
-                "time": dps.time.tolist(),
-                "dyn_ps": dps.dyn_ps.tolist(),
+                "time": dps.time.astype(float).tolist(),
+                "dyn_ps": [_finite_list(row) for row in dps.dyn_ps],
                 "norm": norm,
                 "segment_size": segment_size,
                 "shape": list(dps.dyn_ps.shape),
