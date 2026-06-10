@@ -97,3 +97,16 @@ def test_tiny_segment_size_rejected_with_readable_message(loaded_state):
     result = svc.create_averaged_power_spectrum("ev1", dt=0.0625, segment_size=0.125)
     assert not result["success"]
     assert "3x dt" in result["message"]
+
+
+def test_disjoint_event_lists_rejected_readably(loaded_state):
+    import numpy as np
+    from stingray import EventList
+
+    rng = np.random.default_rng(7)
+    far = np.sort(rng.uniform(1000.0, 1064.0, 5000))
+    loaded_state.add_event_data("ev_far", EventList(time=far, gti=[[1000.0, 1064.0]]))
+    svc = SpectrumService(loaded_state)
+    result = svc.create_cross_spectrum("ev1", "ev_far", dt=0.0625)
+    assert not result["success"]
+    assert "no overlapping time range" in result["message"]

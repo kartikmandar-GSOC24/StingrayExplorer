@@ -110,6 +110,18 @@ def test_coherence_of_independent_signals_is_low(loaded_state):
     assert np.median(coh) < 0.5  # measured ~0.1 for independent fixtures
 
 
+def test_disjoint_event_lists_rejected_for_coherence(loaded_state):
+    rng = np.random.default_rng(8)
+    far = np.sort(rng.uniform(1000.0, 1064.0, 5000))
+    from stingray import EventList
+
+    loaded_state.add_event_data("ev_far", EventList(time=far, gti=[[1000.0, 1064.0]]))
+    svc = TimingService(loaded_state)
+    result = svc.calculate_coherence("ev1", "ev_far", dt=0.0625, segment_size=8.0)
+    assert not result["success"]
+    assert "no overlapping time range" in result["message"]
+
+
 def test_time_lag_sign_convention_for_shifted_signal(loaded_state):
     # Pin the sign convention the UI will document: ev_shifted = ev1 delayed by 0.1 s.
     from stingray import EventList

@@ -33,6 +33,19 @@ def _segment_size_error(segment_size: float, dt: float) -> Optional[str]:
     return None
 
 
+def _overlap_error(events1, events2) -> Optional[str]:
+    """Readable rejection when two event lists share no time overlap."""
+    start = max(float(events1.time[0]), float(events2.time[0]))
+    stop = min(float(events1.time[-1]), float(events2.time[-1]))
+    if stop <= start:
+        return (
+            "the two event lists have no overlapping time range "
+            f"({events1.time[0]:.1f}-{events1.time[-1]:.1f}s vs "
+            f"{events2.time[0]:.1f}-{events2.time[-1]:.1f}s)"
+        )
+    return None
+
+
 class TimingService(BaseService):
     """
     Service for timing analysis operations.
@@ -236,6 +249,12 @@ class TimingService(BaseService):
             event_list_1 = self.state.get_event_data(event_list_1_name)
             event_list_2 = self.state.get_event_data(event_list_2_name)
 
+            overlap_error = _overlap_error(event_list_1, event_list_2)
+            if overlap_error:
+                return self.create_result(
+                    success=False, data=None, message=overlap_error, error=None
+                )
+
             lc1 = event_list_1.to_lc(dt=dt)
             lc2 = event_list_2.to_lc(dt=dt)
 
@@ -347,6 +366,12 @@ class TimingService(BaseService):
 
             event_list_1 = self.state.get_event_data(event_list_1_name)
             event_list_2 = self.state.get_event_data(event_list_2_name)
+
+            overlap_error = _overlap_error(event_list_1, event_list_2)
+            if overlap_error:
+                return self.create_result(
+                    success=False, data=None, message=overlap_error, error=None
+                )
 
             lc1 = event_list_1.to_lc(dt=dt)
             lc2 = event_list_2.to_lc(dt=dt)
