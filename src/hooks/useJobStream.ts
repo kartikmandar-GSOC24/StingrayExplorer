@@ -9,10 +9,12 @@
  */
 
 import { useEffect, useRef, useCallback } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { useJobStore } from '@/store/jobStore';
 import { useUIStore, NotificationType } from '@/store/uiStore';
 import { useBackendContext } from '@/App';
 import { jobApi } from '@/api/jobApi';
+import { EVENT_LISTS_QUERY_KEY } from '@/hooks/useEventLists';
 import type { Job, JobStreamEvent } from '@/types/job';
 
 /**
@@ -170,6 +172,7 @@ export function useJobStream(): void {
     reconnectAttempts,
   } = useJobStore();
   const addNotification = useUIStore((state) => state.addNotification);
+  const queryClient = useQueryClient();
 
   // Track if we should be connected
   const shouldConnectRef = useRef(false);
@@ -210,6 +213,12 @@ export function useJobStream(): void {
     }
 
     if (event.type === 'job_completed') {
+      // All job types load event lists, so refresh any mounted event list
+      // queries (e.g. analysis page selectors). Kept inside the
+      // notifiedJobsRef dedup guard so SSE reconnect replays don't
+      // re-invalidate for jobs we've already processed.
+      void queryClient.invalidateQueries({ queryKey: EVENT_LISTS_QUERY_KEY });
+
       const message = buildCompletionMessage(job);
       addNotification({
         type: 'success',
@@ -228,7 +237,7 @@ export function useJobStream(): void {
         message: job.error || `Failed to load: ${job.display_name}`,
       });
     }
-  }, [addNotification]);
+  }, [addNotification, queryClient]);
 
   const connect = useCallback(async () => {
     if (!backendReady || !port) {

@@ -24,18 +24,40 @@ interface EventListSelectorProps {
 /** Dropdown of event lists currently loaded in the backend. */
 const EventListSelector: React.FC<EventListSelectorProps> = ({ label, value, onChange }) => {
   const { data, isLoading, isError, error, refetch, isFetching } = useEventLists();
+  const labelId = `event-list-selector-${React.useId()}`;
+
+  // Auto-clear a selection that no longer exists in the list (deleted
+  // elsewhere or backend restart) so consumers never submit stale names.
+  React.useEffect(() => {
+    if (
+      !isLoading &&
+      !isFetching &&
+      value !== '' &&
+      data !== undefined &&
+      !data.some((ev) => ev.name === value)
+    ) {
+      onChange('');
+    }
+  }, [data, isLoading, isFetching, value, onChange]);
 
   const refreshButton = (
     <Tooltip title="Refresh list">
       <span>
-        <IconButton size="small" onClick={() => refetch()} disabled={isFetching}>
+        <IconButton
+          size="small"
+          aria-label="Refresh event lists"
+          onClick={() => refetch()}
+          disabled={isFetching}
+        >
           {isFetching ? <CircularProgress size={16} /> : <RefreshIcon fontSize="small" />}
         </IconButton>
       </span>
     </Tooltip>
   );
 
-  if (isError) {
+  // Only take over the UI with an error when there is no usable (stale) data;
+  // a failed background refetch keeps the populated dropdown rendered.
+  if (isError && data === undefined) {
     return (
       <Alert severity="error" action={refreshButton}>
         Failed to load event lists: {error instanceof Error ? error.message : 'unknown error'}
@@ -54,8 +76,6 @@ const EventListSelector: React.FC<EventListSelectorProps> = ({ label, value, onC
       </Alert>
     );
   }
-
-  const labelId = `event-list-selector-${label.replace(/\s+/g, '-').toLowerCase()}`;
 
   return (
     <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>

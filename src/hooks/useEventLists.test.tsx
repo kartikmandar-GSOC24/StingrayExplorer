@@ -10,11 +10,15 @@ vi.mock('@/api/dataApi', () => ({
 
 import { useEventLists } from './useEventLists';
 
-const wrapper = ({ children }: { children: React.ReactNode }): React.ReactElement => {
+/** Mint a fresh QueryClient per test, outside the wrapper render path. */
+const createWrapper = (): React.FC<{ children: React.ReactNode }> => {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+  const Wrapper: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+  return Wrapper;
 };
 
 describe('useEventLists', () => {
@@ -27,14 +31,14 @@ describe('useEventLists', () => {
       message: '',
       error: null,
     });
-    const { result } = renderHook(() => useEventLists(), { wrapper });
+    const { result } = renderHook(() => useEventLists(), { wrapper: createWrapper() });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data?.[0].name).toBe('ev1');
   });
 
   it('surfaces a success:false response as a query error', async () => {
     listEventLists.mockResolvedValue({ success: false, data: null, message: 'boom', error: 'boom' });
-    const { result } = renderHook(() => useEventLists(), { wrapper });
+    const { result } = renderHook(() => useEventLists(), { wrapper: createWrapper() });
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect((result.current.error as Error).message).toBe('boom');
   });
