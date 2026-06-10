@@ -31,6 +31,7 @@ import { parsePositiveNumber } from '@/utils/numbers';
 
 const SCALE_OPTIONS = ['biased', 'unbiased'];
 const WINDOW_OPTIONS = ['uniform', 'parzen', 'hamming', 'hanning', 'triangular', 'welch', 'blackmann', 'flat-top'];
+const MAXLAG_CAP = 500;
 
 const BispectrumPage: React.FC = () => {
   const [eventList, setEventList] = useState('');
@@ -45,15 +46,17 @@ const BispectrumPage: React.FC = () => {
 
   const dtNum = parsePositiveNumber(dt);
   const maxlagNum = parsePositiveNumber(maxlag);
-  const canRun = eventList !== '' && dtNum !== null && maxlagNum !== null && !running;
+  const maxlagInt = maxlagNum === null ? null : Math.round(maxlagNum);
+  const maxlagValid = maxlagInt !== null && maxlagInt >= 1 && maxlagInt <= MAXLAG_CAP;
+  const canRun = eventList !== '' && dtNum !== null && maxlagValid && !running;
 
   const handleRun = (): void => {
-    if (!dtNum || !maxlagNum) return;
+    if (!dtNum || !maxlagInt || !maxlagValid) return;
     void run(() =>
       timingApi.createBispectrum({
         event_list_name: eventList,
         dt: dtNum,
-        maxlag: Math.round(maxlagNum),
+        maxlag: maxlagInt,
         scale,
         window: windowFn,
         output_name: outputName.trim() || undefined,
@@ -118,8 +121,12 @@ const BispectrumPage: React.FC = () => {
                   size="small"
                   value={maxlag}
                   onChange={(e) => setMaxlag(e.target.value)}
-                  error={maxlag !== '' && maxlagNum === null}
-                  helperText="Bispectrum size is (2·maxlag+1)²; keep ≤ 100"
+                  error={maxlag !== '' && !maxlagValid}
+                  helperText={
+                    maxlag !== '' && !maxlagValid
+                      ? 'Integer between 1 and 500'
+                      : 'Bispectrum size is (2·maxlag+1)²; keep ≤ 100'
+                  }
                 />
                 <FormControl size="small">
                   <InputLabel id="bs-scale-label">Scale</InputLabel>

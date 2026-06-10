@@ -84,6 +84,7 @@ def test_bispectrum_serializes(loaded_state):
     result = svc.create_bispectrum("ev1", dt=0.25, maxlag=10)
     assert result["success"], result
     json.dumps(result, allow_nan=False)
+    assert "cum3" not in result["data"]
 
 
 def test_time_lag_of_identical_signals_is_zero(loaded_state):

@@ -101,7 +101,8 @@ class TimingService(BaseService):
                 "lags": bs.lags.tolist(),
                 "bispec_mag": bs.bispec_mag.tolist(),
                 "bispec_phase": bs.bispec_phase.tolist(),
-                "cum3": bs.cum3.tolist(),
+                # cum3 omitted from the payload — large and unused by the UI;
+                # recompute server-side if ever needed.
                 "maxlag": maxlag,
                 "scale": scale,
                 "window": window,
