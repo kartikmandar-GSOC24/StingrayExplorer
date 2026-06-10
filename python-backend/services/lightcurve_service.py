@@ -7,7 +7,7 @@ Handles creation and manipulation of lightcurves.
 from typing import Any, Dict, List, Optional
 
 import numpy as np
-from stingray import EventList, Lightcurve
+from stingray import Lightcurve
 
 from .base_service import BaseService
 
@@ -17,9 +17,12 @@ DEFAULT_MAX_PLOT_POINTS = 200_000
 
 
 def _decimate_for_plot(time, counts, max_points):
-    """Stride-decimate arrays for display. Returns (time, counts, stride)."""
+    """Stride-decimate arrays for display. Returns (time, counts, stride).
+
+    max_points: Cap on points in the JSON payload; None or 0 sends full resolution.
+    """
     n = len(time)
-    if not max_points or n <= max_points:
+    if not max_points or max_points < 0 or n <= max_points:
         return time, counts, 1
     stride = int(np.ceil(n / max_points))
     return time[::stride], counts[::stride], stride
@@ -48,6 +51,7 @@ class LightcurveService(BaseService):
             dt: Time binning in seconds
             output_name: Name to save the lightcurve as
             gti: Optional Good Time Intervals
+            max_points: Cap on points in the JSON payload; None or 0 sends full resolution.
 
         Returns:
             Result dictionary with lightcurve data
@@ -159,6 +163,7 @@ class LightcurveService(BaseService):
             name: Name of the lightcurve to rebin
             rebin_factor: Rebinning factor
             output_name: Name for the rebinned lightcurve
+            max_points: Cap on points in the JSON payload; None or 0 sends full resolution.
 
         Returns:
             Result dictionary with rebinned lightcurve data
@@ -209,6 +214,7 @@ class LightcurveService(BaseService):
 
         Args:
             name: Name of the lightcurve
+            max_points: Cap on points in the JSON payload; None or 0 sends full resolution.
 
         Returns:
             Result dictionary with lightcurve data

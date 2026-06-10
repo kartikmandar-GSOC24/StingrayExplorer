@@ -38,3 +38,17 @@ def test_get_lightcurve_data_decimates(loaded_state):
     json.dumps(result, allow_nan=False)
     assert len(result["data"]["time"]) <= 1000
     assert result["data"]["plot_stride"] == 64
+
+
+def test_stats_use_full_resolution_and_zero_disables_decimation(loaded_state):
+    svc = LightcurveService(loaded_state)
+    decimated = svc.create_lightcurve_from_event_list(
+        "ev1", dt=0.001, output_name="lc_stats_a", max_points=1000
+    )
+    full = svc.get_lightcurve_data("lc_stats_a", max_points=0)
+    assert full["data"]["plot_stride"] == 1
+    assert len(full["data"]["time"]) == full["data"]["n_bins"]
+    # count_rate_mean must come from the FULL arrays, not the decimated payload
+    assert decimated["data"]["count_rate_mean"] == (
+        sum(full["data"]["counts"]) / (full["data"]["n_bins"] * full["data"]["dt"])
+    )

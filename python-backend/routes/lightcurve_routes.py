@@ -4,10 +4,10 @@ API routes for Lightcurve operations.
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BaseModel, Field
 
-from services.lightcurve_service import LightcurveService
+from services.lightcurve_service import DEFAULT_MAX_PLOT_POINTS, LightcurveService
 
 router = APIRouter()
 
@@ -26,7 +26,7 @@ class CreateLightcurveFromEventListRequest(BaseModel):
     dt: float
     output_name: str
     gti: Optional[List[List[float]]] = None
-    max_points: Optional[int] = 200000
+    max_points: Optional[int] = Field(default=DEFAULT_MAX_PLOT_POINTS, ge=0)
 
 
 class CreateLightcurveFromArraysRequest(BaseModel):
@@ -40,7 +40,7 @@ class RebinLightcurveRequest(BaseModel):
     name: str
     rebin_factor: float
     output_name: str
-    max_points: Optional[int] = 200000
+    max_points: Optional[int] = Field(default=DEFAULT_MAX_PLOT_POINTS, ge=0)
 
 
 # Routes
@@ -90,7 +90,7 @@ async def rebin_lightcurve(
 @router.get("/{name}")
 async def get_lightcurve_data(
     name: str,
-    max_points: int = 200000,
+    max_points: int = Query(default=DEFAULT_MAX_PLOT_POINTS, ge=0),
     service: LightcurveService = Depends(get_lightcurve_service),
 ):
     """Get lightcurve data for plotting."""
