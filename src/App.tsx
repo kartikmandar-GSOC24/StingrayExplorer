@@ -31,6 +31,7 @@ import CrossSpectrumPage from '@/pages/QuickLook/CrossSpectrum';
 import AvgCrossSpectrumPage from '@/pages/QuickLook/AvgCrossSpectrum';
 import DynamicalPowerSpectrumPage from '@/pages/QuickLook/DynamicalPowerSpectrum';
 import CoherencePage from '@/pages/QuickLook/Coherence';
+import TimeLagsPage from '@/pages/QuickLook/TimeLags';
 import CrossCorrelationPage from '@/pages/QuickLook/CrossCorrelation';
 import AutoCorrelationPage from '@/pages/QuickLook/AutoCorrelation';
 import DeadTimeCorrectionsPage from '@/pages/QuickLook/DeadTimeCorrections';
@@ -653,6 +654,7 @@ const router = createHashRouter([
       { path: 'quicklook/avg-cross-spectrum', element: <AvgCrossSpectrumPage /> },
       { path: 'quicklook/dynamical-power-spectrum', element: <DynamicalPowerSpectrumPage /> },
       { path: 'quicklook/coherence', element: <CoherencePage /> },
+      { path: 'quicklook/time-lags', element: <TimeLagsPage /> },
       { path: 'quicklook/cross-correlation', element: <CrossCorrelationPage /> },
       { path: 'quicklook/auto-correlation', element: <AutoCorrelationPage /> },
       { path: 'quicklook/dead-time-corrections', element: <DeadTimeCorrectionsPage /> },

@@ -85,6 +85,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
         { text: 'Avg Cross Spectrum', path: '/quicklook/avg-cross-spectrum' },
         { text: 'Dynamical Power Spectrum', path: '/quicklook/dynamical-power-spectrum' },
         { text: 'Coherence', path: '/quicklook/coherence' },
+        { text: 'Time Lags', path: '/quicklook/time-lags' },
         { text: 'Cross Correlation', path: '/quicklook/cross-correlation' },
         { text: 'Auto Correlation', path: '/quicklook/auto-correlation' },
         { text: 'Dead Time Corrections', path: '/quicklook/dead-time-corrections' },
@@ -164,6 +165,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
       'Avg Cross Spectrum',
       'Dynamical Power Spectrum',
       'Coherence',
+      'Time Lags',
     ],
     'Correlation Analysis': ['Cross Correlation', 'Auto Correlation'],
     'Advanced Analysis': [
