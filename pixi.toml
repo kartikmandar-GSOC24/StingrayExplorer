@@ -25,7 +25,6 @@ install-npm = { cmd = "npm install", description = "Install npm dependencies" }
 setup = { depends-on = ["install-npm"], description = "Setup the project" }
 
 # Testing
-test-python = { cmd = "pytest tests/", description = "Run Python tests" }
 test = { depends-on = ["test-python"], description = "Run all tests" }
 
 # Utilities
@@ -72,6 +71,9 @@ lxml = ">=5.0"
 
 # Node.js (npm is included with nodejs)
 nodejs = ">=20"
+
+[feature.dev.tasks]
+test-python = { cmd = "pytest python-backend/tests", description = "Run Python backend tests" }
 
 [feature.dev.dependencies]
 # Development dependencies
