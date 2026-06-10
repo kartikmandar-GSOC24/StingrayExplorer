@@ -105,6 +105,7 @@ def test_tiny_segment_size_rejected_for_coherence(loaded_state):
 def test_coherence_of_independent_signals_is_low(loaded_state):
     svc = TimingService(loaded_state)
     result = svc.calculate_coherence("ev1", "ev2", dt=0.0625, segment_size=8.0)
+    assert result["success"], result
     coh = np.asarray(
         [v for v in result["data"]["coherence"] if v is not None], dtype=float
     )
@@ -147,3 +148,17 @@ def test_time_lag_sign_convention_for_shifted_signal(loaded_state):
     # Observed: median_lag = -0.095 for channel 2 delayed by 0.1 s → stingray
     # convention: positive lag means channel 2 (second list) leads channel 1;
     # a delayed second channel yields negative lags.
+
+
+def test_short_overlap_rejected_for_coherence(loaded_state):
+    # ev1 covers 0–64 s; ev_partial covers 56–120 s → 8 s overlap < 16 s segment.
+    from stingray import EventList
+
+    rng = np.random.default_rng(99)
+    partial_times = np.sort(rng.uniform(56.0, 120.0, 5000))
+    ev_partial = EventList(time=partial_times, gti=[[56.0, 120.0]])
+    loaded_state.add_event_data("ev_partial", ev_partial)
+    svc = TimingService(loaded_state)
+    result = svc.calculate_coherence("ev1", "ev_partial", dt=0.0625, segment_size=16.0)
+    assert not result["success"]
+    assert "shorter than the segment size" in result["message"]

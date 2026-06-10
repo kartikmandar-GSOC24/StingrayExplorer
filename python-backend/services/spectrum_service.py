@@ -53,8 +53,17 @@ def _segment_size_error(segment_size: float, dt: float) -> Optional[str]:
     return None
 
 
-def _overlap_error(events1, events2) -> Optional[str]:
-    """Readable rejection when two event lists share no time overlap."""
+def _overlap_error(
+    events1, events2, segment_size: Optional[float] = None
+) -> Optional[str]:
+    """Readable rejection when two event lists share no time overlap.
+
+    Optional segment_size check: if provided and the overlap is shorter than
+    one segment, stingray will produce zero segments (cryptic error), so we
+    reject early with a human-readable message.
+    """
+    if len(events1.time) == 0 or len(events2.time) == 0:
+        return "one of the event lists contains no events"
     start = max(float(events1.time[0]), float(events2.time[0]))
     stop = min(float(events1.time[-1]), float(events2.time[-1]))
     if stop <= start:
@@ -62,6 +71,11 @@ def _overlap_error(events1, events2) -> Optional[str]:
             "the two event lists have no overlapping time range "
             f"({events1.time[0]:.1f}-{events1.time[-1]:.1f}s vs "
             f"{events2.time[0]:.1f}-{events2.time[-1]:.1f}s)"
+        )
+    if segment_size is not None and (stop - start) < segment_size:
+        return (
+            f"the overlapping time range ({stop - start:.1f}s) is shorter than "
+            f"the segment size ({segment_size}s)"
         )
     return None
 
@@ -341,7 +355,9 @@ class SpectrumService(BaseService):
             event_list_1 = self.state.get_event_data(event_list_1_name)
             event_list_2 = self.state.get_event_data(event_list_2_name)
 
-            overlap_error = _overlap_error(event_list_1, event_list_2)
+            overlap_error = _overlap_error(
+                event_list_1, event_list_2, segment_size=segment_size
+            )
             if overlap_error:
                 return self.create_result(
                     success=False, data=None, message=overlap_error, error=None

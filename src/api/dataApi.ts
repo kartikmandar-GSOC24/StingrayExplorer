@@ -515,14 +515,14 @@ export const dataApi = {
    * Delete an EventList from state
    */
   async deleteEventList(name: string): Promise<ApiResponse<{ name: string }>> {
-    return apiClient.delete(`/api/data/${name}`);
+    return apiClient.delete(`/api/data/${encodeURIComponent(name)}`);
   },
 
   /**
    * Get information about an EventList
    */
   async getEventListInfo(name: string): Promise<ApiResponse<EventListInfo>> {
-    return apiClient.get(`/api/data/${name}`);
+    return apiClient.get(`/api/data/${encodeURIComponent(name)}`);
   },
 
   /**
@@ -554,7 +554,7 @@ export const dataApi = {
     timeLimit?: number
   ): Promise<ApiResponse<EventListFullPreview>> {
     const params = timeLimit ? `?time_limit=${timeLimit}` : '';
-    return apiClient.get(`/api/data/${name}/full-preview${params}`);
+    return apiClient.get(`/api/data/${encodeURIComponent(name)}/full-preview${params}`);
   },
 
   // =========================================================================

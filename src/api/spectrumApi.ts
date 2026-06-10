@@ -159,7 +159,7 @@ export const spectrumApi = {
    * Delete a spectrum from state
    */
   async deleteSpectrum(name: string): Promise<ApiResponse<{ name: string }>> {
-    return apiClient.delete(`/api/spectrum/${name}`);
+    return apiClient.delete(`/api/spectrum/${encodeURIComponent(name)}`);
   },
 };
 
