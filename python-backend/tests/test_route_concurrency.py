@@ -41,14 +41,16 @@ async def test_lightcurve_create_does_not_block_event_loop(monkeypatch):
                 json={"event_list_name": "x", "dt": 0.1, "output_name": "y"},
             )
         )
+        # Start the clock before the first yield so the measurement captures
+        # the block wherever the first scheduler checkpoint lands.
+        t0 = time.monotonic()
         # Yield control so the slow task can start executing.
         await asyncio.sleep(0)
 
-        # Measure how long a 0.05s sleep actually takes.
-        # If the event loop is blocked by the sync service call, the sleep
-        # cannot fire until the blocking work finishes (~0.6s later), so
-        # the measured duration will be ~0.6s instead of ~0.05s.
-        t0 = time.monotonic()
+        # Measure how long the yield plus a 0.05s sleep actually take.
+        # If the event loop is blocked by the sync service call, control
+        # cannot return until the blocking work finishes (~0.6s later), so
+        # the measured duration will be ~0.65s instead of ~0.05s.
         await asyncio.sleep(0.05)
         elapsed = time.monotonic() - t0
 
