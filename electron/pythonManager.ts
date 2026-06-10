@@ -17,8 +17,14 @@ export type LogCallback = (level: LogLevel, message: string, source: LogSource) 
 export class PythonManager {
   private process: ChildProcess | null = null;
   private port: number = 8765;
-  private maxRetries: number = 60; // 30 seconds max wait
-  private retryInterval: number = 500; // ms
+  private retryInterval: number = 500; // ms between health checks
+  // Hard cap on how long we wait for the backend to answer /health. A cold
+  // first launch imports the full scientific stack (stingray, numba, astropy,
+  // scipy) and warms numba's compile cache, which can take ~60s — so this is
+  // deliberately generous. We fail sooner if the spawned process dies (see
+  // waitForReady), so a genuine startup crash still surfaces quickly.
+  private readyTimeoutMs: number = 180000; // 3 minutes
+  private progressLogIntervalMs: number = 15000; // emit a "still waiting" log every 15s
   private isRunning: boolean = false;
   private externalBackend: boolean = false; // True if backend was started externally
   private logCallback: LogCallback | null = null;
@@ -286,23 +292,50 @@ export class PythonManager {
    * Wait for the Python backend to be ready
    */
   private async waitForReady(): Promise<void> {
-    this.sendLog('info', 'Waiting for Python backend to be ready...');
+    this.sendLog(
+      'info',
+      'Waiting for Python backend to be ready (first launch can take ~60s while the scientific stack and numba caches warm up)...'
+    );
 
-    for (let i = 0; i < this.maxRetries; i++) {
+    const startTime = Date.now();
+    let lastProgressLog = startTime;
+
+    // Poll until the backend is healthy, the process dies, or we hit the hard
+    // cap. We deliberately keep waiting as long as the process is alive — a
+    // cold import of stingray/numba/astropy routinely exceeds the old 30s
+    // limit on first launch, which made Electron give up and show a spurious
+    // "backend failed to start" error even though it came up moments later.
+    while (Date.now() - startTime < this.readyTimeoutMs) {
+      // If we spawned the process and it has already exited, there's no point
+      // waiting out the full timeout — fail fast so the real error (crash,
+      // missing dependency, etc.) surfaces immediately. The exit handler in
+      // start() sets this.process to null when the child exits.
+      if (!this.process) {
+        throw new Error('Python backend process exited before becoming ready');
+      }
+
       try {
-        const isReady = await this.checkHealth();
-        if (isReady) {
-          this.sendLog('info', 'Python backend is ready!');
+        if (await this.checkHealth()) {
+          const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+          this.sendLog('info', `Python backend is ready! (took ${elapsed}s)`);
           return;
         }
       } catch {
         // Ignore errors, keep trying
       }
 
+      // Periodic progress so a slow cold start doesn't look like a hang.
+      if (Date.now() - lastProgressLog >= this.progressLogIntervalMs) {
+        const elapsed = Math.round((Date.now() - startTime) / 1000);
+        this.sendLog('info', `Still waiting for Python backend... (${elapsed}s elapsed)`);
+        lastProgressLog = Date.now();
+      }
+
       await this.sleep(this.retryInterval);
     }
 
-    const errorMsg = `Python backend failed to start within ${(this.maxRetries * this.retryInterval) / 1000} seconds`;
+    const seconds = Math.round(this.readyTimeoutMs / 1000);
+    const errorMsg = `Python backend failed to become ready within ${seconds} seconds`;
     this.sendLog('error', errorMsg);
     throw new Error(errorMsg);
   }

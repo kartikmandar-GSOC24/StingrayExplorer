@@ -174,22 +174,35 @@ app.whenReady().then(async () => {
   await initializeApp();
 
   app.on('activate', async () => {
-    // On macOS, re-create window when dock icon is clicked
+    // On macOS, re-create the window when the dock icon is clicked.
     if (BrowserWindow.getAllWindows().length === 0) {
       await createWindow();
+
+      // Make sure the freshly-loaded renderer ends up connected. Normally the
+      // backend is still running (see 'window-all-closed'), so just tell the new
+      // window its port — the renderer's mount-time check also reconnects on its
+      // own. If the backend somehow isn't running, (re)initialize it so we never
+      // get stuck showing "Starting..." with no backend.
+      if (pythonManager && pythonManager.getIsRunning()) {
+        mainWindow?.webContents.send('python:ready', pythonManager.getPort());
+      } else {
+        await initializeApp();
+      }
     }
   });
 });
 
 app.on('window-all-closed', async () => {
-  // Stop Python backend
-  if (pythonManager) {
-    await pythonManager.stop();
-    pythonManager = null;
-  }
-
-  // On macOS, don't quit when all windows are closed
+  // On macOS the app (and its Python backend) stays alive when all windows are
+  // closed — the user reopens via the dock and we want the backend still there
+  // to reconnect to. Tearing it down here meant a reopened window had no backend
+  // and got stuck on "Starting...". Only fully shut down on platforms where
+  // closing the last window means quitting; final cleanup lives in 'before-quit'.
   if (process.platform !== 'darwin') {
+    if (pythonManager) {
+      await pythonManager.stop();
+      pythonManager = null;
+    }
     app.quit();
   }
 });
