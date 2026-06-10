@@ -19,7 +19,7 @@ export interface BispectrumData {
 
 export interface PowerColorsData {
   name: string | null;
-  power_colors: Record<string, number[]>;
+  power_colors: Record<string, Array<number | null>>;
   time: number[];
   freq_ranges: Record<string, [number, number]>;
 }
