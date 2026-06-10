@@ -134,7 +134,7 @@ class TimingService(BaseService):
         """
         Calculate power colors from frequency bands.
 
-        Power colors are ratios of integrated power in different frequency bands,
+        Power colors are ratios of band-mean power in different frequency bands,
         useful for source classification and state analysis.
 
         Args:

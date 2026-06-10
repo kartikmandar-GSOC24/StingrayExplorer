@@ -55,6 +55,9 @@ const PowerColorsPage: React.FC = () => {
   const bandsValid = parsedBands.every(
     (b) => b.fmin !== null && b.fmax !== null && b.fmax > b.fmin
   );
+  const nyquist = dtNum !== null ? 1 / (2 * dtNum) : null;
+  const bandExceedsNyquist =
+    nyquist !== null && parsedBands.some((b) => b.fmax !== null && b.fmax > nyquist);
   const canRun = eventList !== '' && dtNum !== null && segNum !== null && bandsValid && !running;
 
   const updateBand = (index: number, field: 'fmin' | 'fmax', value: string): void => {
@@ -83,7 +86,7 @@ const PowerColorsPage: React.FC = () => {
         y: values,
         type: 'scattergl' as const,
         mode: 'lines+markers' as const,
-        marker: { size: 4 },
+        marker: { size: 4, color: BAND_COLORS[i % BAND_COLORS.length] },
         line: { width: 1, color: BAND_COLORS[i % BAND_COLORS.length] },
         name: label,
       }))
@@ -111,7 +114,7 @@ const PowerColorsPage: React.FC = () => {
   return (
     <PageTemplate
       title="Power Colors"
-      description="Integrated band powers per segment and the PC1–PC2 power-color diagram"
+      description="Band-mean Leahy power per segment in four frequency bands, and the PC1–PC2 power-color diagram"
       category="Advanced Analysis"
       status="ready"
     >
@@ -161,6 +164,12 @@ const PowerColorsPage: React.FC = () => {
                 {!bandsValid && (
                   <Alert severity="warning">Each band needs 0 &lt; f min &lt; f max.</Alert>
                 )}
+                {bandExceedsNyquist && (
+                  <Alert severity="warning">
+                    A band&apos;s f max exceeds the Nyquist frequency 1/(2·dt); frequency bins above it are
+                    dropped.
+                  </Alert>
+                )}
                 <Button
                   variant="contained"
                   startIcon={
@@ -208,6 +217,11 @@ const PowerColorsPage: React.FC = () => {
                     <Box>
                       <Typography variant="subtitle2" gutterBottom>
                         Power-color diagram (PC1 = C/A, PC2 = B/D)
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        Ratios use band-mean (not band-integrated) power: PC tracks match literature power
+                        colours up to constant per-band factors, so absolute values are not comparable to
+                        published hue diagrams.
                       </Typography>
                       <PlotlyChart
                         data={scatterTrace}
