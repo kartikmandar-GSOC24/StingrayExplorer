@@ -11,6 +11,19 @@ from stingray import EventList, Lightcurve
 
 from .base_service import BaseService
 
+# Cap on points transferred for plotting. The full-resolution Lightcurve stays
+# in StateManager; only the JSON payload is strided.
+DEFAULT_MAX_PLOT_POINTS = 200_000
+
+
+def _decimate_for_plot(time, counts, max_points):
+    """Stride-decimate arrays for display. Returns (time, counts, stride)."""
+    n = len(time)
+    if not max_points or n <= max_points:
+        return time, counts, 1
+    stride = int(np.ceil(n / max_points))
+    return time[::stride], counts[::stride], stride
+
 
 class LightcurveService(BaseService):
     """
@@ -25,6 +38,7 @@ class LightcurveService(BaseService):
         dt: float,
         output_name: str,
         gti: Optional[List[List[float]]] = None,
+        max_points: Optional[int] = DEFAULT_MAX_PLOT_POINTS,
     ) -> Dict[str, Any]:
         """
         Create a Lightcurve from an EventList.
@@ -61,12 +75,16 @@ class LightcurveService(BaseService):
             self.state.add_lightcurve_data(output_name, lc)
 
             # Prepare response data
+            plot_time, plot_counts, stride = _decimate_for_plot(
+                lc.time, lc.counts, max_points
+            )
             lc_data = {
                 "name": output_name,
-                "time": lc.time.tolist(),
-                "counts": lc.counts.tolist(),
+                "time": plot_time.astype(float).tolist(),
+                "counts": plot_counts.astype(float).tolist(),
                 "dt": float(lc.dt),
                 "n_bins": len(lc.time),
+                "plot_stride": stride,
                 "time_range": [float(lc.time.min()), float(lc.time.max())],
                 "count_rate_mean": float(np.mean(lc.counts / lc.dt)),
             }
@@ -112,8 +130,8 @@ class LightcurveService(BaseService):
 
             lc_data = {
                 "name": output_name,
-                "time": lc.time.tolist(),
-                "counts": lc.counts.tolist(),
+                "time": lc.time.astype(float).tolist(),
+                "counts": lc.counts.astype(float).tolist(),
                 "dt": float(lc.dt),
                 "n_bins": len(lc.time),
             }
@@ -132,6 +150,7 @@ class LightcurveService(BaseService):
         name: str,
         rebin_factor: float,
         output_name: str,
+        max_points: Optional[int] = DEFAULT_MAX_PLOT_POINTS,
     ) -> Dict[str, Any]:
         """
         Rebin a lightcurve.
@@ -159,12 +178,16 @@ class LightcurveService(BaseService):
             # Save to state
             self.state.add_lightcurve_data(output_name, rebinned_lc)
 
+            plot_time, plot_counts, stride = _decimate_for_plot(
+                rebinned_lc.time, rebinned_lc.counts, max_points
+            )
             lc_data = {
                 "name": output_name,
-                "time": rebinned_lc.time.tolist(),
-                "counts": rebinned_lc.counts.tolist(),
+                "time": plot_time.astype(float).tolist(),
+                "counts": plot_counts.astype(float).tolist(),
                 "dt": float(rebinned_lc.dt),
                 "n_bins": len(rebinned_lc.time),
+                "plot_stride": stride,
             }
 
             return self.create_result(
@@ -178,7 +201,9 @@ class LightcurveService(BaseService):
                 e, "Rebinning lightcurve", name=name, rebin_factor=rebin_factor
             )
 
-    def get_lightcurve_data(self, name: str) -> Dict[str, Any]:
+    def get_lightcurve_data(
+        self, name: str, max_points: Optional[int] = DEFAULT_MAX_PLOT_POINTS
+    ) -> Dict[str, Any]:
         """
         Get lightcurve data for plotting.
 
@@ -199,12 +224,16 @@ class LightcurveService(BaseService):
 
             lc = self.state.get_lightcurve_data(name)
 
+            plot_time, plot_counts, stride = _decimate_for_plot(
+                lc.time, lc.counts, max_points
+            )
             lc_data = {
                 "name": name,
-                "time": lc.time.tolist(),
-                "counts": lc.counts.tolist(),
+                "time": plot_time.astype(float).tolist(),
+                "counts": plot_counts.astype(float).tolist(),
                 "dt": float(lc.dt),
                 "n_bins": len(lc.time),
+                "plot_stride": stride,
                 "time_range": [float(lc.time.min()), float(lc.time.max())],
                 "count_stats": {
                     "mean": float(np.mean(lc.counts)),
@@ -230,12 +259,14 @@ class LightcurveService(BaseService):
 
             summaries = []
             for name, lc in lc_data:
-                summaries.append({
-                    "name": name,
-                    "n_bins": len(lc.time),
-                    "dt": float(lc.dt),
-                    "time_range": [float(lc.time.min()), float(lc.time.max())],
-                })
+                summaries.append(
+                    {
+                        "name": name,
+                        "n_bins": len(lc.time),
+                        "dt": float(lc.dt),
+                        "time_range": [float(lc.time.min()), float(lc.time.max())],
+                    }
+                )
 
             return self.create_result(
                 success=True,

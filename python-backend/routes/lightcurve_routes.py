@@ -26,6 +26,7 @@ class CreateLightcurveFromEventListRequest(BaseModel):
     dt: float
     output_name: str
     gti: Optional[List[List[float]]] = None
+    max_points: Optional[int] = 200000
 
 
 class CreateLightcurveFromArraysRequest(BaseModel):
@@ -39,6 +40,7 @@ class RebinLightcurveRequest(BaseModel):
     name: str
     rebin_factor: float
     output_name: str
+    max_points: Optional[int] = 200000
 
 
 # Routes
@@ -53,6 +55,7 @@ async def create_lightcurve_from_event_list(
         dt=request.dt,
         output_name=request.output_name,
         gti=request.gti,
+        max_points=request.max_points,
     )
 
 
@@ -80,16 +83,18 @@ async def rebin_lightcurve(
         name=request.name,
         rebin_factor=request.rebin_factor,
         output_name=request.output_name,
+        max_points=request.max_points,
     )
 
 
 @router.get("/{name}")
 async def get_lightcurve_data(
     name: str,
+    max_points: int = 200000,
     service: LightcurveService = Depends(get_lightcurve_service),
 ):
     """Get lightcurve data for plotting."""
-    return service.get_lightcurve_data(name)
+    return service.get_lightcurve_data(name, max_points=max_points)
 
 
 @router.get("/")
