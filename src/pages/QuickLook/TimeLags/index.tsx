@@ -37,9 +37,12 @@ const TimeLagsPage: React.FC = () => {
   const segNum = parsePositiveNumber(segmentSize);
   const fMin = parsePositiveNumber(freqMin);
   const fMax = parsePositiveNumber(freqMax);
+  const freqMinInvalid = freqMin !== '' && fMin === null;
+  const freqMaxInvalid = freqMax !== '' && fMax === null;
   const freqRangePartial = (fMin !== null) !== (fMax !== null);
   const freqRangeInverted = fMin !== null && fMax !== null && fMax <= fMin;
-  const freqRangeValid = !freqRangePartial && !freqRangeInverted;
+  const freqRangeValid =
+    !freqMinInvalid && !freqMaxInvalid && !freqRangePartial && !freqRangeInverted;
   const canRun =
     eventList1 !== '' &&
     eventList2 !== '' &&
@@ -123,7 +126,7 @@ const TimeLagsPage: React.FC = () => {
                     size="small"
                     value={freqMin}
                     onChange={(e) => setFreqMin(e.target.value)}
-                    error={(freqMin !== '' && fMin === null) || freqRangePartial || freqRangeInverted}
+                    error={freqMinInvalid || freqRangePartial || freqRangeInverted}
                     helperText={freqHelperText(freqMin, fMin)}
                   />
                   <TextField
@@ -131,7 +134,7 @@ const TimeLagsPage: React.FC = () => {
                     size="small"
                     value={freqMax}
                     onChange={(e) => setFreqMax(e.target.value)}
-                    error={(freqMax !== '' && fMax === null) || freqRangePartial || freqRangeInverted}
+                    error={freqMaxInvalid || freqRangePartial || freqRangeInverted}
                     helperText={freqHelperText(freqMax, fMax)}
                   />
                 </Box>
