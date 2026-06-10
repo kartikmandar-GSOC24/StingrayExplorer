@@ -36,6 +36,7 @@ import CrossCorrelationPage from '@/pages/QuickLook/CrossCorrelation';
 import AutoCorrelationPage from '@/pages/QuickLook/AutoCorrelation';
 import DeadTimeCorrectionsPage from '@/pages/QuickLook/DeadTimeCorrections';
 import BispectrumPage from '@/pages/QuickLook/Bispectrum';
+import PowerColorsPage from '@/pages/QuickLook/PowerColors';
 import CovarianceSpectrumPage from '@/pages/QuickLook/CovarianceSpectrum';
 import AvgCovarianceSpectrumPage from '@/pages/QuickLook/AvgCovarianceSpectrum';
 import VariableEnergySpectrumPage from '@/pages/QuickLook/VariableEnergySpectrum';
@@ -659,6 +660,7 @@ const router = createHashRouter([
       { path: 'quicklook/auto-correlation', element: <AutoCorrelationPage /> },
       { path: 'quicklook/dead-time-corrections', element: <DeadTimeCorrectionsPage /> },
       { path: 'quicklook/bispectrum', element: <BispectrumPage /> },
+      { path: 'quicklook/power-colors', element: <PowerColorsPage /> },
       { path: 'quicklook/covariance-spectrum', element: <CovarianceSpectrumPage /> },
       { path: 'quicklook/avg-covariance-spectrum', element: <AvgCovarianceSpectrumPage /> },
       { path: 'quicklook/variable-energy-spectrum', element: <VariableEnergySpectrumPage /> },

@@ -90,6 +90,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
         { text: 'Auto Correlation', path: '/quicklook/auto-correlation' },
         { text: 'Dead Time Corrections', path: '/quicklook/dead-time-corrections' },
         { text: 'Bispectrum', path: '/quicklook/bispectrum' },
+        { text: 'Power Colors', path: '/quicklook/power-colors' },
         { text: 'Covariance Spectrum', path: '/quicklook/covariance-spectrum' },
         { text: 'Avg Covariance Spectrum', path: '/quicklook/avg-covariance-spectrum' },
         { text: 'Variable Energy Spectrum', path: '/quicklook/variable-energy-spectrum' },
@@ -171,6 +172,7 @@ const Sidebar: React.FC<SidebarProps> = ({ open, onSubmenuStateChange }) => {
     'Advanced Analysis': [
       'Dead Time Corrections',
       'Bispectrum',
+      'Power Colors',
       'Covariance Spectrum',
       'Avg Covariance Spectrum',
     ],
