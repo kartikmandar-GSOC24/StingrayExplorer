@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import {
   Alert,
   Box,
@@ -59,25 +59,32 @@ const DynamicalPowerSpectrumPage: React.FC = () => {
 
   // dyn_ps rows correspond to frequencies (n_freq x n_times) — matches
   // Plotly's convention that z[i] pairs with y[i].
-  const zValues: Array<Array<number | null>> | undefined = result
-    ? logZ
-      ? result.dyn_ps.map((row) => row.map((v) => (v !== null && v > 0 ? Math.log10(v) : null)))
-      : result.dyn_ps
-    : undefined;
+  const zValues: Array<Array<number | null>> | undefined = useMemo(
+    () =>
+      result
+        ? logZ
+          ? result.dyn_ps.map((row) => row.map((v) => (v !== null && v > 0 ? Math.log10(v) : null)))
+          : result.dyn_ps
+        : undefined,
+    [result, logZ]
+  );
 
-  const heatmap: Data[] =
-    result && zValues
-      ? [
-          {
-            z: zValues,
-            x: result.time,
-            y: result.freq,
-            type: 'heatmap',
-            colorscale: 'Viridis',
-            colorbar: { title: { text: logZ ? 'log10 P' : 'Power' } },
-          } as Data,
-        ]
-      : [];
+  const heatmap: Data[] = useMemo<Data[]>(
+    () =>
+      result && zValues
+        ? [
+            {
+              z: zValues,
+              x: result.time,
+              y: result.freq,
+              type: 'heatmap',
+              colorscale: 'Viridis',
+              colorbar: { title: { text: logZ ? 'log10 P' : 'Power' } },
+            } as Data,
+          ]
+        : [],
+    [result, zValues, logZ]
+  );
 
   return (
     <PageTemplate
