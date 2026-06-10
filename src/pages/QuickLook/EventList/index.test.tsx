@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/testUtils';
 
@@ -25,6 +25,7 @@ describe('EventListPage', () => {
   beforeEach(() => {
     listEventLists.mockReset();
     getEventListInfo.mockReset();
+    deleteEventList.mockReset();
     listEventLists.mockResolvedValue({
       success: true,
       data: [{ name: 'obs1', n_events: 5000, time_range: [0, 100] }],
@@ -58,5 +59,22 @@ describe('EventListPage', () => {
     expect(getEventListInfo).toHaveBeenCalledWith('obs1');
     // GTI table rows
     expect(await screen.findByText('Good Time Intervals')).toBeInTheDocument();
+  });
+
+  it('deletes an event list via the confirmation dialog', async () => {
+    deleteEventList.mockResolvedValue({
+      success: true,
+      data: { name: 'obs1' },
+      message: '',
+      error: null,
+    });
+    renderWithProviders(<EventListPage />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Delete obs1' }));
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    expect(deleteEventList).toHaveBeenCalledWith('obs1');
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
   });
 });

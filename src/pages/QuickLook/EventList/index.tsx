@@ -17,6 +17,7 @@ import {
   Grid,
   IconButton,
   List,
+  ListItem,
   ListItemButton,
   ListItemText,
   Stack,
@@ -40,6 +41,9 @@ import { dataApi, EventListFullPreview, EventListInfo } from '@/api/dataApi';
 import { useUIStore } from '@/store/uiStore';
 
 const mono = { fontFamily: '"JetBrains Mono", monospace' };
+
+const eventListInfoKey = (name: string) => ['eventListInfo', name] as const;
+const eventListPreviewKey = (name: string) => ['eventListPreview', name] as const;
 
 const formatNum = (v: number | null | undefined, digits = 3): string =>
   v === null || v === undefined
@@ -66,7 +70,7 @@ const EventListPage: React.FC = () => {
   const { data: eventLists, isLoading, isError, error, refetch, isFetching } = useEventLists();
 
   const infoQuery = useQuery({
-    queryKey: ['eventListInfo', selected],
+    queryKey: eventListInfoKey(selected ?? ''),
     enabled: selected !== null,
     queryFn: async (): Promise<EventListInfo> => {
       const res = await dataApi.getEventListInfo(selected as string);
@@ -76,7 +80,7 @@ const EventListPage: React.FC = () => {
   });
 
   const previewQuery = useQuery({
-    queryKey: ['eventListPreview', selected],
+    queryKey: eventListPreviewKey(selected ?? ''),
     enabled: selected !== null && tab === 1,
     queryFn: async (): Promise<EventListFullPreview> => {
       const res = await dataApi.getEventListFullPreview(selected as string);
@@ -91,6 +95,8 @@ const EventListPage: React.FC = () => {
     if (res.success) {
       addNotification({ type: 'success', title: 'Event List', message: `Deleted '${deleteTarget}'` });
       if (selected === deleteTarget) setSelected(null);
+      queryClient.removeQueries({ queryKey: eventListInfoKey(deleteTarget) });
+      queryClient.removeQueries({ queryKey: eventListPreviewKey(deleteTarget) });
       await queryClient.invalidateQueries({ queryKey: EVENT_LISTS_QUERY_KEY });
     } else {
       addNotification({
@@ -139,27 +145,28 @@ const EventListPage: React.FC = () => {
               )}
               <List dense>
                 {(eventLists ?? []).map((ev) => (
-                  <ListItemButton
+                  <ListItem
                     key={ev.name}
-                    selected={ev.name === selected}
-                    onClick={() => setSelected(ev.name)}
+                    disablePadding
+                    secondaryAction={
+                      <IconButton
+                        edge="end"
+                        size="small"
+                        aria-label={`Delete ${ev.name}`}
+                        onClick={() => setDeleteTarget(ev.name)}
+                      >
+                        <DeleteIcon fontSize="small" />
+                      </IconButton>
+                    }
                   >
-                    <ListItemText
-                      primary={ev.name}
-                      secondary={`${ev.n_events.toLocaleString()} events`}
-                      primaryTypographyProps={{ sx: mono }}
-                    />
-                    <IconButton
-                      edge="end"
-                      size="small"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setDeleteTarget(ev.name);
-                      }}
-                    >
-                      <DeleteIcon fontSize="small" />
-                    </IconButton>
-                  </ListItemButton>
+                    <ListItemButton selected={ev.name === selected} onClick={() => setSelected(ev.name)}>
+                      <ListItemText
+                        primary={ev.name}
+                        secondary={`${ev.n_events.toLocaleString()} events`}
+                        primaryTypographyProps={{ sx: mono }}
+                      />
+                    </ListItemButton>
+                  </ListItem>
                 ))}
               </List>
             </CardContent>
@@ -190,7 +197,7 @@ const EventListPage: React.FC = () => {
                     <Tab label="Distributions" />
                   </Tabs>
 
-                  {infoQuery.isError && (
+                  {tab === 0 && infoQuery.isError && (
                     <Alert severity="error">
                       {infoQuery.error instanceof Error ? infoQuery.error.message : 'Failed to load info'}
                     </Alert>
@@ -292,7 +299,7 @@ const EventListPage: React.FC = () => {
                               type: 'histogram',
                               nbinsx: 200,
                               marker: { color: '#00d4aa' },
-                            } as unknown as Data,
+                            } as Data,
                           ]}
                           layout={{
                             xaxis: { title: { text: 'Time (s)' } },
@@ -313,7 +320,7 @@ const EventListPage: React.FC = () => {
                                 type: 'histogram',
                                 nbinsx: 150,
                                 marker: { color: '#3b82f6' },
-                              } as unknown as Data,
+                              } as Data,
                             ]}
                             layout={{
                               xaxis: { title: { text: 'Energy (keV)' } },
