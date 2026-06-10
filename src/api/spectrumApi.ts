@@ -8,7 +8,8 @@ import { apiClient, ApiResponse } from './client';
 export interface PowerSpectrumData {
   name: string | null;
   freq: number[];
-  power: number[];
+  power: Array<number | null>;
+  power_phase?: Array<number | null> | null;
   norm: string;
   n_freq: number;
   df: number;
@@ -21,7 +22,7 @@ export interface DynamicalPowerSpectrumData {
   name: string | null;
   freq: number[];
   time: number[];
-  dyn_ps: number[][];
+  dyn_ps: Array<Array<number | null>>;
   norm: string;
   segment_size: number;
   shape: [number, number];

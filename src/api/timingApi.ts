@@ -27,14 +27,18 @@ export interface PowerColorsData {
 export interface TimeLagsData {
   name: string | null;
   freq: number[];
-  time_lags: number[];
+  time_lags: Array<number | null>;
+  time_lags_err?: Array<number | null> | null;
   freq_range: [number, number] | null;
 }
 
 export interface CoherenceData {
   name: string | null;
   freq: number[];
-  coherence: number[];
+  coherence: Array<number | null>;
+  coherence_err?: Array<number | null> | null;
+  segment_size?: number;
+  n_segments?: number | null;
 }
 
 // API functions

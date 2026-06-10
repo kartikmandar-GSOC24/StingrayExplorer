@@ -11,6 +11,7 @@ export interface LightcurveData {
   counts: number[];
   dt: number;
   n_bins: number;
+  plot_stride?: number;
   time_range?: [number, number];
   count_rate_mean?: number;
   count_stats?: {
@@ -38,12 +39,14 @@ export const lightcurveApi = {
     dt: number;
     output_name: string;
     gti?: number[][];
+    max_points?: number;
   }): Promise<ApiResponse<LightcurveData>> {
     return apiClient.post('/api/lightcurve/from-event-list', {
       event_list_name: params.event_list_name,
       dt: params.dt,
       output_name: params.output_name,
       gti: params.gti,
+      max_points: params.max_points,
     });
   },
 
@@ -66,15 +69,25 @@ export const lightcurveApi = {
     name: string;
     rebin_factor: number;
     output_name: string;
+    max_points?: number;
   }): Promise<ApiResponse<LightcurveData>> {
-    return apiClient.post('/api/lightcurve/rebin', params);
+    return apiClient.post('/api/lightcurve/rebin', {
+      name: params.name,
+      rebin_factor: params.rebin_factor,
+      output_name: params.output_name,
+      max_points: params.max_points,
+    });
   },
 
   /**
    * Get lightcurve data for plotting
    */
-  async getLightcurveData(name: string): Promise<ApiResponse<LightcurveData>> {
-    return apiClient.get(`/api/lightcurve/${name}`);
+  async getLightcurveData(
+    name: string,
+    maxPoints?: number
+  ): Promise<ApiResponse<LightcurveData>> {
+    const query = maxPoints ? `?max_points=${maxPoints}` : '';
+    return apiClient.get(`/api/lightcurve/${name}${query}`);
   },
 
   /**
