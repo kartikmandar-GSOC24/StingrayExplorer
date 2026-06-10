@@ -58,6 +58,20 @@ const LightCurvePage: React.FC = () => {
     if (result) void queryClient.invalidateQueries({ queryKey: LIGHTCURVES_QUERY_KEY });
   }, [result, queryClient]);
 
+  // Auto-clear a stored-curve selection that no longer exists in the list
+  // (deleted elsewhere or backend restart) so we never act on stale names.
+  useEffect(() => {
+    if (
+      !existingQuery.isLoading &&
+      !existingQuery.isFetching &&
+      existingSelection !== '' &&
+      existingQuery.data !== undefined &&
+      !existingQuery.data.some((lc) => lc.name === existingSelection)
+    ) {
+      setExistingSelection('');
+    }
+  }, [existingQuery.data, existingQuery.isLoading, existingQuery.isFetching, existingSelection]);
+
   const dtNum = parsePositiveNumber(dt);
   const canRun = eventList !== '' && dtNum !== null && !running;
   const rebinNum = parsePositiveNumber(rebinFactor);
@@ -108,7 +122,7 @@ const LightCurvePage: React.FC = () => {
           type: 'scattergl',
           mode: 'lines',
           line: { color: '#00d4aa', width: 1 },
-        } as Data,
+        },
       ]
     : [];
 
@@ -242,8 +256,8 @@ const LightCurvePage: React.FC = () => {
               </Box>
               {result?.plot_stride !== undefined && result.plot_stride > 1 && (
                 <Alert severity="info" sx={{ mb: 1 }}>
-                  Showing every {result.plot_stride}th bin for display performance (full resolution
-                  is stored in the backend).
+                  Showing 1 of every {result.plot_stride} bins for display performance (full
+                  resolution is stored in the backend).
                 </Alert>
               )}
               {error && (

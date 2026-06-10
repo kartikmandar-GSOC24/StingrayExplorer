@@ -178,7 +178,9 @@ class LightcurveService(BaseService):
                 )
 
             lightcurve = self.state.get_lightcurve_data(name)
-            rebinned_lc = lightcurve.rebin(rebin_factor)
+            # stingray's first positional param is dt_new (absolute); we promise
+            # factor semantics, so pass f= explicitly.
+            rebinned_lc = lightcurve.rebin(f=rebin_factor)
 
             # Save to state
             self.state.add_lightcurve_data(output_name, rebinned_lc)
@@ -193,6 +195,7 @@ class LightcurveService(BaseService):
                 "dt": float(rebinned_lc.dt),
                 "n_bins": len(rebinned_lc.time),
                 "plot_stride": stride,
+                "count_rate_mean": float(np.mean(rebinned_lc.counts / rebinned_lc.dt)),
             }
 
             return self.create_result(
@@ -241,6 +244,7 @@ class LightcurveService(BaseService):
                 "n_bins": len(lc.time),
                 "plot_stride": stride,
                 "time_range": [float(lc.time.min()), float(lc.time.max())],
+                "count_rate_mean": float(np.mean(lc.counts / lc.dt)),
                 "count_stats": {
                     "mean": float(np.mean(lc.counts)),
                     "std": float(np.std(lc.counts)),

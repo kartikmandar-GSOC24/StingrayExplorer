@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from services.lightcurve_service import LightcurveService
 
 
@@ -52,3 +54,12 @@ def test_stats_use_full_resolution_and_zero_disables_decimation(loaded_state):
     assert decimated["data"]["count_rate_mean"] == (
         sum(full["data"]["counts"]) / (full["data"]["n_bins"] * full["data"]["dt"])
     )
+
+
+def test_rebin_scales_dt_by_factor(loaded_state):
+    svc = LightcurveService(loaded_state)
+    svc.create_lightcurve_from_event_list("ev1", dt=0.5, output_name="lc_base")
+    result = svc.rebin_lightcurve("lc_base", rebin_factor=2.0, output_name="lc_base_r2")
+    assert result["success"], result
+    assert result["data"]["dt"] == pytest.approx(1.0)  # 2 x 0.5, factor semantics
+    assert "count_rate_mean" in result["data"]

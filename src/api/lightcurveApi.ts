@@ -87,7 +87,7 @@ export const lightcurveApi = {
     maxPoints?: number
   ): Promise<ApiResponse<LightcurveData>> {
     const query = maxPoints ? `?max_points=${maxPoints}` : '';
-    return apiClient.get(`/api/lightcurve/${name}${query}`);
+    return apiClient.get(`/api/lightcurve/${encodeURIComponent(name)}${query}`);
   },
 
   /**
@@ -101,7 +101,7 @@ export const lightcurveApi = {
    * Delete a lightcurve from state
    */
   async deleteLightcurve(name: string): Promise<ApiResponse<{ name: string }>> {
-    return apiClient.delete(`/api/lightcurve/${name}`);
+    return apiClient.delete(`/api/lightcurve/${encodeURIComponent(name)}`);
   },
 };
 
