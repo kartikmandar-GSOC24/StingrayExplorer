@@ -36,7 +36,6 @@ import {
   archiveApi,
   FileEntry,
   FileType,
-  DownloadToDiskEvent,
 } from '@/api/archiveApi';
 import { useUIStore } from '@/store/uiStore';
 

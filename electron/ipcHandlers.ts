@@ -33,7 +33,7 @@ export function setupIpcHandlers(getPythonManager: PythonManagerGetter): void {
           { name: 'Text Files', extensions: ['txt', 'csv', 'dat', 'ascii'] },
           { name: 'All Files', extensions: ['*'] },
         ],
-        properties: options?.multiple ? ['openFile', 'multiSelections'] as const : ['openFile'] as const,
+        properties: options?.multiple ? (['openFile', 'multiSelections'] as ('openFile' | 'multiSelections')[]) : (['openFile'] as ('openFile')[]),
       };
 
       const result = parentWindow
@@ -84,7 +84,7 @@ export function setupIpcHandlers(getPythonManager: PythonManagerGetter): void {
 
     const dialogOptions = {
       title: 'Select Directory',
-      properties: ['openDirectory'] as const,
+      properties: ['openDirectory'] as ('openDirectory')[],
     };
 
     const result = parentWindow
@@ -261,7 +261,14 @@ export function setupIpcHandlers(getPythonManager: PythonManagerGetter): void {
     }
 
     // Main process metrics
-    const mainMetrics = {
+    const mainMetrics: {
+      memory_mb: number;
+      heap_used_mb: number;
+      heap_total_mb: number;
+      cpu_user_ms: number;
+      cpu_system_ms: number;
+      cpu_percent?: number;
+    } = {
       memory_mb: mainProcessMemory.rss / (1024 * 1024),
       heap_used_mb: mainProcessMemory.heapUsed / (1024 * 1024),
       heap_total_mb: mainProcessMemory.heapTotal / (1024 * 1024),
