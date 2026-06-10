@@ -18,6 +18,26 @@ from stingray import (
 from .base_service import BaseService
 
 
+def _power_to_lists(power) -> tuple:
+    """Split a (possibly complex) power array into JSON-safe magnitude and phase lists.
+
+    Returns (power_list, phase_list_or_None). Non-finite values become None so
+    strict JSON (and JS JSON.parse) never sees NaN/Infinity.
+    """
+    arr = np.asarray(power)
+    if np.iscomplexobj(arr):
+        mag = np.abs(arr)
+        phase = np.angle(arr)
+        return _finite_list(mag), _finite_list(phase)
+    return _finite_list(arr.astype(float)), None
+
+
+def _finite_list(arr) -> list:
+    """Convert a float array to a list, replacing non-finite values with None."""
+    values = np.asarray(arr, dtype=float)
+    return [float(v) if np.isfinite(v) else None for v in values]
+
+
 class SpectrumService(BaseService):
     """
     Service for spectral analysis operations.
@@ -61,10 +81,12 @@ class SpectrumService(BaseService):
             if output_name:
                 self.state.add_spectrum_data(output_name, ps)
 
+            power_list, phase_list = _power_to_lists(ps.power)
             ps_data = {
                 "name": output_name,
                 "freq": ps.freq.tolist(),
-                "power": ps.power.tolist(),
+                "power": power_list,
+                "power_phase": phase_list,
                 "norm": norm,
                 "n_freq": len(ps.freq),
                 "df": float(ps.df),
@@ -119,10 +141,12 @@ class SpectrumService(BaseService):
             if output_name:
                 self.state.add_spectrum_data(output_name, ps)
 
+            power_list, phase_list = _power_to_lists(ps.power)
             ps_data = {
                 "name": output_name,
                 "freq": ps.freq.tolist(),
-                "power": ps.power.tolist(),
+                "power": power_list,
+                "power_phase": phase_list,
                 "norm": norm,
                 "n_freq": len(ps.freq),
                 "df": float(ps.df),
@@ -197,10 +221,12 @@ class SpectrumService(BaseService):
             if output_name:
                 self.state.add_spectrum_data(output_name, cs)
 
+            power_list, phase_list = _power_to_lists(cs.power)
             cs_data = {
                 "name": output_name,
                 "freq": cs.freq.tolist(),
-                "power": cs.power.tolist(),
+                "power": power_list,
+                "power_phase": phase_list,
                 "norm": norm,
                 "n_freq": len(cs.freq),
                 "df": float(cs.df),
@@ -278,10 +304,12 @@ class SpectrumService(BaseService):
             if output_name:
                 self.state.add_spectrum_data(output_name, cs)
 
+            power_list, phase_list = _power_to_lists(cs.power)
             cs_data = {
                 "name": output_name,
                 "freq": cs.freq.tolist(),
-                "power": cs.power.tolist(),
+                "power": power_list,
+                "power_phase": phase_list,
                 "norm": norm,
                 "n_freq": len(cs.freq),
                 "df": float(cs.df),
@@ -406,10 +434,12 @@ class SpectrumService(BaseService):
             if output_name:
                 self.state.add_spectrum_data(output_name, rebinned)
 
+            power_list, phase_list = _power_to_lists(rebinned.power)
             data = {
                 "name": output_name,
                 "freq": rebinned.freq.tolist(),
-                "power": rebinned.power.tolist(),
+                "power": power_list,
+                "power_phase": phase_list,
                 "n_freq": len(rebinned.freq),
             }
 
