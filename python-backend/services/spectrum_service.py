@@ -40,6 +40,19 @@ def _finite_list(arr) -> list:
     return [float(v) if np.isfinite(v) else None for v in values]
 
 
+def _segment_size_error(segment_size: float, dt: float) -> Optional[str]:
+    """Human-readable rejection for segment sizes that stingray fails on cryptically.
+
+    Needs at least 3 time bins per segment to produce a non-empty spectrum.
+    """
+    if segment_size / dt < 3:
+        return (
+            f"segment_size ({segment_size}s) must be at least 3x dt ({dt}s) "
+            "to produce a non-empty spectrum"
+        )
+    return None
+
+
 class SpectrumService(BaseService):
     """
     Service for spectral analysis operations.
@@ -138,6 +151,12 @@ class SpectrumService(BaseService):
                     data=None,
                     message=f"EventList '{event_list_name}' not found",
                     error=None,
+                )
+
+            seg_error = _segment_size_error(segment_size, dt)
+            if seg_error:
+                return self.create_result(
+                    success=False, data=None, message=seg_error, error=None
                 )
 
             event_list = self.state.get_event_data(event_list_name)
@@ -294,6 +313,12 @@ class SpectrumService(BaseService):
                     error=None,
                 )
 
+            seg_error = _segment_size_error(segment_size, dt)
+            if seg_error:
+                return self.create_result(
+                    success=False, data=None, message=seg_error, error=None
+                )
+
             event_list_1 = self.state.get_event_data(event_list_1_name)
             event_list_2 = self.state.get_event_data(event_list_2_name)
 
@@ -367,6 +392,12 @@ class SpectrumService(BaseService):
                     data=None,
                     message=f"EventList '{event_list_name}' not found",
                     error=None,
+                )
+
+            seg_error = _segment_size_error(segment_size, dt)
+            if seg_error:
+                return self.create_result(
+                    success=False, data=None, message=seg_error, error=None
                 )
 
             event_list = self.state.get_event_data(event_list_name)

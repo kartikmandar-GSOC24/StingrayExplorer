@@ -82,3 +82,18 @@ def test_dynamical_power_spectrum_serializes(loaded_state):
     result = svc.create_dynamical_power_spectrum("ev1", dt=0.0625, segment_size=8.0)
     assert result["success"], result
     json.dumps(result, allow_nan=False)
+
+
+def test_averaged_power_spectrum_serializes_with_n_segments(loaded_state):
+    svc = SpectrumService(loaded_state)
+    result = svc.create_averaged_power_spectrum("ev1", dt=0.0625, segment_size=8.0)
+    assert result["success"], result
+    json.dumps(result, allow_nan=False)
+    assert result["data"]["n_segments"] == 8
+
+
+def test_tiny_segment_size_rejected_with_readable_message(loaded_state):
+    svc = SpectrumService(loaded_state)
+    result = svc.create_averaged_power_spectrum("ev1", dt=0.0625, segment_size=0.125)
+    assert not result["success"]
+    assert "3x dt" in result["message"]

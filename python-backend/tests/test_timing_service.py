@@ -94,6 +94,13 @@ def test_time_lag_of_identical_signals_is_zero(loaded_state):
     assert np.max(np.abs(lags)) < 1e-10
 
 
+def test_tiny_segment_size_rejected_for_coherence(loaded_state):
+    svc = TimingService(loaded_state)
+    result = svc.calculate_coherence("ev1", "ev2", dt=0.0625, segment_size=0.125)
+    assert not result["success"]
+    assert "3x dt" in result["message"]
+
+
 def test_coherence_of_independent_signals_is_low(loaded_state):
     svc = TimingService(loaded_state)
     result = svc.calculate_coherence("ev1", "ev2", dt=0.0625, segment_size=8.0)
