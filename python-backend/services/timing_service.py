@@ -133,13 +133,13 @@ class TimingService(BaseService):
             lc = event_list.to_lc(dt=dt)
             dps = DynamicalPowerspectrum(lc, segment_size=segment_size, norm="leahy")
 
-            # Calculate integrated power in each frequency band.
+            # Mean power in each frequency band per time segment.
             # dps.dyn_ps has shape (n_freq, n_time); mask along axis 0 (freq).
             power_colors = {}
             for band_name, (f_min, f_max) in freq_ranges.items():
                 mask = (dps.freq >= f_min) & (dps.freq < f_max)
-                integrated_power = dps.dyn_ps[mask, :].mean(axis=0)
-                power_colors[band_name] = _finite_list(integrated_power)
+                band_mean_power = dps.dyn_ps[mask, :].mean(axis=0)
+                power_colors[band_name] = _finite_list(band_mean_power)
 
             result_data = {
                 "name": output_name,
@@ -233,6 +233,11 @@ class TimingService(BaseService):
             if time_lags_err is not None:
                 time_lags_err = np.real(np.asarray(time_lags_err))
 
+            if time_lags.shape != freq.shape:
+                raise ValueError(
+                    f"Unexpected time_lag() result shape {time_lags.shape}"
+                )
+
             if freq_range:
                 mask = (freq >= freq_range[0]) & (freq <= freq_range[1])
                 freq = freq[mask]
@@ -244,7 +249,9 @@ class TimingService(BaseService):
                 "name": output_name,
                 "freq": freq.tolist(),
                 "time_lags": _finite_list(time_lags),
-                "time_lags_err": _finite_list(time_lags_err) if time_lags_err is not None else None,
+                "time_lags_err": (
+                    _finite_list(time_lags_err) if time_lags_err is not None else None
+                ),
                 "freq_range": freq_range,
             }
 
@@ -329,13 +336,21 @@ class TimingService(BaseService):
                 coherence_vals, coherence_err = coh_result, None
 
             coherence_vals = np.real(np.asarray(coherence_vals))
+            if coherence_vals.shape != np.asarray(cs.freq).shape:
+                raise ValueError(
+                    f"Unexpected coherence() result shape {coherence_vals.shape}"
+                )
+
+            # Uncertainty formula goes negative where coh > 1; report magnitude as the half-width.
             result_data = {
                 "name": output_name,
                 "freq": cs.freq.tolist(),
                 "coherence": _finite_list(coherence_vals),
-                "coherence_err": _finite_list(np.real(np.asarray(coherence_err)))
-                if coherence_err is not None
-                else None,
+                "coherence_err": (
+                    _finite_list(np.abs(np.real(np.asarray(coherence_err))))
+                    if coherence_err is not None
+                    else None
+                ),
                 "segment_size": segment_size,
                 "n_segments": int(cs.m) if hasattr(cs, "m") else None,
             }
