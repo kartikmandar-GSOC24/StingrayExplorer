@@ -40,7 +40,9 @@ async function createWindow(): Promise<void> {
     minHeight: 768,
     show: false, // Don't show until ready
     webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
+      // .cjs extension is load-bearing: see the preload output comment in
+      // electron.vite.config.ts ("type": "module" + Electron >= ~29).
+      preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,

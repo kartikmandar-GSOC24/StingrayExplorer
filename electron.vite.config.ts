@@ -26,7 +26,11 @@ export default defineConfig({
         input: resolve(__dirname, 'electron/preload.ts'),
         output: {
           format: 'cjs',
-          entryFileNames: '[name].js',
+          // Must be .cjs: the root package.json sets "type": "module", and
+          // Electron >= ~29 resolves unsandboxed preload module type Node-style,
+          // so a CommonJS preload named .js is parsed as ESM and crashes before
+          // contextBridge.exposeInMainWorld runs (electronAPI never appears).
+          entryFileNames: '[name].cjs',
         },
       },
     },
