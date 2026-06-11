@@ -6,7 +6,13 @@
     <meta name="description" content="Stingray Explorer - Next Generation Spectral Timing Made Easy" />
     <meta name="keywords" content="Stingray, X-ray Astronomy, Timing Analysis, Spectral Analysis" />
     <meta name="author" content="Kartik Mandar" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:* http://127.0.0.1:*" />
+    <!-- script-src needs 'unsafe-eval': plotly's WebGL traces (scattergl) run on
+         regl, which generates its draw commands with new Function at runtime.
+         Without it regl's init throws EvalError, plotly swallows it, and every
+         gl plot renders "WebGL is not supported by your browser" despite a
+         healthy GPU. img-src needs data:/blob: for plotly's format probes and
+         the theme's data:-URI grain texture. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' http://localhost:* http://127.0.0.1:*" />
     <link rel="icon" type="image/png" href="/assets/images/stingray_explorer.png" />
     <title>Stingray Explorer</title>
   </head>
