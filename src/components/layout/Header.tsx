@@ -1,4 +1,4 @@
-import React, { useContext, useState } from 'react';
+import React, { useContext, useEffect, useState } from 'react';
 import {
   AppBar,
   Toolbar,
@@ -46,6 +46,19 @@ const Header: React.FC<HeaderProps> = ({
   const { searchOpen, searchQuery, setSearchOpen, setSearchQuery } = useUIStore();
 
   const [localSearchQuery, setLocalSearchQuery] = useState('');
+
+  // With titleBarStyle: 'hiddenInset' macOS draws the traffic lights over the
+  // web content, so the toolbar must reserve space for them on darwin only.
+  const [isMac, setIsMac] = useState(false);
+  useEffect(() => {
+    let mounted = true;
+    void window.electronAPI?.getPlatform().then((platform) => {
+      if (mounted) setIsMac(platform === 'darwin');
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const handleRestartBackend = async (): Promise<void> => {
     if (window.electronAPI) {
@@ -99,13 +112,15 @@ const Header: React.FC<HeaderProps> = ({
         },
       }}
     >
-      <Toolbar>
+      {/* The whole bar is a window drag region; interactive children opt out. */}
+      <Toolbar className="titlebar-drag-region" sx={{ pl: isMac ? '76px' : undefined }}>
         {/* Left sidebar toggle */}
         <IconButton
           edge="start"
           color="inherit"
           aria-label="toggle sidebar"
           onClick={onToggleSidebar}
+          className="titlebar-no-drag"
           sx={{ mr: 2, color: 'text.primary' }}
         >
           {sidebarOpen ? <MenuOpenIcon /> : <MenuIcon />}
@@ -160,6 +175,7 @@ const Header: React.FC<HeaderProps> = ({
               <Paper
                 component="form"
                 onSubmit={handleSearchSubmit}
+                className="titlebar-no-drag"
                 sx={{
                   display: 'flex',
                   alignItems: 'center',
@@ -202,6 +218,7 @@ const Header: React.FC<HeaderProps> = ({
             <IconButton
               color="inherit"
               onClick={handleSearchOpen}
+              className="titlebar-no-drag"
               sx={{ color: 'text.secondary', mr: 1 }}
             >
               <SearchIcon />
@@ -241,7 +258,7 @@ const Header: React.FC<HeaderProps> = ({
         </Tooltip>
 
         {/* Action buttons */}
-        <Box sx={{ display: 'flex', gap: 0.5 }}>
+        <Box className="titlebar-no-drag" sx={{ display: 'flex', gap: 0.5 }}>
           {/* Restart backend */}
           <Tooltip title="Restart Python backend">
             <IconButton
@@ -279,6 +296,7 @@ const Header: React.FC<HeaderProps> = ({
             color="inherit"
             aria-label="toggle right toolbar"
             onClick={onToggleRightToolbar}
+            className="titlebar-no-drag"
             sx={{
               ml: 2,
               color: rightToolbarOpen ? 'primary.main' : 'text.primary',
