@@ -197,11 +197,11 @@ body::after {
 
 /* --------------------------------------------------------------------------
    Plotly Chart Container
-   -------------------------------------------------------------------------- */
-.js-plotly-plot {
-  width: 100% !important;
-  height: 100% !important;
-}
+   --------------------------------------------------------------------------
+   Note: never add a global .js-plotly-plot width/height !important rule here.
+   It overrides PlotlyChart's explicit inline sizing and collapses every chart
+   to zero height inside auto-height containers (the plot renders but occupies
+   no space until a window resize forces a re-measure). */
 
 /* --------------------------------------------------------------------------
    Keyframe Animations
