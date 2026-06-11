@@ -16,7 +16,9 @@ from stingray import EventList
 from services.state_manager import StateManager
 
 
-def make_event_list(seed: int, n_events: int = 20000, length: float = 64.0) -> EventList:
+def make_event_list(
+    seed: int, n_events: int = 20000, length: float = 64.0
+) -> EventList:
     """Deterministic synthetic event list spanning [0, length] seconds."""
     rng = np.random.default_rng(seed)
     times = np.sort(rng.uniform(0.0, length, n_events))
