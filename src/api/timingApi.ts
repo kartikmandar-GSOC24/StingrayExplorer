@@ -11,7 +11,6 @@ export interface BispectrumData {
   lags: number[];
   bispec_mag: number[][];
   bispec_phase: number[][];
-  cum3?: number[][];
   maxlag: number;
   scale: string;
   window: string;

@@ -25,6 +25,7 @@ def test_averaged_cross_spectrum_is_strict_json_serializable(loaded_state):
     assert result["success"], result
     json.dumps(result, allow_nan=False)
     assert result["data"]["power_phase"] is not None
+    assert result["data"]["n_segments"] == 8  # 64 s fixture / 8 s segments
 
 
 def test_power_spectrum_has_null_phase(loaded_state):

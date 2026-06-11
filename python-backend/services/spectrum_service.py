@@ -386,6 +386,7 @@ class SpectrumService(BaseService):
                 "n_freq": len(cs.freq),
                 "df": float(cs.df),
                 "segment_size": segment_size,
+                "n_segments": int(cs.m) if hasattr(cs, "m") else None,
             }
 
             return self.create_result(

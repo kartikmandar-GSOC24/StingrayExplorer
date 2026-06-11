@@ -220,7 +220,7 @@ const PowerColorsPage: React.FC = () => {
                       </Typography>
                       <Typography variant="caption" color="text.secondary">
                         Ratios use band-mean (not band-integrated) power: PC tracks match literature power
-                        colours up to constant per-band factors, so absolute values are not comparable to
+                        colors up to constant per-band factors, so absolute values are not comparable to
                         published hue diagrams.
                       </Typography>
                       <PlotlyChart

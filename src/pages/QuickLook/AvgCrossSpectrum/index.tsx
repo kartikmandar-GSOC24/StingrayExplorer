@@ -220,6 +220,9 @@ const AvgCrossSpectrumPage: React.FC = () => {
                 {result?.segment_size !== undefined && (
                   <Chip size="small" label={`segment ${result.segment_size} s`} variant="outlined" />
                 )}
+                {result?.n_segments != null && (
+                  <Chip size="small" label={`${result.n_segments} segments`} variant="outlined" />
+                )}
                 <FormControlLabel
                   control={<Switch size="small" checked={logX} onChange={(e) => setLogX(e.target.checked)} />}
                   label="log f"
