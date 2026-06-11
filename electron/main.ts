@@ -48,6 +48,10 @@ async function createWindow(): Promise<void> {
       sandbox: false,
     },
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    // Pin the traffic lights so the header can reserve exact space for them:
+    // x:16 + ~52px cluster width ends at ~68; the Header's 72px spacer puts the
+    // first control at x=84. y:24 centers them in the 64px-tall app header.
+    trafficLightPosition: { x: 16, y: 24 },
     icon: isDev
       ? path.join(__dirname, '../resources/icon.png')
       : path.join(process.resourcesPath, 'icon.png'),
