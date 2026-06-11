@@ -1,4 +1,4 @@
-import React, { Suspense } from 'react';
+import React, { Suspense, useMemo } from 'react';
 import { Box, CircularProgress, useTheme } from '@mui/material';
 import type { Config, Data, Layout } from 'plotly.js';
 
@@ -17,7 +17,35 @@ const PLOT_CONFIG: Partial<Config> = {
   modeBarButtonsToRemove: ['lasso2d', 'select2d', 'autoScale2d'],
 };
 
+// Plotly's gl traces request their context with failIfMajorPerformanceCaveat,
+// so a renderer stuck in software compositing (e.g. after a GPU-process
+// failure) refuses them and plotly renders "WebGL is not supported by your
+// browser" into the plot div. Probe with the same flag once per session and
+// transparently fall back to SVG scatter when gl isn't genuinely available.
+let webglSupport: boolean | null = null;
+
+function webglAvailable(): boolean {
+  if (webglSupport === null) {
+    try {
+      const canvas = document.createElement('canvas');
+      webglSupport = !!canvas.getContext('webgl', { failIfMajorPerformanceCaveat: true });
+    } catch {
+      webglSupport = false;
+    }
+  }
+  return webglSupport;
+}
+
 const PlotlyChart: React.FC<PlotlyChartProps> = ({ data, layout = {}, height = 440 }) => {
+  const displayData = useMemo<Data[]>(() => {
+    if (webglAvailable()) return data;
+    return data.map((trace) =>
+      (trace as { type?: string }).type === 'scattergl'
+        ? ({ ...trace, type: 'scatter' } as Data)
+        : trace
+    );
+  }, [data]);
+
   const theme = useTheme();
   const isDark = theme.palette.mode === 'dark';
   const gridColor = isDark ? 'rgba(148, 163, 184, 0.12)' : 'rgba(100, 116, 139, 0.2)';
@@ -47,7 +75,7 @@ const PlotlyChart: React.FC<PlotlyChartProps> = ({ data, layout = {}, height = 4
       }
     >
       <Plot
-        data={data}
+        data={displayData}
         layout={mergedLayout}
         config={PLOT_CONFIG}
         useResizeHandler
