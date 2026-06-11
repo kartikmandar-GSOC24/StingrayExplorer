@@ -113,7 +113,11 @@ const Header: React.FC<HeaderProps> = ({
       }}
     >
       {/* The whole bar is a window drag region; interactive children opt out. */}
-      <Toolbar className="titlebar-drag-region" sx={{ pl: isMac ? '76px' : undefined }}>
+      <Toolbar className="titlebar-drag-region">
+        {/* Spacer clearing the macOS traffic lights (drawn over the content by
+            titleBarStyle hiddenInset). A real element, not Toolbar padding:
+            sx padding loses the cascade against MuiToolbar-gutters' media rule. */}
+        {isMac && <Box aria-hidden sx={{ width: 56, flexShrink: 0 }} />}
         {/* Left sidebar toggle */}
         <IconButton
           edge="start"
