@@ -114,12 +114,20 @@ const Header: React.FC<HeaderProps> = ({
     >
       {/* The whole bar is a window drag region; interactive children opt out. */}
       <Toolbar className="titlebar-drag-region">
-        {/* Spacer clearing the macOS traffic lights (drawn over the content by
-            titleBarStyle hiddenInset; position pinned in electron/main.ts to
-            x:16, ~52px wide -> ends ~68px). A real element, not Toolbar
-            padding: sx padding loses the cascade against MuiToolbar-gutters'
-            media rule. 96px + 24px gutter - 12px edge offset = controls at 108. */}
-        {isMac && <Box aria-hidden sx={{ width: 96, flexShrink: 0 }} />}
+        {/* Spacer clearing the macOS traffic lights. Sized from the Window
+            Controls Overlay env var (enabled via titleBarOverlay in main.ts),
+            which the compositor recomputes on page zoom and fullscreen —
+            fixed pixel offsets drift against the OS-drawn buttons when the
+            user zooms. 16px breathing room after the safe-area edge; 80px
+            fallback if the env var is ever unavailable. A real element, not
+            Toolbar padding: sx padding loses the cascade against
+            MuiToolbar-gutters' media rule. */}
+        {isMac && (
+          <Box
+            aria-hidden
+            sx={{ width: 'calc(env(titlebar-area-x, 80px) + 16px)', flexShrink: 0 }}
+          />
+        )}
         {/* Left sidebar toggle */}
         <IconButton
           edge="start"

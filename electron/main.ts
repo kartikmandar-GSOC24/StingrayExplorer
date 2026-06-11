@@ -48,10 +48,12 @@ async function createWindow(): Promise<void> {
       sandbox: false,
     },
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
-    // Pin the traffic lights so the header can reserve exact space for them:
-    // x:16 + ~52px cluster width ends at ~68; the Header's 72px spacer puts the
-    // first control at x=84. y:24 centers them in the 64px-tall app header.
+    // Pin the traffic lights (y:24 centers them in the 64px app header) and
+    // enable the Window Controls Overlay API so the renderer can size its
+    // titlebar inset from env(titlebar-area-x) — which tracks page zoom and
+    // fullscreen, unlike any fixed pixel offset.
     trafficLightPosition: { x: 16, y: 24 },
+    titleBarOverlay: true,
     icon: isDev
       ? path.join(__dirname, '../resources/icon.png')
       : path.join(process.resourcesPath, 'icon.png'),
