@@ -118,8 +118,8 @@ const Header: React.FC<HeaderProps> = ({
             titleBarStyle hiddenInset; position pinned in electron/main.ts to
             x:16, ~52px wide -> ends ~68px). A real element, not Toolbar
             padding: sx padding loses the cascade against MuiToolbar-gutters'
-            media rule. 72px + 24px gutter - 12px edge offset = controls at 84. */}
-        {isMac && <Box aria-hidden sx={{ width: 72, flexShrink: 0 }} />}
+            media rule. 96px + 24px gutter - 12px edge offset = controls at 108. */}
+        {isMac && <Box aria-hidden sx={{ width: 96, flexShrink: 0 }} />}
         {/* Left sidebar toggle */}
         <IconButton
           edge="start"
