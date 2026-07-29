@@ -16,7 +16,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routes import data_routes, lightcurve_routes, spectrum_routes, timing_routes, export_routes, log_routes, archive_routes, job_routes
+from routes import data_routes, lightcurve_routes, spectrum_routes, timing_routes, export_routes, log_routes, archive_routes, job_routes, correlation_routes, varenergy_routes, deadtime_routes
 from services.state_manager import StateManager
 from services.data_service import DataService
 from services.job_manager import JobManager
@@ -110,6 +110,9 @@ def create_app() -> FastAPI:
     app.include_router(log_routes.router, prefix="/api/logs", tags=["Logs"])
     app.include_router(archive_routes.router, prefix="/api/archive", tags=["Archive"])
     app.include_router(job_routes.router, prefix="/api/jobs", tags=["Jobs"])
+    app.include_router(correlation_routes.router, prefix="/api/correlation", tags=["Correlation"])
+    app.include_router(varenergy_routes.router, prefix="/api/varenergy", tags=["VarEnergy"])
+    app.include_router(deadtime_routes.router, prefix="/api/deadtime", tags=["Deadtime"])
 
     @app.get("/")
     async def root():
