@@ -162,6 +162,31 @@ async function initializeApp(): Promise<void> {
   }
 }
 
+/**
+ * Restart the Python backend, emitting the same renderer events as initial
+ * startup so the backend status in the UI never goes stale. Errors are
+ * reported via python:error rather than rethrown — the renderer's restart
+ * button awaits the IPC call without a catch.
+ */
+async function restartBackend(): Promise<void> {
+  if (!pythonManager) {
+    await initializeApp();
+    return;
+  }
+
+  mainWindow?.webContents.send('python:starting');
+  sendLog('info', 'Restarting Python backend...');
+
+  try {
+    await pythonManager.restart();
+    mainWindow?.webContents.send('python:ready', pythonManager.getPort());
+    sendLog('info', `Python backend restarted successfully on port ${pythonManager.getPort()}`);
+  } catch (error) {
+    sendLog('error', `Failed to restart Python backend: ${error}`);
+    mainWindow?.webContents.send('python:error', String(error));
+  }
+}
+
 // Handle renderer ready signal
 ipcMain.on('log:rendererReady', () => {
   rendererReady = true;
@@ -176,7 +201,7 @@ app.whenReady().then(async () => {
   app.setName('Stingray Explorer');
 
   // Set up IPC handlers before creating window
-  setupIpcHandlers(() => pythonManager);
+  setupIpcHandlers(() => pythonManager, restartBackend);
 
   await createWindow();
   await initializeApp();

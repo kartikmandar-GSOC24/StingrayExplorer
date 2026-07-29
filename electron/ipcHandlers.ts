@@ -4,11 +4,15 @@ import path from 'path';
 import { PythonManager } from './pythonManager';
 
 type PythonManagerGetter = () => PythonManager | null;
+type PythonRestarter = () => Promise<void>;
 
 /**
  * Set up all IPC handlers for communication between main and renderer processes
  */
-export function setupIpcHandlers(getPythonManager: PythonManagerGetter): void {
+export function setupIpcHandlers(
+  getPythonManager: PythonManagerGetter,
+  restartPython: PythonRestarter
+): void {
   // ============================================
   // File Dialog Handlers
   // ============================================
@@ -143,12 +147,11 @@ export function setupIpcHandlers(getPythonManager: PythonManagerGetter): void {
     return pythonManager?.getIsRunning() || false;
   });
 
-  ipcMain.handle('python:restart', async () => {
-    const pythonManager = getPythonManager();
-    if (pythonManager) {
-      await pythonManager.restart();
-    }
-  });
+  // Restart goes through main.ts so the renderer receives the same
+  // python:starting/python:ready/python:error events as initial startup —
+  // calling pythonManager.restart() directly would leave the renderer's
+  // backend status stale until a window reload.
+  ipcMain.handle('python:restart', () => restartPython());
 
   // ============================================
   // Application Info Handlers

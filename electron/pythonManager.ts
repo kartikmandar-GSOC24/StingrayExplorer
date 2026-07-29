@@ -18,12 +18,13 @@ export class PythonManager {
   private process: ChildProcess | null = null;
   private port: number = 8765;
   private retryInterval: number = 500; // ms between health checks
-  // Hard cap on how long we wait for the backend to answer /health. A cold
-  // first launch imports the full scientific stack (stingray, numba, astropy,
-  // scipy) and warms numba's compile cache, which can take ~60s — so this is
-  // deliberately generous. We fail sooner if the spawned process dies (see
-  // waitForReady), so a genuine startup crash still surfaces quickly.
-  private readyTimeoutMs: number = 180000; // 3 minutes
+  // Soft threshold after which the wait for /health is logged as a warning.
+  // A cold first launch imports the full scientific stack (stingray, numba,
+  // astropy, scipy) and warms numba's compile cache — ~60s normally, but a
+  // loaded machine can push it well past any fixed cap, so we never give up
+  // while the child process is still alive (see waitForReady). A genuine
+  // startup crash still surfaces quickly because the process exits.
+  private slowStartWarnMs: number = 180000; // 3 minutes
   private progressLogIntervalMs: number = 15000; // emit a "still waiting" log every 15s
   private isRunning: boolean = false;
   private externalBackend: boolean = false; // True if backend was started externally
@@ -229,13 +230,26 @@ export class PythonManager {
     }
 
     return new Promise((resolve) => {
-      if (!this.process) {
+      // Capture the process we are stopping: this.process gets reassigned by a
+      // subsequent start(), and an uncancelled timer reading this.process would
+      // SIGKILL the freshly started replacement backend (seen during restart()).
+      const proc = this.process;
+      if (!proc) {
         resolve();
         return;
       }
 
+      // Force kill after 5 seconds if this same process is still running
+      const forceKillTimer = setTimeout(() => {
+        if (this.process === proc) {
+          this.sendLog('warn', 'Force killing Python backend...');
+          proc.kill('SIGKILL');
+        }
+      }, 5000);
+
       // Try graceful shutdown first
-      this.process.once('exit', () => {
+      proc.once('exit', () => {
+        clearTimeout(forceKillTimer);
         this.process = null;
         this.isRunning = false;
         this.sendLog('info', 'Python backend stopped');
@@ -243,15 +257,7 @@ export class PythonManager {
       });
 
       // Send SIGTERM for graceful shutdown
-      this.process.kill('SIGTERM');
-
-      // Force kill after 5 seconds if still running
-      setTimeout(() => {
-        if (this.process) {
-          this.sendLog('warn', 'Force killing Python backend...');
-          this.process.kill('SIGKILL');
-        }
-      }, 5000);
+      proc.kill('SIGTERM');
     });
   }
 
@@ -299,17 +305,17 @@ export class PythonManager {
 
     const startTime = Date.now();
     let lastProgressLog = startTime;
+    let slowStartWarned = false;
 
-    // Poll until the backend is healthy, the process dies, or we hit the hard
-    // cap. We deliberately keep waiting as long as the process is alive — a
-    // cold import of stingray/numba/astropy routinely exceeds the old 30s
-    // limit on first launch, which made Electron give up and show a spurious
-    // "backend failed to start" error even though it came up moments later.
-    while (Date.now() - startTime < this.readyTimeoutMs) {
-      // If we spawned the process and it has already exited, there's no point
-      // waiting out the full timeout — fail fast so the real error (crash,
-      // missing dependency, etc.) surfaces immediately. The exit handler in
-      // start() sets this.process to null when the child exits.
+    // Poll until the backend is healthy or the process dies. There is no hard
+    // deadline: a fixed cap (previously 180s) was observed expiring while the
+    // child was alive and still importing, leaving the app stuck in an error
+    // state even though the backend became healthy seconds later. A live
+    // process is either booting or serving — only a dead one is a failure.
+    for (;;) {
+      // If we spawned the process and it has already exited, fail fast so the
+      // real error (crash, missing dependency, etc.) surfaces immediately.
+      // The exit handler in start() sets this.process to null on child exit.
       if (!this.process) {
         throw new Error('Python backend process exited before becoming ready');
       }
@@ -324,20 +330,24 @@ export class PythonManager {
         // Ignore errors, keep trying
       }
 
-      // Periodic progress so a slow cold start doesn't look like a hang.
+      // Periodic progress so a slow cold start doesn't look like a hang, with
+      // a one-time escalation to warn once the start is unusually slow.
       if (Date.now() - lastProgressLog >= this.progressLogIntervalMs) {
         const elapsed = Math.round((Date.now() - startTime) / 1000);
-        this.sendLog('info', `Still waiting for Python backend... (${elapsed}s elapsed)`);
+        if (!slowStartWarned && Date.now() - startTime >= this.slowStartWarnMs) {
+          slowStartWarned = true;
+          this.sendLog(
+            'warn',
+            `Python backend is taking unusually long to start (${elapsed}s); continuing to wait while the process is alive. Use the restart button if it never comes up.`
+          );
+        } else {
+          this.sendLog('info', `Still waiting for Python backend... (${elapsed}s elapsed)`);
+        }
         lastProgressLog = Date.now();
       }
 
       await this.sleep(this.retryInterval);
     }
-
-    const seconds = Math.round(this.readyTimeoutMs / 1000);
-    const errorMsg = `Python backend failed to become ready within ${seconds} seconds`;
-    this.sendLog('error', errorMsg);
-    throw new Error(errorMsg);
   }
 
   /**
