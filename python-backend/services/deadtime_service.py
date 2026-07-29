@@ -33,6 +33,25 @@ def _gti_exposure(event_list) -> float:
     return float(np.sum(gti[:, 1] - gti[:, 0]))
 
 
+def _finite_or_none(value) -> Optional[float]:
+    """Coerce a stingray-meta scalar to a JSON-safe float, or None.
+
+    Every array column in this service is sanitized with `finite_list`, but
+    scalars pulled straight out of `results.meta` are not. FAD's smoothed
+    Fourier difference (`smooth_real`) can be exactly zero -- e.g. when the
+    two inputs are byte-identical -- which turns `fad_delta` (and, in
+    principle, any other meta scalar derived from that same division) into
+    NaN. An unguarded `float(nan)` would pass success=True all the way to
+    `json.dumps(..., allow_nan=False)` and blow up the response. This is the
+    scalar equivalent of `finite_list`.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if np.isfinite(f) else None
+
+
 def _detached_copy(event_list) -> EventList:
     """A throwaway EventList sharing the stored arrays but owning its own GTI.
 
@@ -220,7 +239,20 @@ class DeadtimeService(BaseService):
             dt: Time binning in seconds
             segment_size: Segment length in seconds
             norm: Power spectrum normalization (frac/leahy/abs/none)
-            smoothing_length: Smoothing window in seconds (default 3x segment_size)
+            smoothing_length: Sigma (standard deviation) of the Gaussian
+                filter stingray uses to smooth the FAD diagnostic in
+                frequency space, in units of frequency BINS (array samples)
+                -- NOT seconds, despite the field name. stingray passes this
+                value straight to `scipy.ndimage.gaussian_filter1d` on the
+                per-segment power spectrum, whose bin spacing is
+                df = 1/segment_size, so the physical smoothing width in Hz
+                is smoothing_length / segment_size: the same numeric value
+                smooths a different physical frequency range depending on
+                segment_size. When left as None, stingray defaults to
+                `3 * segment_size` (segment_size in seconds, reused verbatim
+                as a bin count), which happens to give a
+                segment_size-independent physical width of 3 Hz -- unlike
+                any value supplied explicitly here.
 
         Returns:
             Result dictionary with FAD-corrected periodograms
@@ -244,6 +276,39 @@ class DeadtimeService(BaseService):
             events1 = self.state.get_event_data(event_list_1_name)
             events2 = self.state.get_event_data(event_list_2_name)
 
+            # Preflight the degenerate inputs stingray fails on cryptically
+            # deep inside FAD (a bare IndexError/AssertionError/ZeroDivision
+            # with no mention of which event list or GTI caused it):
+            #   - an event list with no events at all -- note `EventList.time`
+            #     is `None`, not an empty array, when the list is genuinely
+            #     empty, so `len(events.time)` cannot be used directly here.
+            #   - an event list with events but zero good-time exposure (e.g.
+            #     a fully-screened observation with `gti` reduced to zero
+            #     rows).
+            for name, events in (
+                (event_list_1_name, events1),
+                (event_list_2_name, events2),
+            ):
+                n_events = 0 if events.time is None else len(events.time)
+                if n_events == 0:
+                    return self.create_result(
+                        success=False,
+                        data=None,
+                        message=f"EventList '{name}' contains no events",
+                        error=None,
+                    )
+                if _gti_exposure(events) <= 0:
+                    return self.create_result(
+                        success=False,
+                        data=None,
+                        message=(
+                            f"EventList '{name}' has no good-time exposure "
+                            "(its GTI is empty); cannot compute the FAD "
+                            "diagnostic"
+                        ),
+                        error=None,
+                    )
+
             ovl_error = overlap_error(events1, events2, segment_size)
             if ovl_error:
                 return self.create_result(
@@ -265,17 +330,33 @@ class DeadtimeService(BaseService):
                 )
 
             n_segments = int(results.meta["M"])
+            # `fad_delta` is `(std - stdtheor) / stdtheor`, where `std` comes
+            # from dividing by the smoothed Fourier difference; that smoothed
+            # value can be exactly zero (e.g. the two inputs are
+            # byte-identical), producing a NaN that must never reach the
+            # response unguarded (json.dumps(..., allow_nan=False) would
+            # raise and take the whole request down with an unhandled 500).
+            fad_delta = _finite_or_none(results.meta["fad_delta"])
             if n_segments < MIN_FAD_SEGMENTS:
                 warning_messages.append(
                     f"Only {n_segments} segments were averaged (fewer than "
                     f"{MIN_FAD_SEGMENTS}); the FAD correction is unreliable below "
                     "that. Shorten segment_size or use a longer observation."
                 )
-            if not bool(results.meta["is_compliant"]):
+            if fad_delta is None:
+                warning_messages.append(
+                    "The FAD compliance diagnostic (fad_delta) could not be "
+                    "computed: the smoothed Fourier difference between the "
+                    "two inputs was zero, which happens when the two event "
+                    "lists are identical or otherwise fully correlated. Use "
+                    "two independent, simultaneous detectors; fad_delta and "
+                    "the compliance check are unavailable for this run."
+                )
+            elif not bool(results.meta["is_compliant"]):
                 warning_messages.append(
                     "FAD diagnostic failed: the scatter of the smoothed Fourier "
                     "difference deviates from theory by "
-                    f"{float(results.meta['fad_delta']) * 100:.1f}%. The two event "
+                    f"{fad_delta * 100:.1f}%. The two event "
                     "lists may not be independent simultaneous detectors."
                 )
 
@@ -292,12 +373,12 @@ class DeadtimeService(BaseService):
                 "cs": finite_list(np.abs(cs)),
                 "cs_real": finite_list(cs.real),
                 "n_segments": n_segments,
-                "dt": float(results.meta["dt"]),
+                "dt": _finite_or_none(results.meta["dt"]),
                 "segment_size": float(segment_size),
                 "norm": str(results.meta["norm"]),
-                "smoothing_length": float(results.meta["smoothing_length"]),
+                "smoothing_length": _finite_or_none(results.meta["smoothing_length"]),
                 "is_compliant": bool(results.meta["is_compliant"]),
-                "fad_delta": float(results.meta["fad_delta"]),
+                "fad_delta": fad_delta,
                 "warnings": warning_messages,
             }
 

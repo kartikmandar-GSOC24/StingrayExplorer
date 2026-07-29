@@ -12,8 +12,13 @@ import { apiClient, ApiResponse } from './client';
  *
  * Sign convention (cross-correlation only): time_shift > 0 means the first
  * event list lags the second; time_shift < 0 means the first list leads.
- * time_shift is always null for auto-correlation (by construction) and is
- * nulled for cross-correlation whenever corr contains NaN.
+ * For auto-correlation the backend returns 0.0 (the peak is at zero lag by
+ * construction) -- not null. time_shift is null only when corr contains NaN,
+ * which can happen on either endpoint with norm='variance'.
+ *
+ * dt is the bin size actually used, which is always the dt requested: both
+ * endpoints bin onto their own grid rather than going through
+ * EventList.to_lc, which would snap dt to the instrument time resolution.
  */
 export interface CorrelationData {
   time_lags: Array<number | null>;

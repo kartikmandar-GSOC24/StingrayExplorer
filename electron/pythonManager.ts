@@ -78,6 +78,15 @@ export class PythonManager {
         ...process.env,
         PYTHONUNBUFFERED: '1',
         PYTHONDONTWRITEBYTECODE: '1',
+        // Python 3.14+: make warnings.catch_warnings state context-local instead
+        // of process-global, so the concurrent warning capture in
+        // services/analysis_helpers.py (collect_warnings) can run lock-free.
+        // Unknown to older interpreters, which simply ignore it; analysis_helpers
+        // falls back to a serializing lock whenever the flag is not active.
+        // Requires that any global warnings.showwarning replacement chain to the
+        // handler it displaced - utils/log_stream.py does, and
+        // tests/test_analysis_helpers.py keeps it that way.
+        PYTHON_CONTEXT_AWARE_WARNINGS: '1',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });

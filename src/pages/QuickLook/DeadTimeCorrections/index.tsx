@@ -181,8 +181,9 @@ const DeadTimeCorrectionsPage: React.FC = () => {
       ]
     : [];
 
-  // Shape coordinates on a log axis are given in log10 of the data value.
-  const leahyLineY = pdsLogAxes ? Math.log10(LEAHY_WHITE_NOISE) : LEAHY_WHITE_NOISE;
+  // Shape coordinates use raw data values on log axes in this plotly version
+  // (verified live: passing log10(2) rendered the line at y=0.3, not y=2).
+  const leahyLineY = LEAHY_WHITE_NOISE;
 
   // --- Panel (c): FAD correction --------------------------------------------
   const fadDtNum = parsePositiveNumber(fadDt);
@@ -193,13 +194,15 @@ const DeadTimeCorrectionsPage: React.FC = () => {
   const canRunFad =
     fadEventList1 !== '' &&
     fadEventList2 !== '' &&
+    !fadListsIdentical &&
     fadDtNum !== null &&
     fadSegmentNum !== null &&
     !fadSmoothingInvalid &&
     !fadRunning;
 
   const handleRunFad = (): void => {
-    if (fadDtNum === null || fadSegmentNum === null || fadSmoothingInvalid) return;
+    if (fadDtNum === null || fadSegmentNum === null || fadSmoothingInvalid || fadListsIdentical)
+      return;
     void runFad(() =>
       deadtimeApi.fadCorrection({
         event_list_1_name: fadEventList1,
@@ -399,7 +402,7 @@ const DeadTimeCorrectionsPage: React.FC = () => {
                     </Select>
                   </FormControl>
                   <TextField
-                    label="Smoothing length (s)"
+                    label="Smoothing sigma (bins)"
                     size="small"
                     value={fadSmoothingLength}
                     onChange={(e) => setFadSmoothingLength(e.target.value)}
@@ -407,7 +410,7 @@ const DeadTimeCorrectionsPage: React.FC = () => {
                     helperText={
                       fadSmoothingInvalid
                         ? 'Must be a positive number'
-                        : 'Blank uses 3 × segment size'
+                        : 'Gaussian sigma in frequency bins; blank uses 3 × segment size'
                     }
                   />
                   <Button

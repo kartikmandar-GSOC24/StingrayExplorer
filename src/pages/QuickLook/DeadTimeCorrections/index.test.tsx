@@ -179,9 +179,36 @@ describe('DeadTimeCorrectionsPage', () => {
     await selectEventList('Detector 2 event list', /obs2/);
     expect(fadButton).toBeEnabled();
 
-    await userEvent.type(screen.getByLabelText('Smoothing length (s)'), 'x');
+    await userEvent.type(screen.getByLabelText('Smoothing sigma (bins)'), 'x');
     expect(fadButton).toBeDisabled();
     expect(pdsCorrection).not.toHaveBeenCalled();
     expect(fadCorrection).not.toHaveBeenCalled();
+  });
+
+  it('disables Compute FAD when both detector selectors hold the same event list', async () => {
+    renderWithProviders(<DeadTimeCorrectionsPage />);
+    const fadButton = screen.getByRole('button', { name: /Compute FAD/ });
+
+    await selectEventList('Detector 1 event list', /obs1/);
+    await selectEventList('Detector 2 event list', /obs2/);
+    expect(fadButton).toBeEnabled();
+    expect(
+      screen.queryByText(/FAD needs two independent detectors/)
+    ).not.toBeInTheDocument();
+
+    // Selecting the same list for both detectors must disable the button again
+    // and explain why, instead of silently allowing a meaningless FAD run.
+    await selectEventList('Detector 2 event list', /obs1/);
+    expect(fadButton).toBeDisabled();
+    expect(screen.getByText(/FAD needs two independent detectors/)).toBeInTheDocument();
+
+    await selectEventList('Detector 2 event list', /obs2/);
+    expect(fadButton).toBeEnabled();
+    expect(
+      screen.queryByText(/FAD needs two independent detectors/)
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(fadButton);
+    await waitFor(() => expect(fadCorrection).toHaveBeenCalled());
   });
 });

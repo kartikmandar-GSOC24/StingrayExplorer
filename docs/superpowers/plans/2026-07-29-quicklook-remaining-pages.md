@@ -119,6 +119,16 @@ Data `{ freq[], pds1[], pds2[], ptot[], cs[], n_segments, warnings }`.
 - **Phase 2 (workflow):** one agent writes the three API modules to the interfaces above; then 9 parallel page agents (one per page dir) write `index.tsx` + `index.test.tsx`; gates `npm run typecheck && npm run lint && npm test -- --run`.
 - **Phase 3 (verification workflow + orchestrator):** full-suite gates; adversarial science review of the three services against this doc's verified-facts section; live E2E of all 9 pages via CDP with a dense synthetic event file (modulated correlated variability so covariance/rms produce finite results); fix findings; update this doc's execution notes; commit.
 
-## Execution notes
+## Execution notes (2026-07-29)
 
-(appended as work lands)
+All phases executed same-day; every gate green at completion (backend pytest **145 passed**, vitest **72 passed**, typecheck clean, eslint 0 errors). Live E2E of all nine pages performed via CDP against `npm run dev` with dense synthetic data (120k-event 0.5 Hz-modulated list + 0.5 s-shifted copy + two independent dead-time-filtered streams, loaded as HDF5 via `/api/data/load`).
+
+**Key deviations/decisions (full details in service docstrings and tests):**
+- Legacy `stingray.covariancespectrum` module rejected after introspection proved it histograms the energy column as arrival times and its "averaged" variant always computes exactly one segment; both covariance endpoints use `varenergyspectrum.CovarianceSpectrum` (unsegmented page = one segment spanning the longest GTI, with GTI-usage accounting fields).
+- `ExcessVarianceSpectrum` 2.2.10 discard-bug worked around via a subclass whose `_spectrum_function` stores its results (single compute); excess variance additionally masks inter-GTI gap bins (`create_gti_mask`), which the upstream class does not — gaps otherwise fabricate variability.
+- `stingray.deadtime.fad.FAD` mutates its inputs' GTIs; the service passes detached EventList copies. `fad_delta` can be NaN (identical inputs) — serialized as null + warning.
+- Cross/auto correlation bin on a shared relative-time grid built with `np.histogram` (stingray ignores absolute time and `to_lc` snaps dt); 500k-bin cap; unsorted-time-safe bounds (`np.min`/`np.max`); verified sign convention pinned: positive `time_shift` ⇒ first list lags second.
+- `collect_warnings` is context-aware on Python 3.14 (`PYTHON_CONTEXT_AWARE_WARNINGS=1` set at spawn; `-X` flag in `python:dev`) with a serializing RLock fallback — `warnings.catch_warnings` is otherwise process-global and concurrent captures cross-contaminate and can permanently orphan the global warning hook.
+- Post-implementation adversarial review (5 reviewers + per-finding verification) confirmed 22 findings (1 critical, 10 major, 11 minor); all fixed and pinned with discriminating tests (each verified to fail against the pre-fix code where practical). One rejected finding (hardcoded trace colors) left as-is.
+- Live E2E numeric cross-checks: recovered `time_shift = -0.5000 s` for the +0.5 s-shifted list; Leahy dead-time correction restored mean power ≈ 2 with the calculator's predicted detected rate (171.43 c/s) matching the measured data rate (171.41 c/s); FAD Δ = 0.007 (compliant) at 37 segments; counts/band = 24k = 120k/5.
+- Plotly quirk (verified live): shapes on log axes use RAW data coordinates in the bundled plotly version, not log10 — the Leahy reference line is passed untransformed.

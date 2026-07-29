@@ -135,6 +135,9 @@ const AvgCovarianceSpectrumPage: React.FC = () => {
     );
   };
 
+  const finiteSpectrum = result ? result.spectrum.filter((v): v is number => v !== null) : [];
+  const allNull = result !== null && result.spectrum.length > 0 && finiteSpectrum.length === 0;
+
   const traces: Data[] = result
     ? [
         {
@@ -350,29 +353,40 @@ const AvgCovarianceSpectrumPage: React.FC = () => {
                 </Alert>
               )}
               {result ? (
-                <PlotlyChart
-                  data={traces}
-                  layout={{
-                    xaxis: { title: { text: 'Energy (keV)' }, type: logEnergy ? 'log' : 'linear' },
-                    yaxis: {
-                      title: {
-                        text: norm === 'frac' ? 'Covariance (fractional)' : 'Covariance (absolute)',
+                allNull ? (
+                  <Box sx={{ py: 10, textAlign: 'center' }}>
+                    <Typography color="text.secondary">
+                      No finite covariance values in any energy band. This is expected for
+                      Poisson-dominated or weakly variable sources — it is not an error. See the
+                      warnings above and try a coarser bin, fewer bands, or a source with stronger
+                      correlated variability.
+                    </Typography>
+                  </Box>
+                ) : (
+                  <PlotlyChart
+                    data={traces}
+                    layout={{
+                      xaxis: { title: { text: 'Energy (keV)' }, type: logEnergy ? 'log' : 'linear' },
+                      yaxis: {
+                        title: {
+                          text: norm === 'frac' ? 'Covariance (fractional)' : 'Covariance (absolute)',
+                        },
                       },
-                    },
-                    shapes: [
-                      {
-                        type: 'line',
-                        xref: 'paper',
-                        x0: 0,
-                        x1: 1,
-                        yref: 'y',
-                        y0: 0,
-                        y1: 0,
-                        line: { width: 1, dash: 'dash' },
-                      },
-                    ],
-                  }}
-                />
+                      shapes: [
+                        {
+                          type: 'line',
+                          xref: 'paper',
+                          x0: 0,
+                          x1: 1,
+                          yref: 'y',
+                          y0: 0,
+                          y1: 0,
+                          line: { width: 1, dash: 'dash' },
+                        },
+                      ],
+                    }}
+                  />
+                )
               ) : (
                 <Box sx={{ py: 10, textAlign: 'center' }}>
                   <Typography color="text.secondary">

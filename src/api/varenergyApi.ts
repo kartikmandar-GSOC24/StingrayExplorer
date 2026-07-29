@@ -68,6 +68,13 @@ export interface CovarianceSpectrumData {
   norm: string;
   segment_size: number;
   n_segments_hint: number;
+  // GTI accounting: segments start at GTI boundaries, so GTIs shorter than
+  // segment_size contribute nothing; when n_gtis_used < n_gtis_total the
+  // backend also appends a warning naming the skipped exposure.
+  n_gtis_total?: number;
+  n_gtis_used?: number;
+  exposure_total?: number;
+  exposure_used?: number;
   warnings: string[];
 }
 

@@ -13,6 +13,24 @@ position and never looks at ``Lightcurve.time``, so two lists covering different
 absolute time ranges would be silently mis-aligned. This service therefore bins
 both event lists onto ONE shared bin-edge grid spanning their common time range
 before handing them to stingray.
+
+Three properties of that binning are load-bearing and easy to break:
+
+* Bounds come from ``np.min``/``np.max``, never ``time[0]``/``time[-1]``:
+  ``EventList.read`` does not forward ``skip_checks`` in stingray 2.2.10, so an
+  unsorted event file reaches this service with its stored endpoints pointing at
+  arbitrary interior photons. ``np.histogram`` does not need sorted input.
+* The grid is built in time RELATIVE to the start of the range. ``np.arange``
+  over absolute mission times quantises to the local float64 spacing (1.5e-8 s
+  at MET 8e7), which makes the real bin width differ from the ``dt`` stamped on
+  the ``Lightcurve`` -- and stingray derives ``time_lags`` from that stamped
+  value, so the whole lag axis would be silently stretched.
+* Both endpoints bin with the SAME helper at exactly the requested ``dt``.
+  ``EventList.to_lc`` would instead snap ``dt`` to a multiple of the event
+  list's instrument time resolution, so the auto- and cross-correlation pages
+  would disagree on the lag axis for identical input. The snapping exists to
+  avoid beat artefacts, so ``_resolution_warning`` surfaces the mismatch
+  instead of silently changing the user's ``dt``.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,6 +49,12 @@ VALID_NORMS = ("none", "variance")
 
 # Minimum number of shared bins before a correlation is worth computing.
 MIN_BINS = 3
+
+# Maximum number of bins one request may allocate. Nothing else bounds this:
+# two 3 ks lists at dt=1e-3 already produce ~3e6 lags, a ~93 MB JSON body and
+# several hundred MB of RSS, and a finer dt OOMs the backend outright. Mirrors
+# the DEFAULT_MAX_PLOT_POINTS cap lightcurve_service applies to plot payloads.
+MAX_BINS = 500_000
 
 
 def _mode_error(mode: str) -> Optional[str]:
@@ -68,6 +92,55 @@ def _span_error(span: float, dt: float, what: str) -> Optional[str]:
             f"at least {MIN_BINS} bins are needed to correlate"
         )
     return None
+
+
+def _bin_cap_error(span: float, dt: float, what: str) -> Optional[str]:
+    """Readable rejection when a request would allocate an unusable grid.
+
+    Formatted as a float so a pathologically small dt (span/dt = inf) still
+    produces a sentence rather than an OverflowError from ``int()``.
+    """
+    n_bins = span / dt
+    if n_bins <= MAX_BINS:
+        return None
+    return (
+        f"dt ({dt}s) over {what} ({span:.3f}s) gives {n_bins:,.0f} bins; "
+        f"increase dt or shorten the range (the cap is {MAX_BINS:,} bins)"
+    )
+
+
+def _time_bounds(event_list) -> Tuple[float, float]:
+    """First and last event time of a list that may not be sorted.
+
+    ``time[0]``/``time[-1]`` are NOT the bounds: stingray only sorts when
+    ``skip_checks`` is False, and ``EventList.read`` never forwards it, so an
+    unsorted file yields interior endpoints. Using them shrinks the shared grid
+    to a sliver of the data (or inverts it, faking a no-overlap rejection).
+    """
+    times = np.asarray(event_list.time, dtype=float)
+    return float(np.min(times)), float(np.max(times))
+
+
+def _resolution_warning(event_list, dt: float, label: str) -> Optional[str]:
+    """Advisory when dt is not a multiple of the instrument time resolution.
+
+    ``EventList.to_lc`` would snap dt to a multiple of ``EventList.dt`` (set
+    from TIMEDEL for real HEASARC files) to avoid beat artefacts. This service
+    bins on its own grid so the requested dt is always the dt used -- surface
+    the mismatch rather than silently changing it behind the user's back.
+    """
+    resolution = float(getattr(event_list, "dt", 0.0) or 0.0)
+    if resolution <= 0:
+        return None
+    ratio = dt / resolution
+    if abs(ratio - round(ratio)) < 1e-6:
+        return None
+    return (
+        f"dt ({dt}s) is not a multiple of {label}'s time resolution "
+        f"({resolution}s), so bins hold unequal numbers of instrument ticks "
+        f"and the correlation can show beat artefacts. Use a multiple of "
+        f"{resolution}s."
+    )
 
 
 def _empty_error(event_list, name: str) -> Optional[str]:
@@ -121,6 +194,37 @@ def _nan_corr_warning(corr) -> Optional[str]:
     )
 
 
+def _grid_edges(start: float, stop: float, dt: float) -> np.ndarray:
+    """Bin edges RELATIVE to ``start``, so ``edges[0]`` is exactly 0.0.
+
+    ``np.arange`` derives its step from ``(start + dt) - start``, which at
+    absolute mission times rounds to the local float64 spacing: at MET 8e7 a
+    requested dt of 0.01 s really steps 0.010000005 s. Every edge inherits that
+    error, so the histogram's true bin width no longer matches the dt stamped
+    on the Lightcurve (from which stingray derives ``time_lags``) and the tail
+    of the range is dropped. Starting from 0.0 keeps the step exact.
+    """
+    span = stop - start
+    edges = np.arange(0.0, span + dt, dt)
+    # arange's exclusive stop can leave one edge past the range; that final bin
+    # would only be partially covered, so drop it.
+    return edges[edges <= span + 1e-9]
+
+
+def _grid_lightcurve(times, start: float, edges: np.ndarray, dt: float) -> Lightcurve:
+    """Histogram one event list onto ``edges`` (relative to ``start``).
+
+    Times are shifted to relative seconds BEFORE histogramming so the binning
+    inherits the exact grid. ``np.histogram`` does not require sorted input, so
+    the raw (possibly unsorted) times are safe to pass straight through.
+    """
+    relative = np.asarray(times, dtype=float) - start
+    counts, _ = np.histogram(relative, bins=edges)
+    centers = start + (edges[:-1] + dt / 2.0)
+    gti = [[start, start + float(edges[-1])]]
+    return Lightcurve(time=centers, counts=counts, dt=dt, gti=gti, skip_checks=True)
+
+
 def _shared_grid_lightcurves(
     events1, events2, dt: float
 ) -> Tuple[Lightcurve, Lightcurve, float, float]:
@@ -130,22 +234,15 @@ def _shared_grid_lightcurves(
     that makes a cross-correlation of two independently-loaded event lists
     physically meaningful.
     """
-    start = max(float(events1.time[0]), float(events2.time[0]))
-    stop = min(float(events1.time[-1]), float(events2.time[-1]))
+    start1, stop1 = _time_bounds(events1)
+    start2, stop2 = _time_bounds(events2)
+    start = max(start1, start2)
+    stop = min(stop1, stop2)
 
-    edges = np.arange(start, stop + dt, dt)
-    # arange's exclusive stop can leave one edge past the common range; that
-    # final bin would only be partially covered, so drop it.
-    edges = edges[edges <= stop + 1e-9]
-
-    counts1, _ = np.histogram(events1.time, bins=edges)
-    counts2, _ = np.histogram(events2.time, bins=edges)
-    centers = edges[:-1] + dt / 2.0
-    gti = [[float(edges[0]), float(edges[-1])]]
-
-    lc1 = Lightcurve(time=centers, counts=counts1, dt=dt, gti=gti, skip_checks=True)
-    lc2 = Lightcurve(time=centers, counts=counts2, dt=dt, gti=gti, skip_checks=True)
-    return lc1, lc2, float(edges[0]), float(edges[-1])
+    edges = _grid_edges(start, stop, dt)
+    lc1 = _grid_lightcurve(events1.time, start, edges, dt)
+    lc2 = _grid_lightcurve(events2.time, start, edges, dt)
+    return lc1, lc2, start, start + float(edges[-1])
 
 
 class CorrelationService(BaseService):
@@ -165,6 +262,12 @@ class CorrelationService(BaseService):
         ``AutoCorrelation.__init__`` does not forward ``norm`` (it is hardcoded
         to ``'none'`` upstream). ``time_shift`` is always 0 for an
         auto-correlation.
+
+        The light curve is built with the same helper the cross path uses, NOT
+        ``EventList.to_lc``: ``to_lc`` snaps dt to a multiple of the event
+        list's instrument time resolution and sizes the curve from the GTI, so
+        the two pages would report different lag axes -- and a different dt --
+        for identical input.
         """
         try:
             for message in (_mode_error(mode), _norm_error(norm), _dt_error(dt)):
@@ -188,16 +291,27 @@ class CorrelationService(BaseService):
                     success=False, data=None, message=empty, error=None
                 )
 
-            span = float(event_list.time[-1]) - float(event_list.time[0])
-            span_message = _span_error(span, dt, f"the span of '{event_list_name}'")
-            if span_message:
-                return self.create_result(
-                    success=False, data=None, message=span_message, error=None
-                )
+            start, stop = _time_bounds(event_list)
+            span = stop - start
+            what = f"the span of '{event_list_name}'"
+            for message in (
+                _span_error(span, dt, what),
+                _bin_cap_error(span, dt, what),
+            ):
+                if message:
+                    return self.create_result(
+                        success=False, data=None, message=message, error=None
+                    )
 
             warnings_out: List[str] = []
+            resolution = _resolution_warning(event_list, dt, f"'{event_list_name}'")
+            if resolution:
+                warnings_out.append(resolution)
+
             with collect_warnings(warnings_out):
-                lc = event_list.to_lc(dt=dt)
+                lc = _grid_lightcurve(
+                    event_list.time, start, _grid_edges(start, stop, dt), dt
+                )
                 if norm == "variance":
                     variance_warning = _variance_warning(lc, "The light curve")
                     if variance_warning:
@@ -212,7 +326,9 @@ class CorrelationService(BaseService):
                 data=data,
                 message=(
                     f"Auto-correlation computed for '{event_list_name}' "
-                    f"({data['n']} lags, dt={dt}s)"
+                    # dt comes from the payload, i.e. the dt actually binned
+                    # with, so the sentence can never contradict the result.
+                    f"({data['n']} lags, dt={data['dt']}s)"
                 ),
             )
 
@@ -273,24 +389,38 @@ class CorrelationService(BaseService):
                     success=False, data=None, message=overlap, error=None
                 )
 
-            start = max(float(events1.time[0]), float(events2.time[0]))
-            stop = min(float(events1.time[-1]), float(events2.time[-1]))
-            span_message = _span_error(stop - start, dt, "the overlapping time range")
-            if span_message:
-                return self.create_result(
-                    success=False, data=None, message=span_message, error=None
-                )
+            start1, stop1 = _time_bounds(events1)
+            start2, stop2 = _time_bounds(events2)
+            start = max(start1, start2)
+            stop = min(stop1, stop2)
+            span = stop - start
+            what = "the overlapping time range"
+            for message in (
+                _span_error(span, dt, what),
+                _bin_cap_error(span, dt, what),
+            ):
+                if message:
+                    return self.create_result(
+                        success=False, data=None, message=message, error=None
+                    )
 
             warnings_out: List[str] = []
+            for event_list, name in (
+                (events1, event_list_1_name),
+                (events2, event_list_2_name),
+            ):
+                resolution = _resolution_warning(event_list, dt, f"'{name}'")
+                if resolution and resolution not in warnings_out:
+                    warnings_out.append(resolution)
+
             with collect_warnings(warnings_out):
                 lc1, lc2, grid_start, grid_stop = _shared_grid_lightcurves(
                     events1, events2, dt
                 )
 
                 cropped = any(
-                    float(events.time[0]) < grid_start - dt
-                    or float(events.time[-1]) > grid_stop + dt
-                    for events in (events1, events2)
+                    first < grid_start - dt or last > grid_stop + dt
+                    for first, last in ((start1, stop1), (start2, stop2))
                 )
                 if cropped:
                     warnings_out.append(
@@ -317,7 +447,7 @@ class CorrelationService(BaseService):
                 data=data,
                 message=(
                     f"Cross-correlation computed for '{event_list_1_name}' x "
-                    f"'{event_list_2_name}' ({data['n']} lags, dt={dt}s)"
+                    f"'{event_list_2_name}' ({data['n']} lags, dt={data['dt']}s)"
                 ),
             )
 

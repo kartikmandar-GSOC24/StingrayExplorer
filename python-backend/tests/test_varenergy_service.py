@@ -50,6 +50,36 @@ def sparse_event_list(seed: int = 3, n_events: int = 400, length: float = 64.0) 
     return EventList(time=times, energy=energy, gti=[[0.0, length]])
 
 
+def two_gti_constant_event_list(
+    seed: int = 11, n_per_gti: int = 20000, gti=((0.0, 100.0), (900.0, 1000.0))
+) -> EventList:
+    """Constant-rate Poisson source seen in two GTIs across a long slew gap.
+
+    There is no intrinsic variability whatsoever; the only structure a light
+    curve spanning gti[0][0]..gti[-1][-1] can show is the 800 s of dead time
+    between the two intervals.
+    """
+    rng = np.random.default_rng(seed)
+    times = np.concatenate(
+        [np.sort(rng.uniform(start, stop, n_per_gti)) for start, stop in gti]
+    )
+    energy = rng.uniform(0.5, 10.0, times.size)
+    return EventList(time=times, energy=energy, gti=[list(g) for g in gti])
+
+
+def gappy_modulated_event_list(gti=((0.0, 28.0), (36.0, 64.0)), **kwargs) -> EventList:
+    """`modulated_event_list` with the events outside `gti` screened out."""
+    events = modulated_event_list(**kwargs)
+    inside = np.zeros(events.time.size, dtype=bool)
+    for start, stop in gti:
+        inside |= (events.time >= start) & (events.time < stop)
+    return EventList(
+        time=events.time[inside],
+        energy=events.energy[inside],
+        gti=[list(g) for g in gti],
+    )
+
+
 @pytest.fixture()
 def modulated_state(state_manager):
     state_manager.add_event_data("ev_mod", modulated_event_list())
@@ -395,6 +425,116 @@ def test_excess_variance_rejects_unknown_normalization(modulated_state):
     assert "normalization" in result["message"]
 
 
+def test_excess_variance_is_not_invented_by_inter_gti_gaps(state_manager):
+    # stingray's ExcessVarianceSpectrum builds ONE light curve from gti[0, 0]
+    # to gti[-1, -1], so every bin in the 800 s gap is a real 0-count bin and
+    # np.var(lc.counts) measures the gap, not the source. The service must
+    # restrict the statistic to bins that are actually inside a GTI.
+    from stingray.varenergyspectrum import ExcessVarianceSpectrum
+
+    events = two_gti_constant_event_list()
+    state_manager.add_event_data("ev_gappy", events)
+
+    raw, _ = ExcessVarianceSpectrum(
+        events=events,
+        freq_interval=[0.0, 0.5],
+        energy_spec=(0.5, 10.0, 4, "lin"),
+        bin_time=1.0,
+    )._spectrum_function()
+    assert np.all(raw > 1.5), (
+        "upstream stopped counting gap bins as data; revisit the workaround",
+        raw,
+    )
+
+    svc = VarEnergyService(state_manager)
+    result = svc.excess_variance_spectrum(
+        "ev_gappy", bin_time=1.0, energy_min=0.5, energy_max=10.0, n_bands=4
+    )
+    assert result["success"], result
+    json.dumps(result, allow_nan=False)
+    data = result["data"]
+    measured = [
+        (value, error)
+        for value, error in zip(data["spectrum"], data["spectrum_error"])
+        if value is not None
+    ]
+    # A constant Poisson source has no excess variance: every band that comes
+    # out finite must sit within a few sigma of zero, nowhere near F_var ~ 2.
+    for value, error in measured:
+        assert value < 0.2, measured
+        assert value < 5 * error, measured
+
+
+def test_excess_variance_still_measures_real_variability_across_gtis(state_manager):
+    # Masking the gaps must not cost sensitivity: the same 60% modulation is
+    # recovered whether or not the observation is interrupted.
+    state_manager.add_event_data("ev_mod", modulated_event_list())
+    state_manager.add_event_data("ev_mod_gaps", gappy_modulated_event_list())
+    svc = VarEnergyService(state_manager)
+
+    whole = svc.excess_variance_spectrum("ev_mod", bin_time=0.0625, **ESPEC)
+    gappy = svc.excess_variance_spectrum("ev_mod_gaps", bin_time=0.0625, **ESPEC)
+    assert whole["success"] and gappy["success"], (whole, gappy)
+    whole_fvar = finite_values(whole["data"]["spectrum"])
+    gappy_fvar = finite_values(gappy["data"]["spectrum"])
+    assert len(gappy_fvar) == 5
+    assert np.all(gappy_fvar > 0.2) and np.all(gappy_fvar < 0.8)
+    assert np.all(np.abs(gappy_fvar - whole_fvar) < 0.1)
+
+
+def test_excess_variance_builds_each_light_curve_once(modulated_state, monkeypatch):
+    # VarEnergySpectrum.__init__ runs _spectrum_function() and discards the
+    # result; the service used to run it a second time to recover the numbers,
+    # doubling the heaviest allocation in this module.
+    from stingray import Lightcurve
+
+    original = Lightcurve.make_lightcurve
+    calls = []
+
+    def counting_make_lightcurve(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        Lightcurve, "make_lightcurve", staticmethod(counting_make_lightcurve)
+    )
+    svc = VarEnergyService(modulated_state)
+    result = svc.excess_variance_spectrum(
+        "ev_mod", bin_time=0.0625, energy_min=0.5, energy_max=10.0, n_bands=3
+    )
+    assert result["success"], result
+    assert len(calls) == 3, "one light curve per energy band, not two"
+
+
+def test_nan_advice_on_the_excess_variance_page_names_only_its_own_controls(
+    state_manager,
+):
+    # ExcessVarianceSpectrum has no reference band and the endpoint exposes no
+    # segment_size, so the shared advisory sent users hunting for controls that
+    # do not exist on that page.
+    state_manager.add_event_data("ev_few", sparse_event_list())
+    svc = VarEnergyService(state_manager)
+    result = svc.excess_variance_spectrum("ev_few", bin_time=0.0625, **ESPEC)
+    assert result["success"], result
+    assert all(v is None for v in result["data"]["spectrum"])
+    advice = [w for w in result["data"]["warnings"] if "could not be computed" in w]
+    assert advice, result["data"]["warnings"]
+    assert "segment_size" not in advice[0]
+    assert "reference band" not in advice[0]
+    assert "bin_time" in advice[0] and "energy bands" in advice[0]
+
+    # The segmented spectra do have both controls, and keep naming them.
+    covariance = svc.avg_covariance_spectrum(
+        "ev_few", bin_time=0.0625, segment_size=8.0, **FREQ, **ESPEC
+    )
+    segmented_advice = [
+        w for w in covariance["data"]["warnings"] if "could not be computed" in w
+    ]
+    assert segmented_advice, covariance["data"]["warnings"]
+    assert "segment_size" in segmented_advice[0]
+    assert "reference band" in segmented_advice[0]
+
+
 # --------------------------------------------------------------------------
 # variable-energy-spectrum
 # --------------------------------------------------------------------------
@@ -516,6 +656,59 @@ def test_avg_covariance_spectrum_with_reference_band(modulated_state):
     assert result["data"]["ref_band"] == [8.0, 10.0]
 
 
+def test_covariance_spectrum_reports_the_gtis_it_dropped(state_manager):
+    # segment_size is derived as the longest GTI, and stingray's
+    # time_intervals_from_gtis skips every shorter one outright, so "1 segment
+    # (full GTI)" is only true for a single-GTI observation. The payload has to
+    # say how much exposure actually contributed.
+    state_manager.add_event_data(
+        "ev_gaps", gappy_modulated_event_list(gti=((0.0, 24.0), (28.0, 64.0)))
+    )
+    svc = VarEnergyService(state_manager)
+    result = svc.covariance_spectrum("ev_gaps", bin_time=0.0625, **FREQ, **ESPEC)
+    assert result["success"], result
+    json.dumps(result, allow_nan=False)
+    data = result["data"]
+    assert data["segment_size"] == 36.0
+    assert data["n_segments_hint"] == 1
+    assert data["n_gtis_total"] == 2
+    assert data["n_gtis_used"] == 1
+    assert data["exposure_total"] == 60.0
+    assert data["exposure_used"] == 36.0
+    dropped = [w for w in data["warnings"] if "skipped entirely" in w]
+    assert dropped, data["warnings"]
+    assert "36s of the 60s" in dropped[0]
+    assert "60%" in dropped[0]
+    assert "1 of 2 good-time intervals" in result["message"]
+
+
+def test_single_gti_covariance_says_nothing_about_dropped_exposure(modulated_state):
+    svc = VarEnergyService(modulated_state)
+    result = svc.covariance_spectrum("ev_mod", bin_time=0.0625, **FREQ, **ESPEC)
+    assert result["success"], result
+    data = result["data"]
+    assert data["n_gtis_total"] == data["n_gtis_used"] == 1
+    assert data["exposure_used"] == data["exposure_total"] == 64.0
+    assert not [w for w in data["warnings"] if "skipped entirely" in w]
+    assert result["message"] == "Computed covariance spectrum in 5 energy bands"
+
+
+def test_segmented_endpoints_warn_when_a_gti_is_too_short_for_the_segment(
+    state_manager,
+):
+    state_manager.add_event_data(
+        "ev_gaps", gappy_modulated_event_list(gti=((0.0, 6.0), (8.0, 64.0)))
+    )
+    svc = VarEnergyService(state_manager)
+    result = svc.rms_spectrum(
+        "ev_gaps", bin_time=0.0625, segment_size=8.0, **FREQ, **ESPEC
+    )
+    assert result["success"], result
+    skipped = [w for w in result["data"]["warnings"] if "skips entirely" in w]
+    assert skipped, result["data"]["warnings"]
+    assert "1 of the 2 good-time intervals" in skipped[0]
+
+
 def test_covariance_on_sparse_poisson_data_is_null_with_warnings(state_manager):
     # Pure Poisson noise has no excess variance in the reference band, so the
     # covariance is the sqrt of a negative number: legitimately all-NaN.
@@ -530,6 +723,148 @@ def test_covariance_on_sparse_poisson_data_is_null_with_warnings(state_manager):
     assert all(v is None for v in data["spectrum"])
     assert data["warnings"], "the all-NaN result must come with an explanation"
     assert any("could not be computed" in w for w in data["warnings"])
+
+
+# --------------------------------------------------------------------------
+# segment_size / bin_time compatibility
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bin_time,segment_size,expected",
+    [(0.03, 8.0, 8.01), (0.07, 10.0, 10.01), (0.05, 8.03, 8.05), (0.09, 32.0, 32.04)],
+)
+def test_segment_size_is_snapped_to_a_whole_number_of_bins(
+    modulated_state, bin_time, segment_size, expected
+):
+    # stingray masks frequencies on rint(segment_size/bin_time) bins but sizes
+    # the FFT with floor(); when they disagree sub_power[good] raised
+    # "IndexError: boolean index did not match indexed array", and when they
+    # happened to match in length the mask was applied to the wrong grid.
+    svc = VarEnergyService(modulated_state)
+    result = svc.rms_spectrum(
+        "ev_mod", bin_time=bin_time, segment_size=segment_size, **FREQ, **ESPEC
+    )
+    assert result["success"], result
+    assert "IndexError" not in (result["message"] or "")
+    note = [w for w in result["data"]["warnings"] if "segment_size was adjusted" in w]
+    assert note, result["data"]["warnings"]
+    assert f"to {expected:g}s" in note[0], note
+
+
+@pytest.mark.parametrize(
+    "bin_time,segment_size", [(0.03, 8.0), (0.07, 10.0), (0.05, 8.03), (0.09, 32.0)]
+)
+def test_adjusted_segment_puts_stingrays_two_grids_on_one_bin_count(
+    modulated_state, bin_time, segment_size
+):
+    from stingray.utils import fix_segment_size_to_integer_samples
+
+    svc = VarEnergyService(modulated_state)
+    adjusted, note = svc._fit_segment_to_bins(segment_size, bin_time, None)
+    assert note
+    _, fft_bins = fix_segment_size_to_integer_samples(adjusted, bin_time)
+    assert fft_bins == int(np.rint(adjusted / bin_time))
+
+
+def test_variable_energy_spectrum_survives_a_non_integer_segment_ratio(modulated_state):
+    svc = VarEnergyService(modulated_state)
+    result = svc.variable_energy_spectrum(
+        "ev_mod", bin_time=0.03, segment_size=8.0, **FREQ, **ESPEC
+    )
+    assert result["success"], result
+    assert all(v is not None for v in result["data"]["rms"]["spectrum"])
+
+
+def test_segment_size_that_already_fits_is_left_alone(modulated_state):
+    svc = VarEnergyService(modulated_state)
+    result = svc.rms_spectrum(
+        "ev_mod", bin_time=0.0625, segment_size=8.0, **FREQ, **ESPEC
+    )
+    assert result["success"], result
+    assert not [
+        w for w in result["data"]["warnings"] if "segment_size was adjusted" in w
+    ]
+
+
+# --------------------------------------------------------------------------
+# frequency window vs frequency resolution
+# --------------------------------------------------------------------------
+
+
+def test_frequency_window_with_no_fourier_bin_is_rejected(modulated_state):
+    # segment_size 8 s -> the lowest sampled frequency is 1/8 = 0.125 Hz, so
+    # 0.001-0.05 Hz selects nothing and every band used to come back null
+    # behind a bare "Mean of empty slice." warning.
+    svc = VarEnergyService(modulated_state)
+    result = svc.rms_spectrum(
+        "ev_mod",
+        bin_time=0.05,
+        segment_size=8.0,
+        freq_min=0.001,
+        freq_max=0.05,
+        **ESPEC,
+    )
+    assert not result["success"]
+    assert "1/segment_size" in result["message"]
+    assert "0.125 Hz" in result["message"]
+
+
+def test_frequency_window_floor_applies_to_the_covariance_endpoints(modulated_state):
+    svc = VarEnergyService(modulated_state)
+    result = svc.avg_covariance_spectrum(
+        "ev_mod",
+        bin_time=0.05,
+        segment_size=8.0,
+        freq_min=0.001,
+        freq_max=0.05,
+        **ESPEC,
+    )
+    assert not result["success"]
+    assert "1/segment_size" in result["message"]
+
+
+def test_frequency_window_wider_than_one_bin_is_accepted(modulated_state):
+    svc = VarEnergyService(modulated_state)
+    result = svc.rms_spectrum(
+        "ev_mod", bin_time=0.05, segment_size=8.0, freq_min=0.001, freq_max=0.5, **ESPEC
+    )
+    assert result["success"], result
+
+
+# --------------------------------------------------------------------------
+# reference bands with no events
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "method", ["lag_spectrum", "variable_energy_spectrum", "avg_covariance_spectrum"]
+)
+def test_empty_reference_band_is_rejected_readably(modulated_state, method):
+    svc = VarEnergyService(modulated_state)
+    result = getattr(svc, method)(
+        "ev_mod",
+        bin_time=0.0625,
+        segment_size=8.0,
+        ref_min=50.0,
+        ref_max=100.0,
+        **FREQ,
+        **ESPEC,
+    )
+    assert not result["success"]
+    assert "reference band" in result["message"]
+    assert "no events" in result["message"]
+    assert "NoneType" not in result["message"]
+
+
+def test_empty_reference_band_is_rejected_by_covariance_spectrum(modulated_state):
+    svc = VarEnergyService(modulated_state)
+    result = svc.covariance_spectrum(
+        "ev_mod", bin_time=0.0625, ref_min=50.0, ref_max=100.0, **FREQ, **ESPEC
+    )
+    assert not result["success"]
+    assert "reference band" in result["message"]
+    assert "NoneType" not in result["message"]
 
 
 # --------------------------------------------------------------------------

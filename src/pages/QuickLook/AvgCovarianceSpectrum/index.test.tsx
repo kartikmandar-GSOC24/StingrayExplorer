@@ -132,4 +132,35 @@ describe('AvgCovarianceSpectrumPage', () => {
       await screen.findByText(/the covariance spectrum could not be computed for any energy band/)
     ).toBeInTheDocument();
   });
+
+  it('renders an advisory (not a blank chart) when the result is all-null with warnings', async () => {
+    avgCovarianceSpectrum.mockResolvedValue({
+      success: true,
+      data: {
+        energy: [0.5, 1.5, 3, 5.5, 9],
+        spectrum: [null, null, null, null, null],
+        spectrum_error: [null, null, null, null, null],
+        freq_range: [0.1, 1],
+        ref_band: null,
+        norm: 'abs',
+        segment_size: 64,
+        n_segments_hint: 1,
+        warnings: [
+          'the covariance spectrum could not be computed for any energy band (stingray returns NaN when the reference band shows no variability above the Poisson noise floor).',
+        ],
+      },
+      message: 'done',
+      error: null,
+    });
+    renderWithProviders(<AvgCovarianceSpectrumPage />);
+    await userEvent.click(await screen.findByLabelText('Event list'));
+    await userEvent.click(await screen.findByText(/obs1/));
+    await userEvent.click(screen.getByRole('button', { name: /Compute/ }));
+    expect(
+      await screen.findByText(/the covariance spectrum could not be computed for any energy band/)
+    ).toBeInTheDocument();
+    expect(await screen.findByText(/No finite covariance values/)).toBeInTheDocument();
+    // The blank/empty chart must not render alongside (or instead of) the advisory.
+    expect(screen.queryByTestId('chart')).not.toBeInTheDocument();
+  });
 });

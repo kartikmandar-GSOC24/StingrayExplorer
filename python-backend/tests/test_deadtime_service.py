@@ -205,6 +205,75 @@ def test_fad_correction_rejects_tiny_segment_size(loaded_state):
     assert "3x dt" in result["message"]
 
 
+def test_fad_correction_rejects_empty_event_list(loaded_state):
+    # `EventList(time=np.array([]))` normalizes `.time` to None, not an empty
+    # array, so the preflight must not call `len()` on it directly (that
+    # would raise a raw TypeError instead of a readable rejection).
+    loaded_state.add_event_data(
+        "ev_empty", EventList(time=np.array([]), gti=[[0.0, 64.0]])
+    )
+    svc = DeadtimeService(loaded_state)
+
+    result = svc.calculate_fad_correction("ev1", "ev_empty", dt=0.01, segment_size=8.0)
+    assert not result["success"]
+    assert result["data"] is None
+    assert "contains no events" in result["message"]
+
+    # Same rejection regardless of which argument position is empty.
+    result_swapped = svc.calculate_fad_correction(
+        "ev_empty", "ev1", dt=0.01, segment_size=8.0
+    )
+    assert not result_swapped["success"]
+    assert "contains no events" in result_swapped["message"]
+
+
+def test_fad_correction_rejects_zero_exposure_event_list(loaded_state):
+    # A fully-screened observation: real event times, but a GTI array with
+    # zero rows (all good time removed by screening). Before the preflight
+    # this reached stingray's FAD() unguarded and raised a bare
+    # `IndexError: list index out of range`.
+    rng = np.random.default_rng(9)
+    times = np.sort(rng.uniform(0.0, 64.0, 500))
+    loaded_state.add_event_data(
+        "ev_no_gti", EventList(time=times, gti=np.zeros((0, 2)))
+    )
+    svc = DeadtimeService(loaded_state)
+
+    result = svc.calculate_fad_correction(
+        "ev1", "ev_no_gti", dt=0.01, segment_size=8.0
+    )
+    assert not result["success"]
+    assert result["data"] is None
+    assert "no good-time exposure" in result["message"]
+    assert "ev_no_gti" in result["message"]
+
+
+def test_fad_correction_handles_nan_fad_delta_without_crashing(loaded_state):
+    # Force fad_delta to NaN the same way a real user would trigger it: pick
+    # the same event list for both "detectors" (e.g. testing with one loaded
+    # file, or accidentally selecting the same detector twice). The smoothed
+    # Fourier difference between two byte-identical inputs is exactly zero,
+    # so `average_diff / smooth_real**0.5` is 0/0 -> NaN -> fad_delta is NaN.
+    # Without a finite-or-None guard, that NaN reaches `json.dumps(...,
+    # allow_nan=False)` unguarded and turns a success:true result into an
+    # unhandled 500 at the JSON-encoding layer.
+    svc = DeadtimeService(loaded_state)
+    result = svc.calculate_fad_correction(
+        "ev1", "ev1", dt=1.0 / 512, segment_size=2.0
+    )
+
+    assert result["success"], result
+    json.dumps(result, allow_nan=False)  # must not raise
+    data = result["data"]
+
+    assert data["fad_delta"] is None
+    assert data["n_segments"] == 32  # 64 s / 2 s segments, above MIN_FAD_SEGMENTS
+    assert any(
+        "fad_delta" in w and "could not be computed" in w
+        for w in data["warnings"]
+    )
+
+
 def _client(state):
     """httpx client over the real app, wired to a pre-populated StateManager."""
     from main import create_app

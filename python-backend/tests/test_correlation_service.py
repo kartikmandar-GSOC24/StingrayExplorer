@@ -12,12 +12,19 @@ import pytest
 from stingray import EventList
 from stingray.crosscorrelation import CrossCorrelation
 
-from services.correlation_service import CorrelationService
+from services.correlation_service import (
+    MAX_BINS,
+    CorrelationService,
+    _shared_grid_lightcurves,
+)
 from services.state_manager import StateManager
 from utils.performance_monitor import PerformanceMonitor
 
 DT = 0.05
 LENGTH = 64.0
+# A realistic mission-elapsed time: float64 spacing here is 1.49e-8 s, enough
+# to visibly quantise a grid built by np.arange over absolute times.
+MET = 8e7
 
 
 def pulse_times(
@@ -287,6 +294,124 @@ def test_variance_norm_warns_when_noise_subtracted_variance_is_negative(loaded_s
     assert result["success"], result
     assert result["data"]["time_shift"] is not None
     assert any("negative" in w.lower() for w in result["data"]["warnings"])
+
+
+# --------------------------------------------------------------------------
+# grid robustness (unsorted input, bin cap, dt fidelity, float precision)
+# --------------------------------------------------------------------------
+
+
+def test_cross_correlation_uses_the_full_span_of_an_unsorted_event_list(pulse_state):
+    # EventList.read() does not forward skip_checks in stingray 2.2.10, so real
+    # unsorted event files reach the service with time[0]/time[-1] pointing at
+    # interior photons. Deriving the grid from them correlated a sliver of the
+    # data (measured 26 lags instead of ~1280) or inverted start/stop and faked
+    # a "no overlapping time range" rejection.
+    shuffled = np.random.default_rng(99).permutation(pulse_times(7))
+    events = EventList(time=shuffled, gti=[[0.0, LENGTH]], skip_checks=True)
+    assert float(events.time[0]) > float(np.min(events.time))
+    assert float(events.time[-1]) < float(np.max(events.time))
+    pulse_state.add_event_data("ev_shuffled", events)
+
+    svc = CorrelationService(pulse_state)
+    ordered = svc.cross_correlation("ev_pulse", "ev_delayed", dt=DT)
+    unordered = svc.cross_correlation("ev_shuffled", "ev_delayed", dt=DT)
+    assert unordered["success"], unordered
+    # np.histogram is order-independent, so the results must be identical.
+    assert unordered["data"]["n"] == ordered["data"]["n"]
+    assert unordered["data"]["corr"] == ordered["data"]["corr"]
+    assert unordered["data"]["time_shift"] == ordered["data"]["time_shift"]
+    # The grid spans the whole overlap (~63.5 s), not an interior sliver.
+    assert unordered["data"]["n"] * DT == pytest.approx(LENGTH - 0.5, abs=0.5)
+
+    # The auto path used to derive its span the same way.
+    assert (
+        svc.auto_correlation("ev_shuffled", dt=DT)["data"]["n"]
+        == svc.auto_correlation("ev_pulse", dt=DT)["data"]["n"]
+    )
+
+
+def test_correlation_rejects_a_dt_that_would_blow_up_the_bin_count(loaded_state):
+    # Nothing else bounds the grid: two 3 ks lists at dt=1e-3 already serialise
+    # ~93 MB of JSON and add ~750 MB of RSS, and a finer dt OOMs the backend.
+    svc = CorrelationService(loaded_state)
+    cases = (
+        (svc.auto_correlation("ev1", dt=1e-5), "the span of 'ev1'"),
+        (svc.cross_correlation("ev1", "ev2", dt=1e-5), "the overlapping time range"),
+    )
+    for result, what in cases:
+        assert not result["success"], result
+        assert result["data"] is None
+        message = result["message"]
+        assert message.startswith(f"dt (1e-05s) over {what} (63.")
+        assert "bins;" in message
+        assert (
+            f"increase dt or shorten the range (the cap is {MAX_BINS:,} bins)"
+            in message
+        )
+        # The reported count is the real one: ~64 s / 1e-5 s.
+        assert "6,39" in message
+
+    # A large-but-workable grid is still accepted.
+    ok = svc.cross_correlation("ev1", "ev2", dt=1e-3)
+    assert ok["success"], ok
+    assert ok["data"]["n"] < MAX_BINS
+
+
+def test_requested_dt_is_the_dt_used_by_both_endpoints(state_manager):
+    # EventList.dt is the instrument time resolution (TIMEDEL for real HEASARC
+    # files) and EventList.to_lc snaps dt to a multiple of it, so the auto page
+    # rendered half as many lags as the cross page for identical input while
+    # its message quoted the requested dt (640 lags "at dt=0.05s" over 64 s).
+    times = pulse_times(7)
+    for name in ("ev_res", "ev_res_copy"):
+        state_manager.add_event_data(
+            name, EventList(time=times, gti=[[0.0, LENGTH]], dt=0.1)
+        )
+    # Pins the upstream behaviour being routed around.
+    assert float(state_manager.get_event_data("ev_res").to_lc(dt=DT).dt) == 0.1
+
+    svc = CorrelationService(state_manager)
+    auto = svc.auto_correlation("ev_res", dt=DT)
+    cross = svc.cross_correlation("ev_res", "ev_res_copy", dt=DT)
+    assert auto["success"], auto
+    assert cross["success"], cross
+    assert auto["data"]["dt"] == DT
+    assert cross["data"]["dt"] == DT
+    assert auto["data"]["n"] == cross["data"]["n"]
+    # The success message must describe the run that actually happened.
+    assert f"({auto['data']['n']} lags, dt={DT}s)" in auto["message"]
+    assert f"({cross['data']['n']} lags, dt={DT}s)" in cross["message"]
+    # Binning on our own grid bypasses stingray's beat-artefact guard, so the
+    # mismatch is surfaced instead of silently rewriting the user's dt.
+    for result in (auto, cross):
+        assert any("time resolution" in w for w in result["data"]["warnings"])
+
+
+def test_large_absolute_times_do_not_stretch_the_lag_axis(state_manager):
+    # np.arange over absolute MET quantises its step to the local float64
+    # spacing: at MET 8e7 a requested dt of 0.01 s really stepped 0.010000005 s
+    # (measured), while stingray kept deriving time_lags from the declared dt.
+    times = pulse_times(7)
+    state_manager.add_event_data(
+        "ev_met", EventList(time=times + MET, gti=[[MET, MET + LENGTH]])
+    )
+    state_manager.add_event_data(
+        "ev_met_delayed",
+        EventList(time=times + MET + 0.5, gti=[[MET + 0.5, MET + LENGTH + 0.5]]),
+    )
+    lc1, lc2, grid_start, grid_stop = _shared_grid_lightcurves(
+        state_manager.get_event_data("ev_met"),
+        state_manager.get_event_data("ev_met_delayed"),
+        0.01,
+    )
+    assert lc1.n == lc2.n
+    assert (grid_stop - grid_start) / lc1.n == pytest.approx(0.01, abs=1e-9)
+
+    svc = CorrelationService(state_manager)
+    result = svc.cross_correlation("ev_met", "ev_met_delayed", dt=DT)
+    assert result["success"], result
+    assert result["data"]["time_shift"] == pytest.approx(-0.5, abs=2 * DT)
 
 
 # --------------------------------------------------------------------------

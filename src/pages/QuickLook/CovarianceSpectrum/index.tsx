@@ -301,7 +301,12 @@ const CovarianceSpectrumPage: React.FC = () => {
                       variant="outlined"
                       label={`${result.n_segments_hint} segment${
                         result.n_segments_hint === 1 ? '' : 's'
-                      } · ${result.segment_size} s (full GTI)`}
+                      } · ${result.segment_size} s (${
+                        result.n_gtis_used === undefined ||
+                        result.n_gtis_used === result.n_gtis_total
+                          ? 'full GTI'
+                          : 'longest GTI'
+                      })`}
                     />
                     <Chip
                       size="small"

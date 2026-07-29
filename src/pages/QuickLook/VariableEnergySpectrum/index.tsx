@@ -339,7 +339,10 @@ const VariableEnergySpectrumPage: React.FC = () => {
                       data={countsTraces}
                       layout={{
                         xaxis: energyAxis,
-                        yaxis: { title: { text: 'Counts' }, type: 'log' },
+                        // Linear, not log: CountSpectrum legitimately returns 0 for an
+                        // energy band with no photons, and a log axis silently drops
+                        // those points (or the whole trace, if every band is empty).
+                        yaxis: { title: { text: 'Counts' }, type: 'linear' },
                       }}
                       height={280}
                     />
