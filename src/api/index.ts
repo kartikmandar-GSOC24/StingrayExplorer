@@ -19,3 +19,14 @@ export {
   type CoherenceData,
 } from './timingApi';
 export { exportApi, type ExportResult } from './exportApi';
+export { correlationApi, type CorrelationData } from './correlationApi';
+export {
+  varenergyApi,
+  type RmsSpectrumData,
+  type LagSpectrumData,
+  type ExcessVarianceData,
+  type VarEnergyBand,
+  type VariableEnergySpectrumData,
+  type CovarianceSpectrumData,
+} from './varenergyApi';
+export { deadtimeApi, type PdsCorrectionData, type FadCorrectionData } from './deadtimeApi';
