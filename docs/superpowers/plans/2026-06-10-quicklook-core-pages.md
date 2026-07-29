@@ -4117,7 +4117,7 @@ pixi run -e dev pytest python-backend/tests -v
 ```
 Expected: all green. Fix anything that isn't before proceeding.
 
-- [ ] **Step 2: End-to-end manual checklist**
+- [x] **Step 2: End-to-end manual checklist**
 
 Start `npm run dev`. Load one sample event file from `files/data/` twice under two names (`evA`, `evB`). Then walk every page:
 
@@ -4161,3 +4161,7 @@ git commit -m "docs: record quicklook core implementation plan completion"
 - **Time Lags + Power Colors pages added with routes/nav**: Tasks 20–21 added `src/pages/QuickLook/TimeLags/index.tsx` and `PowerColors/index.tsx`, wired routes in `src/App.tsx`, and added sidebar entries in `src/components/layout/Sidebar.tsx`.
 - **Decimation with longdouble coercion on lightcurve payloads**: stride-decimation helper also coerces `lc.time` (longdouble on some platforms) to `float64` before `tolist()`.
 - **Band-mean (not integrated) power-colors convention documented**: power colors use `dps.dyn_ps[mask, :].mean(axis=0)` (mean over frequencies in band per segment) following the Heil et al. 2015 convention; "integrated" wording removed from UI descriptions to avoid confusion with flux integrals.
+
+## E2E execution notes (2026-07-29)
+
+Task 22 Step 2 manual checklist executed against `npm run dev` (agent-driven via CDP: `--remoteDebuggingPort` + playwright-core `connectOverCDP`). All 11 page rows passed: Event List (both tabs, GTI table, 2 histograms), Light Curve (dt=1, rebin ×2 → 512 bins, stored list grows), Power Spectrum (Leahy Poisson level ≈ 2 at high f, log rebin 8,199 → 258 freqs), Avg Power Spectrum (64-segments chip, smoother), Cross Spectrum (magnitude + phase; phase ≡ 0 for identical files), Avg Cross Spectrum (less scatter), Dynamical PS (heatmap + log-color toggle), Bispectrum (magnitude/phase tabs, console kept streaming during run), Coherence (γ² ≡ 1 for evA × evA), Time Lags (error bars, zero line, f-range 0.5–2 Hz filter verified in plot data), Power Colors (4 band traces + PC scatter). Success and failure notifications both fire; no coming-soon banner on any of the eleven pages. Deviations: event files were loaded via `POST /api/data/load` (the Browse button opens a native macOS dialog, which is not automatable; the rest of the flow used the real UI). Three Electron-shell issues were found outside the plan's scope during startup — hard 180 s backend-ready timeout leaves the app stuck on "Error" even after the backend becomes healthy; `PythonManager.stop()`'s 5 s force-kill timer is never cancelled and SIGKILLs the replacement backend on restart; `python:restart` IPC never re-sends `python:ready`/`python:error` to the renderer — tracked separately.
