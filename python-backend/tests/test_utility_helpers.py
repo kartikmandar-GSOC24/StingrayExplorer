@@ -11,6 +11,9 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from astropy import units as u
+from astropy.table import MaskedColumn, Table
+from astropy.utils.masked import Masked
 from services.state_manager import StateManager
 from services.utility_helpers import (
     FILE_GRANT_MAX_FUTURE_SECONDS,
@@ -284,6 +287,204 @@ def test_state_byte_cap_rejects_string_without_full_utf8_encoding():
     with pytest.raises(ValueError, match="operation size cap"):
         state.copy_analysis_result(
             "oversized metadata", max_rows=10, max_cells=100, max_bytes=64
+        )
+
+
+def test_state_byte_cap_counts_column_metadata_before_deepcopy(monkeypatch):
+    from services import state_manager as state_module
+
+    table = Table({"value": [1.0]})
+    table["value"].meta["blob"] = "x" * 1_000_000
+    state = StateManager()
+    state.add_analysis_result("column metadata", table)
+
+    def forbidden_deepcopy(*args, **kwargs):
+        raise AssertionError("column metadata cap must run before deepcopy")
+
+    monkeypatch.setattr(state_module.copy, "deepcopy", forbidden_deepcopy)
+    with pytest.raises(ValueError, match="operation size cap"):
+        state.copy_analysis_result(
+            "column metadata", max_rows=10, max_cells=100, max_bytes=128
+        )
+
+
+def test_state_byte_cap_counts_mask_storage_before_deepcopy(monkeypatch):
+    from services import state_manager as state_module
+
+    table = Table()
+    table["value"] = MaskedColumn(
+        np.zeros(1_024, dtype=np.uint8),
+        mask=np.ones(1_024, dtype=bool),
+        fill_value=255,
+    )
+    state = StateManager()
+    state.add_analysis_result("masked column", table)
+
+    def forbidden_deepcopy(*args, **kwargs):
+        raise AssertionError("column mask cap must run before deepcopy")
+
+    monkeypatch.setattr(state_module.copy, "deepcopy", forbidden_deepcopy)
+    with pytest.raises(ValueError, match="operation size cap"):
+        state.copy_analysis_result(
+            "masked column", max_rows=2_000, max_cells=2_000, max_bytes=1_500
+        )
+
+
+@pytest.mark.parametrize("field", ["description", "format", "unit", "fill_value"])
+def test_state_byte_cap_counts_all_column_semantics_before_deepcopy(monkeypatch, field):
+    from services import state_manager as state_module
+
+    if field == "fill_value":
+        column = MaskedColumn(
+            np.asarray([object()], dtype=object),
+            mask=[True],
+            fill_value="x" * 512,
+        )
+        table = Table([column], names=["value"])
+    else:
+        table = Table({"value": [1.0]})
+        if field == "description":
+            table["value"].description = "x" * 512
+        elif field == "format":
+            table["value"].format = "%0.2f" + (" " * 512)
+        else:
+            table["value"].unit = u.def_unit("state_cap_" + ("u" * 512))
+    state = StateManager()
+    state.add_analysis_result(f"column {field}", table)
+
+    def forbidden_deepcopy(*args, **kwargs):
+        raise AssertionError(f"column {field} cap must run before deepcopy")
+
+    monkeypatch.setattr(state_module.copy, "deepcopy", forbidden_deepcopy)
+    with pytest.raises(ValueError, match="operation size cap"):
+        state.copy_analysis_result(
+            f"column {field}", max_rows=10, max_cells=100, max_bytes=128
+        )
+
+
+def test_state_byte_cap_counts_quantity_unit_before_deepcopy(monkeypatch):
+    from services import state_manager as state_module
+
+    table = Table({"value": [1.0]})
+    table.meta["exposure"] = u.Quantity(
+        1.0,
+        u.def_unit("state_quantity_" + ("u" * 10_000)),
+    )
+    state = StateManager()
+    state.add_analysis_result("quantity unit", table)
+
+    def forbidden_deepcopy(*args, **kwargs):
+        raise AssertionError("Quantity unit cap must run before deepcopy")
+
+    monkeypatch.setattr(state_module.copy, "deepcopy", forbidden_deepcopy)
+    with pytest.raises(ValueError, match="operation size cap"):
+        state.copy_analysis_result(
+            "quantity unit", max_rows=10, max_cells=100, max_bytes=1_000
+        )
+
+
+def test_state_byte_cap_counts_ndarray_subclass_state_before_deepcopy(monkeypatch):
+    from services import state_manager as state_module
+
+    class ArraySubclass(np.ndarray):
+        pass
+
+    value = np.asarray([1.0]).view(ArraySubclass)
+    value.blob = "x" * 10_000
+    state = StateManager()
+    state.add_analysis_result("array subclass", {"value": value})
+
+    def forbidden_deepcopy(*args, **kwargs):
+        raise AssertionError("ndarray subclass cap must run before deepcopy")
+
+    monkeypatch.setattr(state_module.copy, "deepcopy", forbidden_deepcopy)
+    with pytest.raises(ValueError, match="operation size cap"):
+        state.copy_analysis_result(
+            "array subclass", max_rows=10, max_cells=100, max_bytes=1_000
+        )
+
+
+def test_state_byte_cap_counts_plain_masked_array_storage_before_deepcopy(
+    monkeypatch,
+):
+    from services import state_manager as state_module
+
+    value = np.ma.array(
+        np.zeros(1_024, dtype=np.uint8),
+        mask=np.ones(1_024, dtype=bool),
+        fill_value=255,
+    )
+    state = StateManager()
+    state.add_analysis_result("plain masked array", {"value": value})
+
+    def forbidden_deepcopy(*args, **kwargs):
+        raise AssertionError("masked array cap must run before deepcopy")
+
+    monkeypatch.setattr(state_module.copy, "deepcopy", forbidden_deepcopy)
+    with pytest.raises(ValueError, match="operation size cap"):
+        state.copy_analysis_result(
+            "plain masked array", max_rows=2_000, max_cells=2_000, max_bytes=1_500
+        )
+
+
+def test_state_byte_cap_counts_large_python_int_before_deepcopy(monkeypatch):
+    from services import state_manager as state_module
+
+    state = StateManager()
+    state.add_analysis_result(
+        "large integer",
+        {"value": [1.0], "metadata": {"large": 10**4_000}},
+    )
+
+    def forbidden_deepcopy(*args, **kwargs):
+        raise AssertionError("large integer cap must run before deepcopy")
+
+    monkeypatch.setattr(state_module.copy, "deepcopy", forbidden_deepcopy)
+    with pytest.raises(ValueError, match="operation size cap"):
+        state.copy_analysis_result(
+            "large integer", max_rows=10, max_cells=100, max_bytes=200
+        )
+
+
+def test_state_byte_cap_counts_masked_object_payload_before_deepcopy(monkeypatch):
+    from services import state_manager as state_module
+
+    class LargePayload:
+        def __init__(self):
+            self.blob = "x" * 1_000
+
+    value = Masked(
+        np.asarray([LargePayload()], dtype=object),
+        mask=[True],
+    )
+    state = StateManager()
+    state.add_analysis_result("masked object payload", {"value": value})
+
+    def forbidden_deepcopy(*args, **kwargs):
+        raise AssertionError("masked object payload cap must run before deepcopy")
+
+    monkeypatch.setattr(state_module.copy, "deepcopy", forbidden_deepcopy)
+    with pytest.raises(ValueError, match="operation size cap"):
+        state.copy_analysis_result(
+            "masked object payload", max_rows=10, max_cells=100, max_bytes=128
+        )
+
+
+def test_state_rejects_structured_object_payload_before_deepcopy():
+    class EmbeddedPayload:
+        def __deepcopy__(self, memo):
+            raise AssertionError("structured object payload must not be deep-copied")
+
+    values = np.empty(1, dtype=[("x", object)])
+    values["x"][0] = EmbeddedPayload()
+    table = Table()
+    table["structured"] = values
+    state = StateManager()
+    state.add_analysis_result("structured object", table)
+
+    with pytest.raises(ValueError, match="structured dtype with object references"):
+        state.copy_analysis_result(
+            "structured object", max_rows=10, max_cells=100, max_bytes=1_000
         )
 
 

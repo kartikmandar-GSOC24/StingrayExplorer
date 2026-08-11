@@ -8,6 +8,8 @@ are already in state.
 
 from __future__ import annotations
 
+import copy
+import importlib
 import json
 import math
 import os
@@ -21,7 +23,11 @@ from typing import Any, BinaryIO
 import numpy as np
 from astropy import units as u
 from astropy.io import fits
-from astropy.table import Table
+from astropy.table import Column, MaskedColumn, Table
+from astropy.table import meta as astropy_table_meta
+from astropy.table import serialize as astropy_table_serialize
+from astropy.utils.data_info import serialize_context_as
+from astropy.utils.masked import Masked
 from stingray.io import high_precision_keyword_read, pi_to_energy, read_rmf
 
 from .analysis_helpers import collect_warnings
@@ -58,8 +64,38 @@ EXPORT_EXTENSIONS = {
     "ecsv": ".ecsv",
     "json": ".json",
     "fits": ".fits",
+    "hdf5": ".hdf5",
 }
 EXPORT_OBJECT_TYPES = {"event_list", "lightcurve", "analysis_result"}
+
+HDF5_SCHEMA = "stingray-explorer.hdf5.v1"
+HDF5_GROUP_PATH = "stingray_explorer"
+HDF5_TABLE_PATH = f"{HDF5_GROUP_PATH}/table"
+HDF5_MANIFEST_PATH = f"{HDF5_GROUP_PATH}/column_manifest"
+HDF5_ASTROPY_METADATA_PATH = f"{HDF5_TABLE_PATH}.__table_column_meta__"
+HDF5_EXTENSION = ".hdf5"
+HDF5_MANIFEST_MAX_BYTES = 2 * 1024**2
+HDF5_UNAVAILABLE_REASON = (
+    "HDF5 export requires the optional 'h5py' runtime dependency, which is not "
+    "available."
+)
+HDF5_SUPPORTED_COLUMN_KINDS = {"b", "i", "u", "f", "U"}
+HDF5_SUPPORTED_ITEM_SIZES = {
+    "b": {1},
+    "i": {1, 2, 4, 8},
+    "u": {1, 2, 4, 8},
+    "f": {2, 4, 8},
+}
+HDF5_VERIFICATION_CHECKS = [
+    "schema_and_layout",
+    "row_count",
+    "ordered_columns",
+    "logical_dtypes",
+    "masks_and_values",
+    "units",
+    "column_metadata_and_fill_values",
+    "object_metadata_gti_and_provenance",
+]
 
 TIMING_KEYWORDS = (
     "MJDREF",
@@ -115,6 +151,7 @@ SPLIT_HIGH_PRECISION_TIMING_KEYWORDS = {
 }
 
 ANALYSIS_RESERVED_FIELDS = {"warnings", "provenance", "parameters", "metadata"}
+ANALYSIS_HDF5_FILL_REASON_ATTRIBUTE = "_stingray_hdf5_fill_reason"
 
 
 def _display_fits_value(value: Any) -> Any:
@@ -780,8 +817,14 @@ def _estimated_value_bytes(
     """
     if active is None:
         active = set()
-    if value is None or isinstance(value, (bool, int, float, np.number)):
+    if value is None or isinstance(value, (bool, float, np.number)):
         return 32
+    if type(value) is int:
+        bit_length = abs(value).bit_length()
+        decimal_bytes = 1 + (bit_length * 30_103) // 100_000
+        if value < 0:
+            decimal_bytes += 1
+        return max(32, int(value.__sizeof__()), decimal_bytes)
     if isinstance(value, str):
         return len(value.encode("utf-8"))
     if isinstance(value, (bytes, bytearray)):
@@ -860,17 +903,38 @@ def _analysis_column_array(value: Any, key: str) -> np.ndarray:
     Timing estimators legitimately produce nullable floating-point sequences.
     NumPy otherwise turns those into object arrays, indistinguishable from
     nested arbitrary Python values.  Accept exactly ``None`` plus real scalar
-    numbers and normalize missing entries to NaN; every other object value
-    remains rejected.
+    numbers and normalize ``None`` to a mask.  An unmasked NaN remains an
+    unmasked NaN, so formats capable of representing masks can preserve the
+    scientific distinction between missing and non-finite values.
     """
-    array = np.asarray(value)
+    source_is_masked = isinstance(value, (MaskedColumn, Masked)) or np.ma.isMaskedArray(
+        value
+    )
+    masked_value = np.ma.asarray(value)
+    array = np.asarray(masked_value.data)
     if array.ndim != 1 or array.dtype.kind != "O":
+        if array.ndim == 1 and source_is_masked:
+            return np.ma.array(
+                array,
+                mask=np.ma.getmaskarray(masked_value),
+                copy=False,
+            )
         return array
 
     normalized: list[float] = []
-    for item in array:
+    mask = np.ma.getmaskarray(masked_value).copy()
+    added_missing_mask = False
+    for index, item in enumerate(array):
+        if mask[index]:
+            # A masked payload is scientifically absent.  Do not reject a
+            # valid nullable numeric column merely because its hidden storage
+            # uses an arbitrary object sentinel.
+            normalized.append(float("nan"))
+            continue
         if item is None:
             normalized.append(float("nan"))
+            mask[index] = True
+            added_missing_mask = True
             continue
         if isinstance(item, (bool, np.bool_)) or not isinstance(item, Real):
             raise ValueError(
@@ -883,7 +947,58 @@ def _analysis_column_array(value: Any, key: str) -> np.ndarray:
                 "represented exactly by the nullable numeric export encoding"
             )
         normalized.append(float(item))
-    return np.asarray(normalized, dtype=float)
+    normalized_array = np.asarray(normalized, dtype=float)
+    if source_is_masked or added_missing_mask:
+        return np.ma.array(normalized_array, mask=mask, copy=False)
+    return normalized_array
+
+
+def _normalized_analysis_column(
+    original: Any,
+    normalized: np.ndarray,
+    name: str,
+) -> Column:
+    """Build a normalized column without discarding masks or display metadata."""
+    values = np.ma.asarray(normalized)
+    data = np.asarray(values.data)
+    masked = np.ma.isMaskedArray(normalized)
+    source_is_masked = isinstance(
+        original, (MaskedColumn, Masked)
+    ) or np.ma.isMaskedArray(original)
+    common = {
+        "name": name,
+        "unit": getattr(original, "unit", None),
+        "format": getattr(original, "format", None),
+        "description": getattr(original, "description", None),
+        "meta": copy.deepcopy(getattr(original, "meta", {})),
+        "copy": False,
+    }
+    if not masked:
+        return Column(data, **common)
+
+    fill_value = np.ma.default_fill_value(data)
+    fill_reason: str | None = None
+    if source_is_masked and hasattr(original, "fill_value"):
+        try:
+            fill_value = (
+                np.asarray(getattr(original, "fill_value"), dtype=data.dtype)
+                .reshape(())
+                .item()
+            )
+        except (TypeError, ValueError, OverflowError):
+            fill_reason = (
+                f"HDF5 export cannot preserve column '{name}' custom fill value "
+                "after nullable numeric normalization"
+            )
+    replacement = MaskedColumn(
+        data,
+        mask=np.ma.getmaskarray(values),
+        fill_value=fill_value,
+        **common,
+    )
+    if fill_reason is not None:
+        setattr(replacement, ANALYSIS_HDF5_FILL_REASON_ATTRIBUTE, fill_reason)
+    return replacement
 
 
 def _validate_analysis_dtype(array: np.ndarray, key: str) -> None:
@@ -955,6 +1070,12 @@ def _analysis_result_row_count(result: Any) -> int:
         return row_count
     if not isinstance(result, dict):
         raise ValueError("Analysis result is not a tabular mapping")
+    for key in result:
+        if not isinstance(key, str):
+            raise ValueError(
+                "Analysis result field names must be text; found a field name "
+                f"of type {type(key).__name__}"
+            )
 
     non_column_fields = _analysis_non_column_fields(result)
     reserved = ANALYSIS_RESERVED_FIELDS | non_column_fields
@@ -991,6 +1112,9 @@ def _analysis_result_row_count(result: Any) -> int:
 
         array = _analysis_column_array(value, str(key))
         if array.ndim == 0:
+            if isinstance(value, u.Quantity) and value.isscalar:
+                estimated_bytes += value_bytes
+                continue
             scalar = array.item()
             if isinstance(scalar, (complex, np.complexfloating)):
                 raise ValueError(
@@ -1064,26 +1188,36 @@ def _analysis_table(result: Any) -> Table:
         )
     if isinstance(result, Table):
         table = result.copy(copy_data=True)
+        hdf5_fill_reasons: dict[str, str] = {}
         for name in table.colnames:
             original = table[name]
             array = _analysis_column_array(original, name)
             if np.asarray(original).dtype.kind == "O" and array.dtype.kind != "O":
-                replacement = np.ma.array(
-                    array,
-                    mask=np.ma.getmaskarray(np.ma.asarray(original)),
-                    copy=False,
+                replacement = _normalized_analysis_column(original, array, name)
+                fill_reason = getattr(
+                    replacement, ANALYSIS_HDF5_FILL_REASON_ATTRIBUTE, None
                 )
-                table.replace_column(name, replacement)
-                if getattr(original, "unit", None) is not None:
-                    table[name].unit = original.unit
+                if fill_reason is not None:
+                    hdf5_fill_reasons[name] = str(fill_reason)
+                table.replace_column(
+                    name,
+                    replacement,
+                )
         _reject_complex_columns(table)
+        if hdf5_fill_reasons:
+            setattr(
+                table,
+                ANALYSIS_HDF5_FILL_REASON_ATTRIBUTE,
+                hdf5_fill_reasons,
+            )
         return table
     if not isinstance(result, dict):
         raise ValueError("Analysis result is not a tabular mapping")
 
     non_column_fields = _analysis_non_column_fields(result)
     reserved = ANALYSIS_RESERVED_FIELDS | non_column_fields
-    columns: dict[str, np.ndarray] = {}
+    columns: dict[str, Any] = {}
+    hdf5_fill_reasons: dict[str, str] = {}
     metadata: dict[str, Any] = {}
     expected_length: int | None = None
     for key, value in result.items():
@@ -1091,6 +1225,9 @@ def _analysis_table(result: Any) -> Table:
             continue
         array = _analysis_column_array(value, str(key))
         if array.ndim == 0:
+            if isinstance(value, u.Quantity) and value.isscalar:
+                metadata[str(key)] = value.copy()
+                continue
             scalar = array.item()
             if isinstance(scalar, (complex, np.complexfloating)):
                 raise ValueError(
@@ -1116,13 +1253,25 @@ def _analysis_table(result: Any) -> Table:
             raise ValueError(
                 "Analysis result contains one-dimensional columns with different lengths"
             )
-        columns[str(key)] = value if getattr(value, "unit", None) is not None else array
+        normalized_column = _normalized_analysis_column(value, array, str(key))
+        fill_reason = getattr(
+            normalized_column, ANALYSIS_HDF5_FILL_REASON_ATTRIBUTE, None
+        )
+        if fill_reason is not None:
+            hdf5_fill_reasons[str(key)] = str(fill_reason)
+        columns[str(key)] = normalized_column
 
     if expected_length is None or not columns:
         raise ValueError(
             "Analysis result does not contain exportable one-dimensional columns"
         )
     table = Table(columns)
+    if hdf5_fill_reasons:
+        setattr(
+            table,
+            ANALYSIS_HDF5_FILL_REASON_ATTRIBUTE,
+            hdf5_fill_reasons,
+        )
     table.meta.update(metadata)
     for key in ANALYSIS_RESERVED_FIELDS:
         if key in result:
@@ -1177,7 +1326,9 @@ def _reject_complex_columns(table: Table) -> None:
         _validate_analysis_dtype(values, name)
 
 
-def _gti_array_for_export(obj: Any) -> np.ndarray | None:
+def _gti_array_for_export(
+    obj: Any, *, preserve_dtype: bool = False
+) -> np.ndarray | None:
     """Return only explicitly stored GTIs, including a zero-row GTI.
 
     Stingray's public ``gti`` property synthesizes and caches ``[time[0],
@@ -1190,14 +1341,26 @@ def _gti_array_for_export(obj: Any) -> np.ndarray | None:
         gti = getattr(obj, "gti", None)
     if gti is None:
         return None
-    return _normalize_gti_array(gti)
+    return _normalize_gti_array(gti, preserve_dtype=preserve_dtype)
 
 
-def _normalize_gti_array(gti: Any) -> np.ndarray:
+def _normalize_gti_array(gti: Any, *, preserve_dtype: bool = False) -> np.ndarray:
     """Validate and copy one explicit seconds-based GTI value."""
-    array = np.asarray(gti, dtype=float)
+    array = np.asarray(gti)
+    if not preserve_dtype:
+        array = np.asarray(array, dtype=float)
+    elif array.dtype.kind not in {"f", "i", "u"}:
+        try:
+            array = np.asarray(gti, dtype=np.longdouble)
+        except (TypeError, ValueError, OverflowError) as exception:
+            raise ValueError(
+                "Loaded object GTIs must be numeric for export"
+            ) from exception
     if array.size == 0:
-        return np.empty((0, 2), dtype=float)
+        return np.empty(
+            (0, 2),
+            dtype=array.dtype if preserve_dtype else float,
+        )
     if array.ndim != 2 or array.shape[1] != 2:
         raise ValueError("Loaded object GTIs must have shape (n, 2) for export")
     bad = np.argwhere(~np.isfinite(array))
@@ -1272,7 +1435,18 @@ def _object_row_count(obj: Any, object_type: str) -> int:
     elif object_type == "lightcurve":
         values = getattr(obj, "time", None)
     else:
-        return _analysis_result_row_count(obj)
+        row_count = _analysis_result_row_count(obj)
+        if row_count > MAX_EXPORT_ROWS:
+            return row_count
+        _enforce_precopy_caps(
+            obj,
+            "Analysis result",
+            max_rows=MAX_EXPORT_ROWS,
+            max_columns=MAX_EXPORT_COLUMNS,
+            max_cells=MAX_EXPORT_CELLS,
+            max_bytes=MAX_EXPORT_ESTIMATED_BYTES,
+        )
+        return row_count
     if values is None:
         raise ValueError(f"Loaded {object_type.replace('_', ' ')} has no time array")
     _enforce_precopy_caps(
@@ -1292,27 +1466,47 @@ def _object_row_count(obj: Any, object_type: str) -> int:
     return row_count
 
 
-def _table_for_object(obj: Any, object_type: str) -> Table:
+def _table_for_object(
+    obj: Any,
+    object_type: str,
+    *,
+    preserve_timing_precision: bool = False,
+) -> Table:
     if object_type == "analysis_result":
         table = _analysis_table(obj)
         explicit_gti = None
     else:
         # Capture the backing GTI before to_astropy_table accesses the public
         # property and can synthesize/cache an implicit interval.
-        explicit_gti = _gti_array_for_export(obj)
+        explicit_gti = _gti_array_for_export(
+            obj, preserve_dtype=preserve_timing_precision
+        )
         table = obj.to_astropy_table()
+        # Stingray declares its scientific scalar fields through meta_attrs(),
+        # but Lightcurve.to_astropy_table() currently omits several of them.
+        # Add every declared value that the public serializer left out so the
+        # HDF5 semantic comparison sees the complete source projection.
+        if preserve_timing_precision:
+            for attribute in obj.meta_attrs():
+                if attribute == "gti" or attribute in table.meta:
+                    continue
+                table.meta[attribute] = copy.deepcopy(getattr(obj, attribute))
         if object_type == "lightcurve":
             for attribute in obj.array_attrs():
                 values = getattr(obj, attribute, None)
                 if values is None or attribute in table.colnames:
                     continue
-                array = np.asarray(values)
+                array = (
+                    np.ma.asarray(values)
+                    if isinstance(values, Masked) or np.ma.isMaskedArray(values)
+                    else np.asarray(values)
+                )
                 if array.ndim != 1 or len(array) != len(table):
                     raise ValueError(
                         f"Loaded Lightcurve {attribute} must be a one-dimensional "
                         "array aligned with time"
                     )
-                table[attribute] = np.array(array, copy=True)
+                table[attribute] = _normalized_analysis_column(values, array, attribute)
             dt = np.asarray(getattr(obj, "dt", None))
             if dt.ndim == 1:
                 if len(dt) != len(table):
@@ -1320,6 +1514,29 @@ def _table_for_object(obj: Any, object_type: str) -> Table:
                         "Loaded Lightcurve per-bin dt must be aligned with time"
                     )
                 table["dt"] = np.array(dt, copy=True)
+        if preserve_timing_precision:
+            # Preserve additional application provenance and other non-null
+            # public scalar fields that Stingray does not declare through
+            # meta_attrs().  Aligned scientific arrays are represented as
+            # columns above or by Stingray's own table projection.
+            for attribute, value in vars(obj).items():
+                if (
+                    attribute.startswith("_")
+                    or attribute in table.colnames
+                    or attribute in table.meta
+                    or value is None
+                ):
+                    continue
+                try:
+                    aligned = np.ndim(value) >= 1 and len(value) == len(table)
+                except TypeError:
+                    aligned = False
+                if aligned:
+                    raise ValueError(
+                        f"Loaded {object_type.replace('_', ' ')} field '{attribute}' "
+                        "was not represented as a scientific column"
+                    )
+                table.meta[attribute] = copy.deepcopy(value)
     if not table.colnames:
         raise ValueError("Loaded object has no exportable columns")
     _reject_complex_columns(table)
@@ -1427,7 +1644,10 @@ def _json_export_payload(
             )
         if values.dtype.kind == "f":
             finite = np.isfinite(values)
-            nonfinite_count = int(np.count_nonzero(~finite))
+            # A masked nullable value may use NaN only as its hidden storage.
+            # Report non-finite values only when they are scientifically
+            # present, not when the mask already declares them missing.
+            nonfinite_count = int(np.count_nonzero(~finite & ~masked))
             if nonfinite_count:
                 warnings_out.append(
                     f"columns.{name} contains {nonfinite_count:,} non-finite value(s); "
@@ -1464,6 +1684,993 @@ def _json_export_payload(
         },
         "metadata": json_safe(dict(table.meta), warnings_out, "metadata"),
     }
+
+
+def _optional_hdf5_runtime() -> tuple[Any | None, str | None]:
+    """Load h5py lazily so the rest of General I/O remains independently usable."""
+    try:
+        module = importlib.import_module("h5py")
+    except Exception:
+        return None, HDF5_UNAVAILABLE_REASON
+    if not callable(getattr(module, "File", None)):
+        return None, HDF5_UNAVAILABLE_REASON
+    return module, None
+
+
+def _hdf5_capability() -> dict[str, Any]:
+    module, reason = _optional_hdf5_runtime()
+    available = module is not None
+    return {
+        "supported": available,
+        "notes": (
+            "Versioned Stingray Explorer HDF5 table with a complete semantic "
+            "reopen comparison before publication."
+            if available
+            else "Optional HDF5 runtime dependency is unavailable."
+        ),
+        "reason": reason,
+        "extensions": [HDF5_EXTENSION],
+        "dependency": {
+            "name": "h5py",
+            "available": available,
+            "version": str(getattr(module, "__version__", "unknown"))
+            if available
+            else None,
+        },
+    }
+
+
+def _hdf5_object_name_reason(object_name: str) -> str | None:
+    if "\0" in object_name:
+        return "HDF5 export does not support NUL characters in object names"
+    try:
+        object_name.encode("utf-8")
+    except UnicodeEncodeError:
+        return "HDF5 export requires object names that are valid UTF-8 text"
+    return None
+
+
+def _hdf5_dtype_reason(dtype: np.dtype[Any], column_name: str) -> str | None:
+    kind = dtype.kind
+    if kind not in HDF5_SUPPORTED_COLUMN_KINDS:
+        return (
+            f"HDF5 export does not support column '{column_name}' with logical "
+            f"dtype {dtype}; supported logical kinds are boolean, integer, "
+            "floating point, and ASCII Unicode text"
+        )
+    if kind == "U":
+        if dtype.itemsize <= 0 or dtype.itemsize % np.dtype("U1").itemsize != 0:
+            return (
+                f"HDF5 export cannot represent column '{column_name}' with "
+                f"logical dtype {dtype}"
+            )
+        return None
+    if dtype.itemsize not in HDF5_SUPPORTED_ITEM_SIZES[kind]:
+        return (
+            f"HDF5 export does not support column '{column_name}' with logical "
+            f"dtype {dtype}; its {dtype.itemsize}-byte width is unsupported"
+        )
+    return None
+
+
+def _hdf5_metadata_reason(
+    value: Any,
+    location: str,
+    active: set[int] | None = None,
+) -> str | None:
+    """Return why metadata is outside the explicitly verified HDF5 subset."""
+    if active is None:
+        active = set()
+    if value is None or type(value) in {str, bool, int, float}:
+        return None
+    if isinstance(value, Masked) or np.ma.isMaskedArray(value):
+        return f"HDF5 export does not support masked metadata at '{location}'"
+    if isinstance(value, np.generic):
+        return _hdf5_dtype_reason(np.asarray(value).dtype, location)
+    if isinstance(value, u.UnitBase):
+        return _hdf5_unit_reason(value, location)
+    if isinstance(value, u.Quantity):
+        if type(value) is not u.Quantity:
+            return (
+                f"HDF5 export does not support Quantity subclass "
+                f"'{type(value).__name__}' at '{location}'"
+            )
+        quantity_dtype = np.asarray(value.value).dtype
+        reason = _hdf5_dtype_reason(quantity_dtype, location)
+        if reason is not None:
+            return reason
+        if quantity_dtype.kind in {"b", "i", "u"}:
+            return (
+                f"HDF5 export does not support integer or boolean Quantity "
+                f"metadata at '{location}' because Astropy reopens it as "
+                "floating point"
+            )
+        return _hdf5_unit_reason(value.unit, location)
+    if type(value) is np.ndarray:
+        return _hdf5_dtype_reason(value.dtype, location)
+    if isinstance(value, np.ndarray):
+        return (
+            f"HDF5 export does not support ndarray subclass "
+            f"'{type(value).__name__}' at '{location}'"
+        )
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"HDF5 export does not support binary metadata at '{location}'"
+
+    identity = id(value)
+    if identity in active:
+        return f"HDF5 export metadata at '{location}' contains a cycle"
+    active.add(identity)
+    try:
+        if type(value) is dict:
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    return f"HDF5 export metadata at '{location}' has a non-text key"
+                reason = _hdf5_metadata_reason(item, f"{location}.{key}", active)
+                if reason is not None:
+                    return reason
+            return None
+        if isinstance(value, Mapping):
+            return (
+                f"HDF5 export does not support metadata mapping subclass "
+                f"'{type(value).__name__}' at '{location}'"
+            )
+        if type(value) in {list, tuple}:
+            for index, item in enumerate(value):
+                reason = _hdf5_metadata_reason(item, f"{location}[{index}]", active)
+                if reason is not None:
+                    return reason
+            return None
+        if isinstance(value, (list, tuple)):
+            return (
+                f"HDF5 export does not support metadata sequence subclass "
+                f"'{type(value).__name__}' at '{location}'"
+            )
+    finally:
+        active.remove(identity)
+    return (
+        f"HDF5 export does not support metadata value '{location}' of type "
+        f"{type(value).__name__}"
+    )
+
+
+def _hdf5_unit_reason(unit: u.UnitBase, location: str) -> str | None:
+    """Reject units the standalone reader cannot reconstruct exactly."""
+    try:
+        encoded = unit.to_string()
+        decoded = u.Unit(encoded, parse_strict="raise")
+    except Exception:
+        return (
+            f"HDF5 export cannot reopen the unit '{unit}' at '{location}' "
+            "without an external custom-unit definition"
+        )
+    if decoded != unit:
+        return f"HDF5 export cannot round-trip the unit at '{location}' exactly"
+    return None
+
+
+def _canonicalize_hdf5_metadata(value: Any) -> Any:
+    """Normalize supported scalar types to Astropy's stable YAML representation."""
+    if isinstance(value, np.generic):
+        kind = np.asarray(value).dtype.kind
+        if kind == "b":
+            return bool(value)
+        if kind in {"i", "u"}:
+            return int(value)
+        if kind == "f":
+            return float(value)
+        if kind == "U":
+            return str(value)
+    if isinstance(value, u.Quantity):
+        if value.isscalar:
+            scalar = _canonicalize_hdf5_metadata(np.asarray(value.value)[()])
+            return u.Quantity(scalar, value.unit, copy=True)
+        return value.copy()
+    if type(value) is np.ndarray:
+        return value.copy()
+    if type(value) is dict:
+        return {key: _canonicalize_hdf5_metadata(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_canonicalize_hdf5_metadata(item) for item in value]
+    if type(value) is tuple:
+        return tuple(_canonicalize_hdf5_metadata(item) for item in value)
+    return value
+
+
+def _is_masked_column(column: Any) -> bool:
+    return isinstance(column, MaskedColumn) or np.ma.isMaskedArray(column)
+
+
+def _encode_hdf5_fill_value(value: Any, dtype: np.dtype[Any]) -> dict[str, Any]:
+    """Encode one dtype-coerced scalar without losing non-finite float values."""
+    scalar = np.asarray(value, dtype=dtype).reshape(()).item()
+    if dtype.kind == "b":
+        return {"kind": "bool", "value": bool(scalar)}
+    if dtype.kind in {"i", "u"}:
+        return {"kind": "integer", "value": str(int(scalar))}
+    if dtype.kind == "f":
+        converted = float(scalar)
+        if math.isnan(converted):
+            encoded = "nan"
+        elif math.isinf(converted):
+            encoded = "+inf" if converted > 0 else "-inf"
+        else:
+            encoded = converted.hex()
+        return {"kind": "float", "value": encoded}
+    if dtype.kind == "U":
+        return {"kind": "unicode", "value": str(scalar)}
+    raise ValueError(f"Cannot encode an HDF5 fill value for logical dtype {dtype}")
+
+
+def _logical_dtype_from_manifest(entry: Mapping[str, Any]) -> np.dtype[Any]:
+    kind = entry.get("dtype_kind")
+    itemsize = entry.get("dtype_itemsize")
+    if (
+        not isinstance(kind, str)
+        or not isinstance(itemsize, int)
+        or isinstance(itemsize, bool)
+    ):
+        raise ValueError("HDF5 column manifest contains an invalid logical dtype")
+    if kind == "b" and itemsize == 1:
+        return np.dtype("?")
+    if kind in {"i", "u", "f"} and itemsize in HDF5_SUPPORTED_ITEM_SIZES[kind]:
+        return np.dtype(f"{kind}{itemsize}").newbyteorder("=")
+    if kind == "U" and itemsize > 0 and itemsize % np.dtype("U1").itemsize == 0:
+        return np.dtype(f"U{itemsize // np.dtype('U1').itemsize}")
+    raise ValueError("HDF5 column manifest declares an unsupported logical dtype")
+
+
+def _decode_hdf5_fill_value(
+    encoded: Any, dtype: np.dtype[Any]
+) -> np.generic | str | bool:
+    if not isinstance(encoded, Mapping):
+        raise ValueError("HDF5 column manifest contains an invalid fill value")
+    kind = encoded.get("kind")
+    value = encoded.get("value")
+    if kind == "bool" and isinstance(value, bool):
+        decoded: Any = value
+    elif kind == "integer" and isinstance(value, str):
+        decoded = int(value)
+    elif kind == "float" and isinstance(value, str):
+        if value == "nan":
+            decoded = float("nan")
+        elif value == "+inf":
+            decoded = float("inf")
+        elif value == "-inf":
+            decoded = float("-inf")
+        else:
+            decoded = float.fromhex(value)
+    elif kind == "unicode" and isinstance(value, str):
+        decoded = value
+    else:
+        raise ValueError("HDF5 column manifest contains an invalid fill value")
+    return np.asarray(decoded, dtype=dtype).reshape(()).item()
+
+
+def _replace_table_column(
+    table: Table,
+    name: str,
+    data: np.ndarray,
+    *,
+    masked: bool,
+    mask: np.ndarray | None = None,
+    fill_value: Any = None,
+) -> None:
+    original = table[name]
+    common = {
+        "name": name,
+        "unit": getattr(original, "unit", None),
+        "format": getattr(original, "format", None),
+        "description": getattr(original, "description", None),
+        "meta": copy.deepcopy(getattr(original, "meta", {})),
+        "copy": False,
+    }
+    if masked:
+        replacement = MaskedColumn(
+            data,
+            mask=mask,
+            fill_value=fill_value,
+            **common,
+        )
+    else:
+        replacement = Column(data, **common)
+    table.replace_column(name, replacement)
+
+
+def _prepare_hdf5_table(table: Table) -> tuple[Table, list[dict[str, Any]]]:
+    """Canonicalize endian representation and create an ordered schema manifest."""
+    if "__serialized_columns__" in table.meta:
+        raise ValueError(
+            "HDF5 export does not support the reserved top-level metadata key "
+            "'__serialized_columns__'"
+        )
+    metadata_reason = _hdf5_metadata_reason(table.meta, "metadata")
+    if metadata_reason is not None:
+        raise ValueError(metadata_reason)
+    table_fill_reasons = getattr(table, ANALYSIS_HDF5_FILL_REASON_ATTRIBUTE, {})
+    if isinstance(table_fill_reasons, Mapping) and table_fill_reasons:
+        first_name = next(iter(table_fill_reasons))
+        raise ValueError(str(table_fill_reasons[first_name]))
+    source_names = set(table.colnames)
+    for name in table.colnames:
+        if _is_masked_column(table[name]) and f"{name}.mask" in source_names:
+            raise ValueError(
+                f"HDF5 export cannot serialize masked column '{name}' because "
+                f"column '{name}.mask' conflicts with its schema mask field"
+            )
+    for name in table.colnames:
+        fill_reason = getattr(table[name], ANALYSIS_HDF5_FILL_REASON_ATTRIBUTE, None)
+        if fill_reason is not None:
+            raise ValueError(str(fill_reason))
+
+    canonical = table.copy(copy_data=True)
+    canonical.meta = _canonicalize_hdf5_metadata(canonical.meta)
+    manifest: list[dict[str, Any]] = []
+    for name in canonical.colnames:
+        column = canonical[name]
+        if not isinstance(column, Column):
+            raise ValueError(
+                f"HDF5 export does not support mixin column '{name}' of type "
+                f"{type(column).__name__}"
+            )
+        if not isinstance(name, str) or not name:
+            raise ValueError("HDF5 export requires non-empty text column names")
+        if not name.isprintable():
+            raise ValueError(
+                f"HDF5 export does not support control characters in column "
+                f"name {name!r}"
+            )
+        column_format = getattr(column, "format", None)
+        if column_format is not None and not isinstance(column_format, str):
+            raise ValueError(
+                f"HDF5 export does not support callable or non-text format "
+                f"metadata on column '{name}'"
+            )
+        description = getattr(column, "description", None)
+        if description is not None and not isinstance(description, str):
+            raise ValueError(
+                f"HDF5 export does not support non-text description metadata "
+                f"on column '{name}'"
+            )
+        values = np.ma.asarray(column)
+        data = np.asarray(values.data)
+        if data.ndim != 1:
+            raise ValueError(f"HDF5 export requires one-dimensional column '{name}'")
+        reason = _hdf5_dtype_reason(data.dtype, name)
+        if reason is not None:
+            raise ValueError(reason)
+        if data.dtype.kind == "U" and any(
+            not str(item).isascii() for item in data.flat
+        ):
+            raise ValueError(
+                f"HDF5 export column '{name}' contains non-ASCII Unicode text; "
+                "this schema only verifies fixed-width ASCII text losslessly"
+            )
+
+        dtype = data.dtype.newbyteorder("=")
+        masked = _is_masked_column(column)
+        mask = np.ma.getmaskarray(values) if masked else None
+        fill_value = getattr(column, "fill_value", None) if masked else None
+        if data.dtype.byteorder not in {"=", "|"}:
+            data = data.astype(dtype, copy=True)
+            _replace_table_column(
+                canonical,
+                name,
+                data,
+                masked=masked,
+                mask=mask,
+                fill_value=fill_value,
+            )
+            column = canonical[name]
+            values = np.ma.asarray(column)
+            data = np.asarray(values.data)
+
+        column_meta_reason = _hdf5_metadata_reason(
+            getattr(column, "meta", {}), f"columns.{name}.meta"
+        )
+        if column_meta_reason is not None:
+            raise ValueError(column_meta_reason)
+        column.meta = _canonicalize_hdf5_metadata(column.meta)
+        column_unit = getattr(column, "unit", None)
+        if column_unit is not None:
+            unit_reason = _hdf5_unit_reason(column_unit, f"columns.{name}.unit")
+            if unit_reason is not None:
+                raise ValueError(unit_reason)
+        entry: dict[str, Any] = {
+            "name": name,
+            "dtype_kind": data.dtype.kind,
+            "dtype_itemsize": data.dtype.itemsize,
+            "masked": masked,
+            "unit": str(column_unit) if column_unit is not None else None,
+        }
+        if masked:
+            entry["fill_value"] = _encode_hdf5_fill_value(column.fill_value, data.dtype)
+            entry["mask_stored"] = bool(np.any(mask))
+        manifest.append(entry)
+
+    manifest_bytes = len(
+        json.dumps(
+            manifest,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    if manifest_bytes > HDF5_MANIFEST_MAX_BYTES:
+        raise ValueError("HDF5 column manifest exceeds the 2 MiB schema cap")
+    try:
+        with serialize_context_as("hdf5"):
+            serialized_table = astropy_table_serialize.represent_mixins_as_columns(
+                canonical
+            )
+        yaml_lines = astropy_table_meta.get_yaml_from_table(serialized_table)
+    except Exception as exception:
+        raise ValueError(
+            "HDF5 export metadata cannot be represented by the installed "
+            "Astropy runtime"
+        ) from exception
+    if not isinstance(yaml_lines, list) or any(
+        not isinstance(line, str) for line in yaml_lines
+    ):
+        raise ValueError("HDF5 export metadata serialization is invalid")
+    yaml_width = max(
+        (len(line.encode("utf-8")) for line in yaml_lines),
+        default=0,
+    )
+    yaml_bytes = len(yaml_lines) * yaml_width
+    table_bytes = sum(
+        int(np.asarray(serialized_table[name]).nbytes)
+        for name in serialized_table.colnames
+    )
+    estimated_bytes = table_bytes + yaml_bytes + manifest_bytes
+    if estimated_bytes > MAX_EXPORT_ESTIMATED_BYTES:
+        raise ValueError(
+            f"HDF5 serialized table is estimated at least "
+            f"{estimated_bytes / 1024**2:.1f} MiB; the export size cap is "
+            f"{MAX_EXPORT_ESTIMATED_BYTES / 1024**2:.1f} MiB"
+        )
+    return canonical, manifest
+
+
+def _hdf5_object_support_reason(
+    obj: Any,
+    object_type: str,
+    object_name: str | None = None,
+) -> str | None:
+    """Check one bounded object without mutating application state."""
+    if object_name is not None:
+        name_reason = _hdf5_object_name_reason(object_name)
+        if name_reason is not None:
+            return name_reason
+    try:
+        # A shallow object copy keeps array allocation bounded while isolating
+        # Stingray's lazy GTI/property caches from the catalog operation.
+        table = _table_for_object(
+            copy.copy(obj), object_type, preserve_timing_precision=True
+        )
+        _prepare_hdf5_table(table)
+    except Exception as exception:
+        return str(exception)
+    return None
+
+
+def _write_hdf5_table(
+    stream: BinaryIO,
+    h5py_module: Any,
+    table: Table,
+    manifest: list[dict[str, Any]],
+    *,
+    object_type: str,
+    object_name: str,
+) -> None:
+    name_reason = _hdf5_object_name_reason(object_name)
+    if name_reason is not None:
+        raise ValueError(name_reason)
+    manifest_json = json.dumps(
+        manifest,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    manifest_encoded = manifest_json.encode("utf-8")
+    if len(manifest_encoded) > HDF5_MANIFEST_MAX_BYTES:
+        raise ValueError("HDF5 column manifest exceeds the 2 MiB schema cap")
+    with h5py_module.File(stream, "w") as handle:
+        table.write(
+            handle,
+            format="hdf5",
+            path=HDF5_TABLE_PATH,
+            serialize_meta=True,
+        )
+        group = handle[HDF5_GROUP_PATH]
+        group.attrs["schema"] = HDF5_SCHEMA
+        group.attrs["table_path"] = HDF5_TABLE_PATH
+        group.attrs["object_type"] = object_type
+        group.attrs["object_name"] = object_name
+        group.attrs["row_count"] = len(table)
+        handle.create_dataset(
+            HDF5_MANIFEST_PATH,
+            shape=(),
+            dtype=f"S{max(1, len(manifest_encoded))}",
+            data=np.bytes_(manifest_encoded),
+        )
+        handle.flush()
+
+
+def _text_hdf5_attribute(value: Any, name: str) -> str:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exception:
+            raise ValueError(f"HDF5 {name} attribute is not UTF-8") from exception
+    if not isinstance(value, str):
+        raise ValueError(f"HDF5 {name} attribute is invalid")
+    return value
+
+
+def _require_hdf5_hard_link(
+    handle: Any,
+    h5py_module: Any,
+    path: str,
+    label: str,
+) -> None:
+    link = handle.get(path, getlink=True)
+    if not isinstance(link, h5py_module.HardLink):
+        raise ValueError(f"HDF5 verification found a noncanonical {label} link")
+
+
+def _require_self_contained_hdf5_dataset(dataset: Any, label: str) -> None:
+    if bool(dataset.is_virtual) or bool(dataset.external):
+        raise ValueError(
+            f"HDF5 verification found a non-self-contained {label} dataset"
+        )
+
+
+def _validated_hdf5_manifest(
+    manifest: Any,
+) -> tuple[list[dict[str, Any]], list[tuple[str, np.dtype[Any]]]]:
+    """Validate the bounded manifest before any table dataset is materialized."""
+    if not isinstance(manifest, list):
+        raise ValueError("HDF5 column manifest must be a list")
+    if not manifest or len(manifest) > MAX_EXPORT_COLUMNS:
+        raise ValueError(
+            f"HDF5 column manifest must contain between 1 and "
+            f"{MAX_EXPORT_COLUMNS:,} columns"
+        )
+    seen: set[str] = set()
+    physical_fields: list[tuple[str, np.dtype[Any]]] = []
+    for entry in manifest:
+        if not isinstance(entry, dict):
+            raise ValueError("HDF5 column manifest contains an invalid entry")
+        masked = entry.get("masked")
+        required_keys = {
+            "name",
+            "dtype_kind",
+            "dtype_itemsize",
+            "masked",
+            "unit",
+        }
+        if masked is True:
+            required_keys.update({"fill_value", "mask_stored"})
+        if type(masked) is not bool or set(entry) != required_keys:
+            raise ValueError("HDF5 column manifest contains an invalid entry")
+        name = entry.get("name")
+        if (
+            not isinstance(name, str)
+            or not name
+            or not name.isprintable()
+            or name in seen
+        ):
+            raise ValueError("HDF5 column manifest contains an invalid column name")
+        seen.add(name)
+        unit = entry.get("unit")
+        if unit is not None and not isinstance(unit, str):
+            raise ValueError("HDF5 column manifest contains an invalid unit")
+        logical_dtype = _logical_dtype_from_manifest(entry)
+        physical_fields.append((name, logical_dtype))
+        if masked:
+            # Validate the scalar now; the restored column uses the same decode.
+            _decode_hdf5_fill_value(entry.get("fill_value"), logical_dtype)
+            mask_stored = entry.get("mask_stored")
+            if type(mask_stored) is not bool:
+                raise ValueError("HDF5 column manifest contains an invalid entry")
+            if mask_stored:
+                physical_fields.append((f"{name}.mask", np.dtype("?")))
+    return manifest, physical_fields
+
+
+def _hdf5_dataset_logical_bytes(dataset: Any) -> int:
+    return int(dataset.size) * int(dataset.dtype.itemsize)
+
+
+def _validate_hdf5_table_storage(
+    handle: Any,
+    h5py_module: Any,
+    *,
+    row_count: int,
+    manifest: list[dict[str, Any]],
+    physical_fields: list[tuple[str, np.dtype[Any]]],
+    manifest_bytes: int,
+) -> None:
+    """Bound and validate all datasets before Astropy allocates a Table."""
+    _require_hdf5_hard_link(handle, h5py_module, HDF5_TABLE_PATH, "table dataset")
+    table_dataset = handle[HDF5_TABLE_PATH]
+    if not isinstance(table_dataset, h5py_module.Dataset):
+        raise ValueError("HDF5 verification found an invalid table dataset")
+    _require_self_contained_hdf5_dataset(table_dataset, "table")
+    if len(table_dataset.shape) != 1 or int(table_dataset.shape[0]) != row_count:
+        raise ValueError("HDF5 schema row count does not match the table dataset")
+    if table_dataset.dtype.hasobject or table_dataset.dtype.metadata is not None:
+        raise ValueError("HDF5 table dataset contains an unbounded variable dtype")
+    actual_fields = table_dataset.dtype.names
+    expected_names = tuple(name for name, _dtype in physical_fields)
+    if actual_fields is None or tuple(actual_fields) != expected_names:
+        raise ValueError("HDF5 table storage fields do not match the column manifest")
+    expected_storage_fields: list[tuple[str, np.dtype[Any]]] = []
+    for name, logical_dtype in physical_fields:
+        field_dtype = table_dataset.dtype.fields[name][0]
+        if field_dtype.hasobject or field_dtype.subdtype is not None:
+            raise ValueError(
+                f"HDF5 table storage field '{name}' has an unsupported dtype"
+            )
+        if logical_dtype.kind == "U":
+            expected_kind = "S"
+            expected_itemsize = logical_dtype.itemsize // np.dtype("U1").itemsize
+            expected_storage_dtype = h5py_module.string_dtype(
+                encoding="ascii",
+                length=expected_itemsize,
+            )
+        else:
+            expected_kind = logical_dtype.kind
+            expected_itemsize = logical_dtype.itemsize
+            expected_storage_dtype = logical_dtype.newbyteorder("=")
+        expected_storage_fields.append((name, expected_storage_dtype))
+        allowed_metadata = field_dtype.metadata is None or (
+            expected_kind == "S" and field_dtype.metadata == {"h5py_encoding": "ascii"}
+        )
+        if (
+            field_dtype.kind != expected_kind
+            or field_dtype.itemsize != expected_itemsize
+            or not allowed_metadata
+        ):
+            raise ValueError(
+                f"HDF5 table storage field '{name}' does not match its logical dtype"
+            )
+
+    # High-level NumPy dtypes do not expose every HDF5 type property.  Compare
+    # the complete low-level compound type against the exact packed type our
+    # writer creates so padding, byte order, integer precision/offset/sign,
+    # string padding/cset, and boolean enum semantics are all canonical.
+    expected_storage_dtype = np.dtype(expected_storage_fields, align=False)
+    actual_hdf_type = table_dataset.id.get_type()
+    expected_hdf_type = h5py_module.h5t.py_create(
+        expected_storage_dtype,
+        logical=True,
+    )
+    try:
+        if not actual_hdf_type.equal(expected_hdf_type):
+            raise ValueError(
+                "HDF5 table storage has a noncanonical compound layout or member type"
+            )
+    finally:
+        expected_hdf_type.close()
+        actual_hdf_type.close()
+
+    cells = row_count * len(manifest)
+    if cells > MAX_EXPORT_CELLS:
+        raise ValueError(
+            f"HDF5 table has {cells:,} cells; the export cell cap is "
+            f"{MAX_EXPORT_CELLS:,}"
+        )
+    if HDF5_ASTROPY_METADATA_PATH not in handle:
+        raise ValueError("HDF5 verification could not find Astropy table metadata")
+    _require_hdf5_hard_link(
+        handle,
+        h5py_module,
+        HDF5_ASTROPY_METADATA_PATH,
+        "Astropy table metadata",
+    )
+    metadata_dataset = handle[HDF5_ASTROPY_METADATA_PATH]
+    if not isinstance(metadata_dataset, h5py_module.Dataset):
+        raise ValueError("HDF5 verification found invalid Astropy table metadata")
+    _require_self_contained_hdf5_dataset(metadata_dataset, "Astropy table metadata")
+    if (
+        len(metadata_dataset.shape) != 1
+        or int(metadata_dataset.size) <= 0
+        or metadata_dataset.dtype.kind != "S"
+        or metadata_dataset.dtype.itemsize <= 0
+        or metadata_dataset.dtype.hasobject
+    ):
+        raise ValueError("HDF5 verification found invalid Astropy table metadata")
+    metadata_bytes = _hdf5_dataset_logical_bytes(metadata_dataset)
+    table_bytes = _hdf5_dataset_logical_bytes(table_dataset)
+    estimated_bytes = manifest_bytes + metadata_bytes + table_bytes
+    if estimated_bytes > MAX_EXPORT_ESTIMATED_BYTES:
+        raise ValueError(
+            f"HDF5 artifact is estimated at least "
+            f"{estimated_bytes / 1024**2:.1f} MiB; the export size cap is "
+            f"{MAX_EXPORT_ESTIMATED_BYTES / 1024**2:.1f} MiB"
+        )
+
+
+def _restore_hdf5_columns(table: Table, manifest: list[dict[str, Any]]) -> Table:
+    if len(manifest) != len(table.colnames):
+        raise ValueError("HDF5 column manifest length does not match the table")
+    for index, entry in enumerate(manifest):
+        if not isinstance(entry, dict):
+            raise ValueError("HDF5 column manifest contains an invalid entry")
+        name = entry.get("name")
+        if not isinstance(name, str) or table.colnames[index] != name:
+            raise ValueError("HDF5 column manifest order does not match the table")
+        logical_dtype = _logical_dtype_from_manifest(entry)
+        column = table[name]
+        values = np.ma.asarray(column)
+        data = np.asarray(values.data)
+        masked = entry.get("masked")
+        if not isinstance(masked, bool):
+            raise ValueError("HDF5 column manifest has an invalid mask declaration")
+        actual_masked = _is_masked_column(column)
+        if actual_masked != masked:
+            raise ValueError(f"HDF5 column '{name}' mask capability changed")
+        declared_unit = entry.get("unit")
+        actual_unit = (
+            str(column.unit) if getattr(column, "unit", None) is not None else None
+        )
+        if actual_unit != declared_unit:
+            raise ValueError(f"HDF5 column '{name}' unit manifest changed")
+
+        if logical_dtype.kind == "U":
+            character_count = logical_dtype.itemsize // np.dtype("U1").itemsize
+            if data.dtype.kind == "S" and data.dtype.itemsize == character_count:
+                try:
+                    restored_data = data.astype(logical_dtype)
+                except UnicodeDecodeError as exception:
+                    raise ValueError(
+                        f"HDF5 column '{name}' is not valid ASCII text"
+                    ) from exception
+            elif data.dtype == logical_dtype:
+                restored_data = data
+            else:
+                raise ValueError(f"HDF5 column '{name}' logical dtype changed")
+        else:
+            if (
+                data.dtype.kind != logical_dtype.kind
+                or data.dtype.itemsize != logical_dtype.itemsize
+            ):
+                raise ValueError(f"HDF5 column '{name}' logical dtype changed")
+            restored_data = (
+                data.astype(logical_dtype, copy=True)
+                if data.dtype.byteorder not in {"=", "|"}
+                else data
+            )
+
+        fill_value = None
+        if masked:
+            fill_value = _decode_hdf5_fill_value(entry.get("fill_value"), logical_dtype)
+        if restored_data is not data or masked:
+            _replace_table_column(
+                table,
+                name,
+                restored_data,
+                masked=masked,
+                mask=np.ma.getmaskarray(values) if masked else None,
+                fill_value=fill_value,
+            )
+    return table
+
+
+def _read_hdf5_table(
+    stream: BinaryIO,
+    h5py_module: Any,
+    *,
+    object_type: str,
+    object_name: str,
+) -> tuple[Table, list[dict[str, Any]]]:
+    with h5py_module.File(stream, "r") as handle:
+        if HDF5_GROUP_PATH not in handle:
+            raise ValueError("HDF5 verification could not find the schema group")
+        _require_hdf5_hard_link(handle, h5py_module, HDF5_GROUP_PATH, "schema group")
+        group = handle[HDF5_GROUP_PATH]
+        if not isinstance(group, h5py_module.Group):
+            raise ValueError("HDF5 verification found an invalid schema group")
+        schema = _text_hdf5_attribute(group.attrs.get("schema"), "schema")
+        if schema != HDF5_SCHEMA:
+            raise ValueError("HDF5 verification found an unexpected schema marker")
+        table_path = _text_hdf5_attribute(group.attrs.get("table_path"), "table path")
+        if table_path != HDF5_TABLE_PATH or HDF5_TABLE_PATH not in handle:
+            raise ValueError("HDF5 verification found an unexpected table path")
+        stored_type = _text_hdf5_attribute(
+            group.attrs.get("object_type"), "object type"
+        )
+        stored_name = _text_hdf5_attribute(
+            group.attrs.get("object_name"), "object name"
+        )
+        if stored_type != object_type or stored_name != object_name:
+            raise ValueError("HDF5 verification found unexpected object identity")
+        row_count = group.attrs.get("row_count")
+        if not isinstance(row_count, (int, np.integer)) or isinstance(
+            row_count, (bool, np.bool_)
+        ):
+            raise ValueError("HDF5 verification found an invalid row count")
+        row_count = int(row_count)
+        if row_count < 0 or row_count > MAX_EXPORT_ROWS:
+            raise ValueError(
+                f"HDF5 table row count exceeds the export cap of {MAX_EXPORT_ROWS:,}"
+            )
+        if HDF5_MANIFEST_PATH not in handle:
+            raise ValueError("HDF5 verification could not find the column manifest")
+        _require_hdf5_hard_link(
+            handle, h5py_module, HDF5_MANIFEST_PATH, "column manifest"
+        )
+        manifest_dataset = handle[HDF5_MANIFEST_PATH]
+        if not isinstance(manifest_dataset, h5py_module.Dataset):
+            raise ValueError("HDF5 verification found an invalid column manifest")
+        if (
+            manifest_dataset.shape != ()
+            or manifest_dataset.dtype.kind != "S"
+            or manifest_dataset.dtype.itemsize <= 0
+            or manifest_dataset.dtype.itemsize > HDF5_MANIFEST_MAX_BYTES
+            or manifest_dataset.dtype.hasobject
+        ):
+            raise ValueError(
+                "HDF5 column manifest storage exceeds or violates the 2 MiB schema cap"
+            )
+        _require_self_contained_hdf5_dataset(manifest_dataset, "column manifest")
+        manifest_bytes = int(manifest_dataset.dtype.itemsize)
+        manifest_text = _text_hdf5_attribute(manifest_dataset[()], "column manifest")
+        if len(manifest_text.encode("utf-8")) > HDF5_MANIFEST_MAX_BYTES:
+            raise ValueError("HDF5 column manifest exceeds the 2 MiB schema cap")
+        try:
+            manifest = json.loads(manifest_text)
+        except json.JSONDecodeError as exception:
+            raise ValueError("HDF5 column manifest is invalid JSON") from exception
+        manifest, physical_fields = _validated_hdf5_manifest(manifest)
+        _validate_hdf5_table_storage(
+            handle,
+            h5py_module,
+            row_count=row_count,
+            manifest=manifest,
+            physical_fields=physical_fields,
+            manifest_bytes=manifest_bytes,
+        )
+        reopened = Table.read(
+            handle,
+            format="hdf5",
+            path=HDF5_TABLE_PATH,
+        )
+        if len(reopened) != row_count:
+            raise ValueError("HDF5 schema row count does not match the table")
+    return _restore_hdf5_columns(reopened, manifest), manifest
+
+
+def _semantic_array_equal(expected: np.ndarray, actual: np.ndarray) -> bool:
+    if expected.shape != actual.shape:
+        return False
+    if expected.dtype.kind == "f" and actual.dtype.kind == "f":
+        return bool(np.array_equal(expected, actual, equal_nan=True))
+    return bool(np.array_equal(expected, actual))
+
+
+def _assert_hdf5_semantic_equal(expected: Any, actual: Any, location: str) -> None:
+    if isinstance(expected, u.Quantity):
+        if not isinstance(actual, u.Quantity) or expected.unit != actual.unit:
+            raise ValueError(f"HDF5 verification changed {location} units")
+        _assert_hdf5_semantic_equal(expected.value, actual.value, location)
+        return
+    if isinstance(expected, u.UnitBase):
+        if not isinstance(actual, u.UnitBase) or expected != actual:
+            raise ValueError(f"HDF5 verification changed {location}")
+        return
+    if isinstance(expected, np.ndarray):
+        if not isinstance(actual, np.ndarray):
+            raise ValueError(f"HDF5 verification changed {location} type")
+        if (
+            expected.dtype.kind != actual.dtype.kind
+            or expected.dtype.itemsize != actual.dtype.itemsize
+        ):
+            raise ValueError(f"HDF5 verification changed {location} dtype")
+        if not _semantic_array_equal(expected, actual):
+            raise ValueError(f"HDF5 verification changed {location} values")
+        return
+    if isinstance(expected, Mapping):
+        if not isinstance(actual, Mapping) or set(expected) != set(actual):
+            raise ValueError(f"HDF5 verification changed {location} keys")
+        for key in expected:
+            _assert_hdf5_semantic_equal(expected[key], actual[key], f"{location}.{key}")
+        return
+    if isinstance(expected, (list, tuple)):
+        if not isinstance(actual, type(expected)) or len(expected) != len(actual):
+            raise ValueError(f"HDF5 verification changed {location} sequence")
+        for index, (expected_item, actual_item) in enumerate(
+            zip(expected, actual, strict=True)
+        ):
+            _assert_hdf5_semantic_equal(
+                expected_item, actual_item, f"{location}[{index}]"
+            )
+        return
+    if isinstance(expected, np.generic):
+        if isinstance(expected, np.floating):
+            expected = float(expected)
+        else:
+            expected = expected.item()
+    if isinstance(actual, np.generic):
+        if isinstance(actual, np.floating):
+            actual = float(actual)
+        else:
+            actual = actual.item()
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        if type(expected) is not type(actual) or expected != actual:
+            raise ValueError(f"HDF5 verification changed {location}")
+        return
+    if isinstance(expected, float) and isinstance(actual, (int, float)):
+        if math.isnan(expected) and isinstance(actual, float) and math.isnan(actual):
+            return
+        if expected == actual:
+            return
+        raise ValueError(f"HDF5 verification changed {location}")
+    if expected != actual:
+        raise ValueError(f"HDF5 verification changed {location}")
+
+
+def _verify_hdf5_table(expected: Table, actual: Table) -> list[str]:
+    if len(expected) != len(actual):
+        raise ValueError("HDF5 semantic verification changed the row count")
+    if expected.colnames != actual.colnames:
+        raise ValueError("HDF5 semantic verification changed the column order")
+    for name in expected.colnames:
+        expected_column = expected[name]
+        actual_column = actual[name]
+        expected_values = np.ma.asarray(expected_column)
+        actual_values = np.ma.asarray(actual_column)
+        expected_data = np.asarray(expected_values.data)
+        actual_data = np.asarray(actual_values.data)
+        if (
+            expected_data.dtype.kind != actual_data.dtype.kind
+            or expected_data.dtype.itemsize != actual_data.dtype.itemsize
+        ):
+            raise ValueError(
+                f"HDF5 semantic verification changed column '{name}' logical dtype"
+            )
+        if _is_masked_column(expected_column) != _is_masked_column(actual_column):
+            raise ValueError(
+                f"HDF5 semantic verification changed column '{name}' mask capability"
+            )
+        expected_mask = np.ma.getmaskarray(expected_values)
+        actual_mask = np.ma.getmaskarray(actual_values)
+        if not np.array_equal(expected_mask, actual_mask):
+            raise ValueError(
+                f"HDF5 semantic verification changed column '{name}' masks"
+            )
+        # Masked payload bytes are deliberately non-scientific and serializers
+        # may normalize them.  The mask and fill semantics are checked
+        # separately; compare values only where the column says they exist.
+        if not _semantic_array_equal(
+            expected_data[~expected_mask], actual_data[~actual_mask]
+        ):
+            raise ValueError(
+                f"HDF5 semantic verification changed column '{name}' values"
+            )
+        expected_unit = getattr(expected_column, "unit", None)
+        actual_unit = getattr(actual_column, "unit", None)
+        if expected_unit != actual_unit:
+            raise ValueError(
+                f"HDF5 semantic verification changed column '{name}' units"
+            )
+        for attribute in ("description", "format", "meta"):
+            _assert_hdf5_semantic_equal(
+                getattr(expected_column, attribute, None),
+                getattr(actual_column, attribute, None),
+                f"column '{name}' {attribute}",
+            )
+        if _is_masked_column(expected_column):
+            _assert_hdf5_semantic_equal(
+                np.asarray(expected_column.fill_value, dtype=expected_data.dtype),
+                np.asarray(actual_column.fill_value, dtype=actual_data.dtype),
+                f"column '{name}' fill value",
+            )
+    _assert_hdf5_semantic_equal(
+        dict(expected.meta), dict(actual.meta), "table metadata"
+    )
+    return list(HDF5_VERIFICATION_CHECKS)
 
 
 class IOUtilityService(BaseService):
@@ -1729,7 +2936,10 @@ class IOUtilityService(BaseService):
             )
 
     @staticmethod
-    def _format_capabilities(object_type: str) -> dict[str, dict[str, Any]]:
+    def _format_capabilities(
+        object_type: str,
+        hdf5_capability: dict[str, Any] | None = None,
+    ) -> dict[str, dict[str, Any]]:
         common = {
             "csv": {
                 "supported": True,
@@ -1750,6 +2960,7 @@ class IOUtilityService(BaseService):
                 "supported": True,
                 "notes": "Generic FITS binary table, not an OGIP/HEASoft event product.",
             },
+            "hdf5": copy.deepcopy(hdf5_capability or _hdf5_capability()),
         }
         if object_type in {"event_list", "lightcurve"}:
             common["fits"]["notes"] += (
@@ -1759,6 +2970,10 @@ class IOUtilityService(BaseService):
 
     def list_exportable_objects(self) -> dict[str, Any]:
         try:
+            hdf5_capability = _hdf5_capability()
+            enabled_formats = ["csv", "ecsv", "json", "fits"]
+            if hdf5_capability["supported"]:
+                enabled_formats.append("hdf5")
             objects: list[dict[str, Any]] = []
             sources = (
                 ("event_list", self.state.get_event_data()),
@@ -1778,31 +2993,45 @@ class IOUtilityService(BaseService):
                     except Exception as exception:
                         row_count = None
                         reason = str(exception)
+                    formats = list(enabled_formats) if reason is None else []
+                    format_reasons: dict[str, str] = {}
+                    if reason is None:
+                        if hdf5_capability["supported"]:
+                            hdf5_reason = _hdf5_object_support_reason(
+                                obj, object_type, name
+                            )
+                        else:
+                            hdf5_reason = hdf5_capability["reason"]
+                        if hdf5_reason is not None:
+                            format_reasons["hdf5"] = hdf5_reason
+                            if "hdf5" in formats:
+                                formats.remove("hdf5")
                     objects.append(
                         {
                             "object_type": object_type,
                             "name": name,
                             "row_count": row_count,
                             "exportable": reason is None,
-                            "formats": list(EXPORT_EXTENSIONS)
-                            if reason is None
-                            else [],
+                            "formats": formats,
+                            "format_reasons": format_reasons,
                             "reason": reason,
                         }
                     )
 
             matrix = {
-                object_type: self._format_capabilities(object_type)
+                object_type: self._format_capabilities(object_type, hdf5_capability)
                 for object_type in sorted(EXPORT_OBJECT_TYPES)
             }
+            excluded_formats = {
+                "pickle": "Unsafe deserialization format; intentionally unsupported."
+            }
+            if not hdf5_capability["supported"]:
+                excluded_formats["hdf5"] = hdf5_capability["reason"]
             data = {
                 "objects": objects,
                 "capability_matrix": matrix,
-                "format_allowlist": list(EXPORT_EXTENSIONS),
-                "excluded_formats": {
-                    "pickle": "Unsafe deserialization format; intentionally unsupported.",
-                    "hdf5": "Not enabled because this Utilities export path has not verified every object round trip.",
-                },
+                "format_allowlist": enabled_formats,
+                "excluded_formats": excluded_formats,
                 "row_cap": MAX_EXPORT_ROWS,
                 "provenance": operation_provenance(
                     "list_exportable_objects",
@@ -1888,6 +3117,14 @@ class IOUtilityService(BaseService):
                     f"{requested_format.upper()} export requires the exact "
                     f"'{expected_extension}' filename extension"
                 )
+            h5py_module = None
+            if requested_format == "hdf5":
+                h5py_module, hdf5_reason = _optional_hdf5_runtime()
+                if h5py_module is None:
+                    raise RuntimeError(hdf5_reason or HDF5_UNAVAILABLE_REASON)
+                name_reason = _hdf5_object_name_reason(object_name)
+                if name_reason is not None:
+                    raise ValueError(name_reason)
             publication.assert_destination_available()
             obj = self._copy_export_object(object_type, object_name)
             row_count = _object_row_count(obj, object_type)
@@ -1895,11 +3132,18 @@ class IOUtilityService(BaseService):
                 raise ValueError(
                     f"Object has {row_count:,} rows; the export cap is {MAX_EXPORT_ROWS:,}"
                 )
-            table = _table_for_object(obj, object_type)
+            table = _table_for_object(
+                obj,
+                object_type,
+                preserve_timing_precision=requested_format == "hdf5",
+            )
             if len(table) != row_count:
                 raise ValueError(
                     "Export table row count does not match the loaded object"
                 )
+            hdf5_manifest: list[dict[str, Any]] | None = None
+            if requested_format == "hdf5":
+                table, hdf5_manifest = _prepare_hdf5_table(table)
 
             # Write and verify in a private same-directory staging area.  The
             # platform adapter exposes the user-visible destination only after
@@ -1923,10 +3167,15 @@ class IOUtilityService(BaseService):
                     "event product, and may not preserve every object metadata field."
                 )
 
-            mode = "wb" if requested_format == "fits" else "w"
+            if requested_format == "hdf5":
+                mode = "w+b"
+            elif requested_format == "fits":
+                mode = "wb"
+            else:
+                mode = "w"
             with publication.open_writer(
                 mode,
-                encoding=None if mode == "wb" else "utf-8",
+                encoding=None if "b" in mode else "utf-8",
             ) as stream:
                 with collect_warnings(warning_messages):
                     if requested_format == "csv":
@@ -1938,6 +3187,17 @@ class IOUtilityService(BaseService):
                             table, object_type, obj, warning_messages
                         ) as hdul:
                             hdul.writeto(stream, checksum=True)
+                    elif requested_format == "hdf5":
+                        assert h5py_module is not None
+                        assert hdf5_manifest is not None
+                        _write_hdf5_table(
+                            stream,
+                            h5py_module,
+                            table,
+                            hdf5_manifest,
+                            object_type=object_type,
+                            object_name=object_name,
+                        )
                     else:
                         payload = _json_export_payload(
                             table,
@@ -1956,6 +3216,7 @@ class IOUtilityService(BaseService):
             # Astropy's ASCII registry expects a binary-readable file object;
             # JSON's standard decoder expects text.
             read_mode = "r" if requested_format == "json" else "rb"
+            hdf5_checks: list[str] | None = None
             with publication.open_reader(
                 read_mode,
                 encoding=None if read_mode == "rb" else "utf-8",
@@ -2000,6 +3261,22 @@ class IOUtilityService(BaseService):
                             raise ValueError(
                                 "FITS verification could not find object metadata"
                             )
+                elif requested_format == "hdf5":
+                    assert h5py_module is not None
+                    assert hdf5_manifest is not None
+                    reopened, reopened_manifest = _read_hdf5_table(
+                        reopened_stream,
+                        h5py_module,
+                        object_type=object_type,
+                        object_name=object_name,
+                    )
+                    _assert_hdf5_semantic_equal(
+                        hdf5_manifest,
+                        reopened_manifest,
+                        "HDF5 column manifest",
+                    )
+                    hdf5_checks = _verify_hdf5_table(table, reopened)
+                    reopened_rows = len(reopened)
                 else:
                     reopened_json = json.load(reopened_stream)
                     if reopened_json.get("schema") != "stingray-explorer.tabular.v1":
@@ -2015,6 +3292,14 @@ class IOUtilityService(BaseService):
             # Publish the already verified artifact through the platform's
             # single-operation, exclusive no-replacement primitive.
             warning_messages.extend(publication.publish())
+            provenance_parameters = {
+                "format": requested_format,
+                "destination_path": str(path),
+                "exclusive_non_overwrite": True,
+                "reopen_verified": True,
+            }
+            if requested_format == "hdf5":
+                provenance_parameters["schema"] = HDF5_SCHEMA
             data = {
                 "path": str(path),
                 "bytes": byte_size,
@@ -2027,14 +3312,19 @@ class IOUtilityService(BaseService):
                 "provenance": operation_provenance(
                     "export_loaded_object",
                     input_source={"kind": object_type, "name": object_name},
-                    parameters={
-                        "format": requested_format,
-                        "destination_path": str(path),
-                        "exclusive_non_overwrite": True,
-                        "reopen_verified": True,
-                    },
+                    parameters=provenance_parameters,
                 ),
             }
+            if requested_format == "hdf5":
+                assert h5py_module is not None
+                assert hdf5_checks is not None
+                data["verification"] = {
+                    "schema": HDF5_SCHEMA,
+                    "table_path": HDF5_TABLE_PATH,
+                    "semantic_round_trip": True,
+                    "checks": hdf5_checks,
+                    "h5py_version": str(getattr(h5py_module, "__version__", "unknown")),
+                }
             return self.create_result(
                 success=True,
                 data=data,

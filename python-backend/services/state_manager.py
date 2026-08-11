@@ -9,9 +9,13 @@ import gc
 import logging
 import sys
 import threading
+from itertools import chain
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+from astropy import units as u
+from astropy.table import Column
+from astropy.utils.masked import Masked
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +45,18 @@ def _bounded_key_size(value: Any, limit: Optional[int]) -> int:
     return min(size, limit + 1) if limit is not None else size
 
 
+def _object_payload_items(value: np.ndarray) -> Any:
+    """Return referenced object values or reject opaque structured references."""
+    if not value.dtype.hasobject:
+        return ()
+    if value.dtype.kind != "O":
+        raise ValueError(
+            "Stored state contains a structured dtype with object references and "
+            "cannot be copied safely"
+        )
+    return enumerate(np.asarray(value).flat)
+
+
 def _precopy_metrics(
     value: Any,
     *,
@@ -52,13 +68,19 @@ def _precopy_metrics(
     """Estimate rows, scalar cells, and bytes without copying nested state."""
     if active is None:
         active = set()
-    if value is None or isinstance(value, (bool, int, float, np.number)):
+    if value is None or isinstance(value, (bool, float, np.number)):
         return 0, 1, 32
+    if type(value) is int:
+        bit_length = abs(value).bit_length()
+        decimal_bytes = 1 + (bit_length * 30_103) // 100_000
+        if value < 0:
+            decimal_bytes += 1
+        return 0, 1, max(32, int(sys.getsizeof(value)), decimal_bytes)
     if isinstance(value, str):
         return 0, 1, _bounded_utf8_size(value, max_bytes)
     if isinstance(value, (bytes, bytearray)):
         return 0, 1, len(value)
-    if isinstance(value, np.ndarray) and value.dtype.kind != "O":
+    if type(value) is np.ndarray and not value.dtype.hasobject:
         rows = int(value.shape[0]) if value.ndim else 0
         return rows, int(value.size), int(value.nbytes)
 
@@ -69,13 +91,57 @@ def _precopy_metrics(
         )
     active.add(identity)
     try:
-        if isinstance(value, np.ndarray):
+        if isinstance(value, Masked):
+            own_rows = int(value.shape[0]) if value.ndim else 0
+            own_cells = int(value.size)
+            own_bytes = int(value.nbytes) + int(np.asarray(value.mask).nbytes)
+            unit = getattr(value, "unit", None)
+            data_items = _object_payload_items(value)
+            items = chain(
+                data_items,
+                (("unit", unit.to_string() if unit is not None else None),),
+            )
+        elif isinstance(value, u.Quantity):
+            own_rows = int(value.shape[0]) if value.ndim else 0
+            own_cells = int(value.size)
+            own_bytes = int(value.nbytes)
+            data_items = _object_payload_items(value)
+            items = chain(data_items, (("unit", value.unit.to_string()),))
+        elif isinstance(value, Column):
+            own_rows = int(value.shape[0]) if value.ndim else 0
+            own_cells = int(value.size)
+            own_bytes = int(value.nbytes)
+            column_items: list[tuple[Any, Any]] = [
+                ("metadata", value.meta),
+                ("description", value.description),
+                ("format", value.format),
+                (
+                    "unit",
+                    value.unit.to_string() if value.unit is not None else None,
+                ),
+            ]
+            if isinstance(value, np.ma.MaskedArray):
+                mask = np.ma.getmask(value)
+                if mask is not np.ma.nomask:
+                    own_bytes += int(np.asarray(mask).nbytes)
+                column_items.append(("fill_value", value.fill_value))
+            data_items = _object_payload_items(value)
+            items = chain(data_items, column_items)
+        elif type(value) is np.ndarray:
             own_rows = int(value.shape[0]) if value.ndim else 0
             own_cells = int(value.size)
             own_bytes = int(value.nbytes)
             if max_rows is not None and own_rows > max_rows:
                 return own_rows, own_cells, own_bytes
-            items = enumerate(value.flat)
+            items = _object_payload_items(value)
+        elif isinstance(value, np.ndarray):
+            own_rows = int(value.shape[0]) if value.ndim else 0
+            own_cells = int(value.size)
+            own_bytes = int(value.nbytes)
+            if max_rows is not None and own_rows > max_rows:
+                return own_rows, own_cells, own_bytes
+            data_items = _object_payload_items(value)
+            items = chain(data_items, vars(value).items())
         elif isinstance(value, dict):
             items = value.items()
             own_rows = 0
@@ -94,10 +160,10 @@ def _precopy_metrics(
             own_bytes = 0
             if max_rows is not None and own_rows > max_rows:
                 return own_rows, own_cells, own_bytes
-            items = [
-                *((name, value[name]) for name in value.colnames),
-                ("metadata", dict(value.meta)),
-            ]
+            items = chain(
+                ((name, value[name]) for name in value.colnames),
+                (("metadata", value.meta),),
+            )
         elif hasattr(value, "__dict__"):
             items = vars(value).items()
             own_rows = 0

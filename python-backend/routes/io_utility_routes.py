@@ -51,7 +51,7 @@ class ExportObjectRequest(BaseModel):
 
     object_type: Literal["event_list", "lightcurve", "analysis_result"]
     object_name: str = Field(min_length=1)
-    format: Literal["csv", "ecsv", "json", "fits"]
+    format: Literal["csv", "ecsv", "json", "fits", "hdf5"]
     destination_path: str = Field(min_length=1, max_length=4_096)
     destination_grant: str = Field(min_length=1, max_length=512)
 

@@ -878,10 +878,11 @@ def test_nullable_numeric_analysis_columns_remain_exportable(
         assert payload["columns"]["time_lags"] == [None, 0.25]
         assert payload["columns"]["time_lags_err"] == [None, None]
         assert payload["column_units"]["time_lags"] == "s"
+        assert not any("non-finite" in warning for warning in result["warnings"])
         json.dumps(payload, allow_nan=False)
     elif export_format == "ecsv":
         table = Table.read(path, format="ascii.ecsv")
-        assert np.isnan(table["time_lags"][0])
+        assert table["time_lags"].mask.tolist() == [True, False]
         assert table["time_lags"][1] == pytest.approx(0.25)
         assert str(table["time_lags"].unit) == "s"
     else:
@@ -1451,18 +1452,23 @@ def test_list_exportable_objects_has_honest_capability_matrix(service):
     result = service.list_exportable_objects()
     assert result["success"], result
     data = result["data"]
-    assert data["format_allowlist"] == ["csv", "ecsv", "json", "fits"]
+    hdf5_supported = data["capability_matrix"]["event_list"]["hdf5"]["supported"]
+    expected_formats = ["csv", "ecsv", "json", "fits"]
+    if hdf5_supported:
+        expected_formats.append("hdf5")
+    assert data["format_allowlist"] == expected_formats
     assert set(data["capability_matrix"]) == {
         "event_list",
         "lightcurve",
         "analysis_result",
     }
+    assert all(item["exportable"] for item in data["objects"])
     assert all(
-        item["exportable"] and item["formats"] == data["format_allowlist"]
+        set(item["formats"]) <= set(data["format_allowlist"])
         for item in data["objects"]
     )
     assert "pickle" in data["excluded_formats"]
-    assert "hdf5" in data["excluded_formats"]
+    assert ("hdf5" in data["excluded_formats"]) is not hdf5_supported
 
 
 @pytest.mark.parametrize("export_format", ["csv", "ecsv", "json", "fits"])
