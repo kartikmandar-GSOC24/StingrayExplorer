@@ -12,8 +12,12 @@ import queue
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
+from models.event_formats import (
+    require_batch_input_formats,
+    require_input_event_format,
+)
 from models.job import Job, JobStatus, JobType
 
 logger = logging.getLogger(__name__)
@@ -298,6 +302,8 @@ class JobManager:
         Returns:
             The created Job object
         """
+        fmt = require_input_event_format(fmt)
+
         # Create display name from filename
         import os
         display_name = os.path.basename(file_path)
@@ -365,6 +371,7 @@ class JobManager:
         Returns:
             The created Job object
         """
+        files, shared_fmt = require_batch_input_formats(files, shared_fmt)
         display_name = f"Batch load ({len(files)} files)"
 
         job = Job(
@@ -426,6 +433,8 @@ class JobManager:
         Returns:
             The created Job object
         """
+        fmt = require_input_event_format(fmt)
+
         # Extract filename from URL for display
         import os
         from urllib.parse import urlparse

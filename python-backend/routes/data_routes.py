@@ -10,8 +10,8 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from models.event_formats import InputEventFormat, OutputEventFormat
 from services.data_service import DataService
-from services.state_manager import StateManager
 
 router = APIRouter()
 
@@ -28,7 +28,7 @@ def get_data_service(request: Request) -> DataService:
 class LoadEventListRequest(BaseModel):
     file_path: str
     name: str
-    fmt: str = "ogip"
+    fmt: InputEventFormat = "ogip"
     rmf_file: Optional[str] = None
     additional_columns: Optional[List[str]] = None
     high_precision: bool = False
@@ -39,7 +39,7 @@ class LoadEventListRequest(BaseModel):
 class LoadEventListFromUrlRequest(BaseModel):
     url: str
     name: str
-    fmt: str = "ogip"
+    fmt: InputEventFormat = "ogip"
     rmf_file: Optional[str] = None
     additional_columns: Optional[List[str]] = None
     high_precision: bool = False
@@ -50,7 +50,7 @@ class LoadEventListFromUrlRequest(BaseModel):
 class SaveEventListRequest(BaseModel):
     name: str
     file_path: str
-    fmt: str = "ogip"
+    fmt: OutputEventFormat = "hdf5"
 
 
 class CheckFileSizeRequest(BaseModel):
@@ -63,7 +63,7 @@ class LoadByTimeRangeRequest(BaseModel):
     name: str
     start_time: float
     end_time: float
-    fmt: str = "ogip"
+    fmt: InputEventFormat = "ogip"
     notes: Optional[str] = None
 
 
@@ -73,21 +73,21 @@ class LoadByEventCountRequest(BaseModel):
     name: str
     start_index: int = 0
     count: int = 10000
-    fmt: str = "ogip"
+    fmt: InputEventFormat = "ogip"
     notes: Optional[str] = None
 
 
 class GetFileMetadataRequest(BaseModel):
     """Request model for getting file metadata without loading."""
     file_path: str
-    fmt: str = "ogip"
+    fmt: InputEventFormat = "ogip"
 
 
 class SingleFileConfig(BaseModel):
     """Configuration for a single file in batch load."""
     file_path: str
     name: str
-    fmt: str = "ogip"
+    fmt: InputEventFormat = "ogip"
     rmf_file: Optional[str] = None
     additional_columns: Optional[List[str]] = None
     high_precision: bool = False
@@ -111,7 +111,7 @@ class BatchLoadEventListRequest(BaseModel):
     use_same_settings: bool = True
 
     # Shared settings (used when use_same_settings=True)
-    shared_fmt: str = "ogip"
+    shared_fmt: InputEventFormat = "ogip"
     shared_rmf_file: Optional[str] = None
     shared_additional_columns: Optional[List[str]] = None
     shared_high_precision: bool = False

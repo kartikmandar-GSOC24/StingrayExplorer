@@ -20,6 +20,12 @@ from astropy.io import fits
 from stingray import EventList
 from stingray.io import FITSTimeseriesReader
 
+from models.event_formats import (
+    require_batch_input_formats,
+    require_input_event_format,
+    require_output_event_format,
+)
+
 from .base_service import BaseService
 
 
@@ -444,7 +450,7 @@ class DataService(BaseService):
             if fits_key in header_dict:
                 value = header_dict[fits_key]
                 try:
-                    if type_func == float:
+                    if type_func is float:
                         header_info[output_key] = _to_python_float(float(value))
                     else:
                         header_info[output_key] = type_func(value)
@@ -566,6 +572,7 @@ class DataService(BaseService):
         Returns:
             Result dictionary with the EventList data
         """
+        fmt = require_input_event_format(fmt)
         try:
             # Validate the name doesn't already exist
             if self.state.has_event_data(name):
@@ -585,7 +592,7 @@ class DataService(BaseService):
             # Otherwise use the provided fmt (default: ogip for FITS files)
 
             # Detect file type before attempting to load (for FITS files)
-            is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+            is_fits = fmt in ("ogip", "fits")
             if is_fits:
                 file_type_info = self._detect_fits_file_type(file_path)
                 if not file_type_info["is_event_list"]:
@@ -706,6 +713,7 @@ class DataService(BaseService):
         Returns:
             Result dictionary
         """
+        fmt = require_input_event_format(fmt)
         try:
             # Validate the name doesn't already exist
             if self.state.has_event_data(name):
@@ -728,7 +736,7 @@ class DataService(BaseService):
                 temp_filename = tmp_file.name
 
             # Detect file type before attempting to load (for FITS files)
-            is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+            is_fits = fmt in ("ogip", "fits")
             if is_fits:
                 file_type_info = self._detect_fits_file_type(temp_filename)
                 if not file_type_info["is_event_list"]:
@@ -835,6 +843,8 @@ class DataService(BaseService):
         Yields:
             Dict events with types: 'progress', 'processing', 'complete', 'error'
         """
+        fmt = require_input_event_format(fmt)
+
         import httpx
 
         try:
@@ -887,7 +897,7 @@ class DataService(BaseService):
                 await asyncio.sleep(0)
 
                 # Detect file type before attempting to load (for FITS files)
-                is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+                is_fits = fmt in ("ogip", "fits")
                 if is_fits:
                     file_type_info = self._detect_fits_file_type(temp_filename)
                     if not file_type_info["is_event_list"]:
@@ -988,11 +998,12 @@ class DataService(BaseService):
         Args:
             name: Name of the event list in state
             file_path: Path where to save the file
-            fmt: File format to save as ('hdf5', 'ascii.ecsv', or 'pickle')
+            fmt: File format to save as ('hdf5' or 'ascii.ecsv')
 
         Returns:
             Result dictionary
         """
+        fmt = require_output_event_format(fmt)
         try:
             if not self.state.has_event_data(name):
                 return self.create_result(
@@ -1009,14 +1020,9 @@ class DataService(BaseService):
             if dirname:
                 os.makedirs(dirname, exist_ok=True)
 
-            # Save using Stingray's native write method with requested format
-            # Supported formats: hdf5, ascii.ecsv, pickle
-            if fmt in ('hdf5', 'ascii.ecsv', 'pickle'):
-                event_list.write(file_path, fmt=fmt)
-            else:
-                # Default to HDF5 for unrecognized formats
-                # HDF5 preserves all metadata (GTI, MJDREF, etc.) and supports float128
-                event_list.write(file_path, fmt='hdf5')
+            # Preserve the caller's explicitly validated format.  Never
+            # reinterpret an unknown value as a different on-disk format.
+            event_list.write(file_path, fmt=fmt)
 
             return self.create_result(
                 success=True,
@@ -1264,11 +1270,10 @@ class DataService(BaseService):
         - FITS event file: ~3x file size
         - HDF5: ~2x file size
         """
+        fmt = require_input_event_format(fmt)
         multipliers = {
             "fits": 3,
-            "evt": 3,
             "ogip": 3,
-            "hea": 3,
             "hdf5": 2,
         }
         multiplier = multipliers.get(fmt, 3)
@@ -1281,6 +1286,7 @@ class DataService(BaseService):
         fmt: str = "fits",
     ) -> bool:
         """Check if file can be safely loaded into memory."""
+        fmt = require_input_event_format(fmt)
         file_size = os.path.getsize(file_path)
         available_ram = psutil.virtual_memory().available
         needed_ram = self._estimate_memory_usage(file_size, fmt)
@@ -1515,6 +1521,7 @@ class DataService(BaseService):
         Returns:
             Result dictionary with the filtered EventList
         """
+        fmt = require_input_event_format(fmt)
         try:
             # Validate the name doesn't already exist
             if self.state.has_event_data(name):
@@ -1526,7 +1533,7 @@ class DataService(BaseService):
                 )
 
             # Check format - only FITS supports true lazy loading
-            is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+            is_fits = fmt in ("ogip", "fits")
             if not is_fits:
                 return self.create_result(
                     success=False,
@@ -1714,6 +1721,7 @@ class DataService(BaseService):
         Returns:
             Result dictionary with the sliced EventList
         """
+        fmt = require_input_event_format(fmt)
         try:
             # Validate the name doesn't already exist
             if self.state.has_event_data(name):
@@ -1725,7 +1733,7 @@ class DataService(BaseService):
                 )
 
             # Check format
-            is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+            is_fits = fmt in ("ogip", "fits")
             if not is_fits:
                 return self.create_result(
                     success=False,
@@ -1889,9 +1897,10 @@ class DataService(BaseService):
         Returns:
             Result dictionary with file metadata
         """
+        fmt = require_input_event_format(fmt)
         try:
             # Check format
-            is_fits = fmt.lower() in ['ogip', 'hea', 'fits', 'evt']
+            is_fits = fmt in ("ogip", "fits")
             if not is_fits:
                 return self.create_result(
                     success=False,
@@ -2197,6 +2206,7 @@ class DataService(BaseService):
         Returns:
             Result with successful[], failed[], and summary statistics
         """
+        files, shared_fmt = require_batch_input_formats(files, shared_fmt)
         start_time = time.time()
 
         if not files:
@@ -2409,6 +2419,7 @@ class DataService(BaseService):
         Yields:
             Dict events with type 'file_complete' or 'complete'
         """
+        files, shared_fmt = require_batch_input_formats(files, shared_fmt)
         start_time = time.time()
 
         if not files:
@@ -2537,8 +2548,6 @@ class DataService(BaseService):
 
         # Execute loading in parallel, yielding results as they complete
         # Use asyncio to wrap thread pool futures for proper async handling
-        loop = asyncio.get_event_loop()
-
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks and wrap them as asyncio futures
             future_to_file = {

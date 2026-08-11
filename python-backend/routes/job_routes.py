@@ -6,11 +6,13 @@ Provides REST endpoints for submitting, listing, streaming, and cancelling jobs.
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+
+from models.event_formats import InputEventFormat
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +27,7 @@ class SubmitLoadJobRequest(BaseModel):
     """Request body for submitting a single file load job."""
     file_path: str = Field(..., description="Path to the file to load")
     name: str = Field(..., description="Name for the loaded event list")
-    fmt: str = Field(default="ogip", description="File format")
+    fmt: InputEventFormat = Field(default="ogip", description="File format")
     rmf_file: Optional[str] = Field(default=None, description="RMF file path")
     additional_columns: Optional[List[str]] = Field(default=None, description="Additional columns to load")
     high_precision: bool = Field(default=False, description="Use high precision loading")
@@ -43,7 +45,7 @@ class FileConfig(BaseModel):
     """Configuration for a single file in batch loading."""
     file_path: str
     name: str
-    fmt: Optional[str] = None
+    fmt: InputEventFormat = "ogip"
     rmf_file: Optional[str] = None
     additional_columns: Optional[List[str]] = None
     high_precision: Optional[bool] = None
@@ -61,7 +63,7 @@ class SubmitBatchJobRequest(BaseModel):
     """Request body for submitting a batch load job."""
     files: List[FileConfig] = Field(..., description="List of files to load")
     use_same_settings: bool = Field(default=True, description="Use shared settings for all files")
-    shared_fmt: str = Field(default="ogip", description="Shared file format")
+    shared_fmt: InputEventFormat = Field(default="ogip", description="Shared file format")
     shared_rmf_file: Optional[str] = Field(default=None, description="Shared RMF file path")
     shared_additional_columns: Optional[List[str]] = Field(default=None, description="Shared additional columns")
     shared_high_precision: bool = Field(default=False, description="Shared high precision setting")
@@ -78,7 +80,7 @@ class SubmitUrlJobRequest(BaseModel):
     """Request body for submitting a URL download job."""
     url: str = Field(..., description="URL to download")
     name: str = Field(..., description="Name for the loaded event list")
-    fmt: str = Field(default="ogip", description="File format")
+    fmt: InputEventFormat = Field(default="ogip", description="File format")
     rmf_file: Optional[str] = Field(default=None, description="RMF file path")
     additional_columns: Optional[List[str]] = Field(default=None, description="Additional columns to load")
     high_precision: bool = Field(default=False, description="Use high precision loading")
