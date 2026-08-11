@@ -24,7 +24,6 @@ from routes.data_routes import (
     LoadByTimeRangeRequest,
     LoadEventListFromUrlRequest,
     LoadEventListRequest,
-    SaveEventListRequest,
     SingleFileConfig,
 )
 from routes.job_routes import (
@@ -43,13 +42,17 @@ from tests.backend_auth import (
 
 
 UNSAFE_FORMATS = ("pickle", "unknown-format", "votable", "evt")
+TEST_FILE_GRANT = "test-native-file-grant"
 
 RequestBuilder = Callable[[str], BaseModel]
 REQUEST_BUILDERS: tuple[tuple[str, RequestBuilder], ...] = (
     (
         "data-load",
         lambda fmt: LoadEventListRequest(
-            file_path="/selected/events.evt", name="events", fmt=fmt
+            file_path="/selected/events.evt",
+            file_grant=TEST_FILE_GRANT,
+            name="events",
+            fmt=fmt,
         ),
     ),
     (
@@ -62,6 +65,7 @@ REQUEST_BUILDERS: tuple[tuple[str, RequestBuilder], ...] = (
         "data-time-range",
         lambda fmt: LoadByTimeRangeRequest(
             file_path="/selected/events.evt",
+            file_grant=TEST_FILE_GRANT,
             name="events",
             start_time=0.0,
             end_time=1.0,
@@ -71,25 +75,39 @@ REQUEST_BUILDERS: tuple[tuple[str, RequestBuilder], ...] = (
     (
         "data-event-count",
         lambda fmt: LoadByEventCountRequest(
-            file_path="/selected/events.evt", name="events", fmt=fmt
+            file_path="/selected/events.evt",
+            file_grant=TEST_FILE_GRANT,
+            name="events",
+            fmt=fmt,
         ),
     ),
     (
         "data-metadata",
         lambda fmt: GetFileMetadataRequest(
-            file_path="/selected/events.evt", fmt=fmt
+            file_path="/selected/events.evt",
+            file_grant=TEST_FILE_GRANT,
+            fmt=fmt,
         ),
     ),
     (
         "data-batch-item",
         lambda fmt: SingleFileConfig(
-            file_path="/selected/events.evt", name="events", fmt=fmt
+            file_path="/selected/events.evt",
+            file_grant=TEST_FILE_GRANT,
+            name="events",
+            fmt=fmt,
         ),
     ),
     (
         "data-batch-shared",
         lambda fmt: BatchLoadEventListRequest(
-            files=[{"file_path": "/selected/events.evt", "name": "events"}],
+            files=[
+                {
+                    "file_path": "/selected/events.evt",
+                    "file_grant": TEST_FILE_GRANT,
+                    "name": "events",
+                }
+            ],
             shared_fmt=fmt,
         ),
     ),
@@ -99,6 +117,7 @@ REQUEST_BUILDERS: tuple[tuple[str, RequestBuilder], ...] = (
             files=[
                 {
                     "file_path": "/selected/events.evt",
+                    "file_grant": TEST_FILE_GRANT,
                     "name": "events",
                     "fmt": fmt,
                 }
@@ -109,19 +128,31 @@ REQUEST_BUILDERS: tuple[tuple[str, RequestBuilder], ...] = (
     (
         "job-load",
         lambda fmt: SubmitLoadJobRequest(
-            file_path="/selected/events.evt", name="events", fmt=fmt
+            file_path="/selected/events.evt",
+            file_grant=TEST_FILE_GRANT,
+            name="events",
+            fmt=fmt,
         ),
     ),
     (
         "job-batch-item",
         lambda fmt: FileConfig(
-            file_path="/selected/events.evt", name="events", fmt=fmt
+            file_path="/selected/events.evt",
+            file_grant=TEST_FILE_GRANT,
+            name="events",
+            fmt=fmt,
         ),
     ),
     (
         "job-batch-shared",
         lambda fmt: SubmitBatchJobRequest(
-            files=[{"file_path": "/selected/events.evt", "name": "events"}],
+            files=[
+                {
+                    "file_path": "/selected/events.evt",
+                    "file_grant": TEST_FILE_GRANT,
+                    "name": "events",
+                }
+            ],
             shared_fmt=fmt,
         ),
     ),
@@ -131,6 +162,7 @@ REQUEST_BUILDERS: tuple[tuple[str, RequestBuilder], ...] = (
             files=[
                 {
                     "file_path": "/selected/events.evt",
+                    "file_grant": TEST_FILE_GRANT,
                     "name": "events",
                     "fmt": fmt,
                 }
@@ -177,26 +209,19 @@ def test_request_models_preserve_supported_input_formats(
     assert actual_format == fmt
 
 
-@pytest.mark.parametrize("unsafe_format", UNSAFE_FORMATS)
-def test_save_request_rejects_pickle_and_unknown_formats(unsafe_format: str) -> None:
-    with pytest.raises(ValidationError):
-        SaveEventListRequest(
-            name="events", file_path="/selected/events.hdf5", fmt=unsafe_format
-        )
-
-
-def test_save_request_defaults_to_hdf5() -> None:
-    request = SaveEventListRequest(name="events", file_path="events.hdf5")
-    assert request.fmt == "hdf5"
-
-
 def test_batch_job_file_format_defaults_to_ogip_instead_of_none() -> None:
-    config = FileConfig(file_path="/selected/events.evt", name="events")
+    config = FileConfig(
+        file_path="/selected/events.evt",
+        file_grant=TEST_FILE_GRANT,
+        name="events",
+    )
     assert config.fmt == "ogip"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint", ["/api/data/load-url", "/api/data/load-url-stream"])
+@pytest.mark.parametrize(
+    "endpoint", ["/api/data/load-url", "/api/data/load-url-stream"]
+)
 @pytest.mark.parametrize("unsafe_format", UNSAFE_FORMATS)
 async def test_url_routes_reject_unsafe_format_before_network(
     monkeypatch: pytest.MonkeyPatch, endpoint: str, unsafe_format: str
@@ -204,10 +229,7 @@ async def test_url_routes_reject_unsafe_format_before_network(
     def forbidden_network(*_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("network access occurred before format validation")
 
-    monkeypatch.setattr(data_service_module.requests, "get", forbidden_network)
-    monkeypatch.setattr(
-        DataService, "load_event_list_from_url", forbidden_network
-    )
+    monkeypatch.setattr(DataService, "load_event_list_from_url", forbidden_network)
     monkeypatch.setattr(
         DataService, "load_event_list_from_url_stream", forbidden_network
     )
@@ -244,9 +266,10 @@ def _forbidden_io(*_args: Any, **_kwargs: Any) -> None:
 
 @pytest.fixture()
 def data_service_without_io(monkeypatch: pytest.MonkeyPatch) -> DataService:
-    monkeypatch.setattr(data_service_module.requests, "get", _forbidden_io)
     monkeypatch.setattr(httpx, "AsyncClient", _forbidden_io)
-    monkeypatch.setattr(data_service_module.tempfile, "NamedTemporaryFile", _forbidden_io)
+    monkeypatch.setattr(
+        data_service_module.tempfile, "NamedTemporaryFile", _forbidden_io
+    )
     monkeypatch.setattr(data_service_module.os.path, "getsize", _forbidden_io)
     monkeypatch.setattr(data_service_module.os, "makedirs", _forbidden_io)
     monkeypatch.setattr(data_service_module.fits, "open", _forbidden_io)
@@ -285,9 +308,7 @@ DIRECT_SERVICE_CALLS: tuple[tuple[str, ServiceCall], ...] = (
     ),
     (
         "metadata",
-        lambda service, fmt: service.get_file_metadata(
-            "/selected/events.evt", fmt=fmt
-        ),
+        lambda service, fmt: service.get_file_metadata("/selected/events.evt", fmt=fmt),
     ),
     (
         "memory-estimate",
@@ -295,9 +316,7 @@ DIRECT_SERVICE_CALLS: tuple[tuple[str, ServiceCall], ...] = (
     ),
     (
         "memory-safety",
-        lambda service, fmt: service._can_load_safely(
-            "/selected/events.evt", fmt=fmt
-        ),
+        lambda service, fmt: service._can_load_safely("/selected/events.evt", fmt=fmt),
     ),
     (
         "batch-shared",
@@ -384,45 +403,15 @@ async def test_direct_streaming_services_reject_unsafe_input_before_io(
         await anext(stream)
 
 
-@pytest.mark.parametrize("unsafe_format", UNSAFE_FORMATS)
-def test_direct_save_rejects_unsafe_output_before_io(
-    data_service_without_io: DataService, unsafe_format: str
-) -> None:
-    with pytest.raises(ValueError, match="Unsupported output EventList format"):
-        data_service_without_io.save_event_list(
-            "events", "/selected/events.hdf5", fmt=unsafe_format
-        )
-
-
-class _RecordingEventList:
-    def __init__(self) -> None:
-        self.writes: list[tuple[str, str]] = []
-
-    def write(self, file_path: str, fmt: str) -> None:
-        self.writes.append((file_path, fmt))
-
-
-class _SaveState:
-    def __init__(self, event_list: _RecordingEventList) -> None:
-        self.event_list = event_list
-
-    def has_event_data(self, name: str) -> bool:
-        return name == "events"
-
-    def get_event_data(self, _name: str) -> _RecordingEventList:
-        return self.event_list
-
-
-@pytest.mark.parametrize("fmt", sorted(OUTPUT_EVENT_FORMATS))
-def test_direct_save_preserves_each_supported_output_format(fmt: str) -> None:
-    event_list = _RecordingEventList()
-    service = DataService(state_manager=_SaveState(event_list))
-    file_path = "events.hdf5" if fmt == "hdf5" else "events.ecsv"
-
-    result = service.save_event_list("events", file_path, fmt=fmt)
-
-    assert result["success"] is True
-    assert event_list.writes == [(file_path, fmt)]
+def test_legacy_data_save_surface_is_retired() -> None:
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
+    route_paths = {
+        (method, route.path)
+        for route in app.routes
+        for method in getattr(route, "methods", set())
+    }
+    assert ("POST", "/api/data/save") not in route_paths
+    assert not hasattr(DataService, "save_event_list")
 
 
 class _NoSubmitExecutor:

@@ -8,12 +8,106 @@ background tasks like file loading, data analysis, and downloads.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+import math
+import re
+from typing import Any, Dict, Optional
 import uuid
+
+
+_PUBLIC_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$")
+_PUBLIC_DISPLAY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _().-]{0,127}$")
+
+
+def _public_name(value: Any) -> str:
+    if isinstance(value, str) and _PUBLIC_NAME.fullmatch(value):
+        return value
+    return "event-list"
+
+
+def _public_count(value: Any) -> int | None:
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= 1_000_000_000
+    ):
+        return value
+    return None
+
+
+def _public_float(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        converted = float(value)
+        if math.isfinite(converted) and abs(converted) <= 1.0e15:
+            return converted
+    return None
+
+
+def _public_warnings(result: Dict[str, Any]) -> list[str] | None:
+    warnings: list[str] = []
+    if result.get("gti_warnings"):
+        warnings.append("GTI validation reported warnings")
+    if result.get("stingray_warnings"):
+        warnings.append("The scientific reader reported warnings")
+    issues = result.get("validation_issues")
+    if isinstance(issues, list) and any(
+        isinstance(issue, dict) and issue.get("severity") in {"warning", "error"}
+        for issue in issues[:64]
+    ):
+        warnings.append("Data-quality validation reported issues")
+    return warnings or None
+
+
+def _public_single_result(result: Any) -> Dict[str, Any] | None:
+    """Project an arbitrary internal result onto the public science summary."""
+    if not isinstance(result, dict):
+        return None
+    public: Dict[str, Any] = {}
+    event_count = _public_count(result.get("n_events", result.get("event_count")))
+    if event_count is not None:
+        public["event_count"] = event_count
+    time_range = result.get("time_range")
+    if isinstance(time_range, (list, tuple)) and len(time_range) == 2:
+        time_start = _public_float(time_range[0])
+        time_end = _public_float(time_range[1])
+    else:
+        time_start = _public_float(result.get("time_start"))
+        time_end = _public_float(result.get("time_end"))
+    if time_start is not None:
+        public["time_start"] = time_start
+    if time_end is not None:
+        public["time_end"] = time_end
+    warnings = _public_warnings(result)
+    if warnings is not None:
+        public["warnings"] = warnings
+    return public or None
+
+
+def _public_batch_result(result: Any) -> Dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    public: Dict[str, Any] = {}
+    for key in ("successful", "failed"):
+        items = result.get(key)
+        if isinstance(items, list):
+            public_items = []
+            for item in items[:32]:
+                if not isinstance(item, dict):
+                    continue
+                projected = {"name": _public_name(item.get("name"))}
+                if key == "failed":
+                    projected["error"] = "The selected file could not be loaded"
+                public_items.append(projected)
+            public[key] = public_items
+    for key in ("success_count", "failure_count", "total_files"):
+        count = _public_count(result.get(key))
+        if count is not None:
+            public[key] = count
+    return public or None
 
 
 class JobStatus(str, Enum):
     """Status of a background job."""
+
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -23,6 +117,7 @@ class JobStatus(str, Enum):
 
 class JobType(str, Enum):
     """Type of background job."""
+
     LOAD_EVENT_LIST = "load_event_list"
     LOAD_BATCH = "load_batch"
     LOAD_FROM_URL = "load_from_url"
@@ -49,11 +144,12 @@ class Job:
         created_at: ISO timestamp when job was created
         started_at: ISO timestamp when job started running
         completed_at: ISO timestamp when job completed/failed/cancelled
-        params: Job-specific parameters (file paths, names, options, etc.)
+        params: Private job execution options. Never serialized publicly.
         result: Result data on successful completion
         error: Error message on failure
         display_name: Human-readable name for the job (shown in UI)
     """
+
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     type: JobType = JobType.LOAD_EVENT_LIST
     status: JobStatus = JobStatus.PENDING
@@ -73,21 +169,39 @@ class Job:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert job to dictionary for JSON serialization."""
+        progress_messages = {
+            JobStatus.PENDING: "Pending...",
+            JobStatus.RUNNING: "Running...",
+            JobStatus.COMPLETED: "Completed",
+            JobStatus.FAILED: "Failed",
+            JobStatus.CANCELLED: "Cancelled",
+        }
+        public_result = (
+            _public_batch_result(self.result)
+            if self.type == JobType.LOAD_BATCH
+            else _public_single_result(self.result)
+        )
+        public_display_name = (
+            self.display_name
+            if _PUBLIC_DISPLAY.fullmatch(self.display_name)
+            else "Background job"
+        )
         return {
             "id": self.id,
             "type": self.type.value,
             "status": self.status.value,
             "progress": self.progress,
-            "progress_message": self.progress_message,
+            "progress_message": progress_messages[self.status],
             "total_items": self.total_items,
             "completed_items": self.completed_items,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
-            "params": self.params,
-            "result": self.result,
-            "error": self.error,
-            "display_name": self.display_name,
+            "result": public_result,
+            "error": "The background job could not be completed"
+            if self.error
+            else None,
+            "display_name": public_display_name,
         }
 
     @classmethod

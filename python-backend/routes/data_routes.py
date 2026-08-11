@@ -4,16 +4,18 @@ API routes for EventList data operations.
 
 import asyncio
 import json
-from typing import List, Optional
+import logging
+from typing import Annotated, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from models.event_formats import InputEventFormat, OutputEventFormat
+from models.event_formats import InputEventFormat
 from services.data_service import DataService
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def get_data_service(request: Request) -> DataService:
@@ -24,109 +26,204 @@ def get_data_service(request: Request) -> DataService:
     )
 
 
+async def _run_data_operation(operation: str, target, /, *args, **kwargs):
+    """Keep admission/native-reader exceptions inside the API envelope."""
+    try:
+        return await asyncio.to_thread(target, *args, **kwargs)
+    except Exception as error:
+        logger.error("Data operation %s failed (%s)", operation, type(error).__name__)
+        return {
+            "success": False,
+            "data": None,
+            "message": "The selected input could not be admitted or read",
+            "error": "data_input_rejected",
+        }
+
+
 # Request/Response Models
-class LoadEventListRequest(BaseModel):
-    file_path: str
-    name: str
+PathText = Annotated[str, Field(min_length=1, max_length=4096)]
+GrantText = Annotated[str, Field(min_length=1, max_length=512)]
+NameText = Annotated[
+    str,
+    Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$",
+    ),
+]
+NoteText = Annotated[str, Field(max_length=4096)]
+ColumnText = Annotated[str, Field(min_length=1, max_length=64)]
+TimeValue = Annotated[float, Field(ge=-1.0e15, le=1.0e15)]
+
+
+class StrictRequest(BaseModel):
+    """Bounded request base that rejects silently ignored fields."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False, strict=True)
+
+
+class OptionalRmfRequest(StrictRequest):
+    """Require an RMF path and native read grant as one indivisible pair."""
+
+    rmf_file: Optional[PathText] = None
+    rmf_grant: Optional[GrantText] = None
+
+    @model_validator(mode="after")
+    def require_complete_rmf_pair(self):
+        if (self.rmf_file is None) != (self.rmf_grant is None):
+            raise ValueError("rmf_file and rmf_grant must be provided together")
+        return self
+
+
+class GrantedInputRequest(StrictRequest):
+    file_path: PathText
+    file_grant: GrantText
+
+
+class LoadEventListRequest(OptionalRmfRequest):
+    file_path: PathText
+    file_grant: GrantText
+    name: NameText
     fmt: InputEventFormat = "ogip"
-    rmf_file: Optional[str] = None
-    additional_columns: Optional[List[str]] = None
+    additional_columns: Optional[List[ColumnText]] = Field(default=None, max_length=64)
     high_precision: bool = False
     skip_checks: bool = False
-    notes: Optional[str] = None
+    notes: Optional[NoteText] = None
 
 
-class LoadEventListFromUrlRequest(BaseModel):
-    url: str
-    name: str
+class LoadEventListFromUrlRequest(OptionalRmfRequest):
+    url: Annotated[str, Field(min_length=1, max_length=4096)]
+    name: NameText
     fmt: InputEventFormat = "ogip"
-    rmf_file: Optional[str] = None
-    additional_columns: Optional[List[str]] = None
+    additional_columns: Optional[List[ColumnText]] = Field(default=None, max_length=64)
     high_precision: bool = False
     skip_checks: bool = False
-    notes: Optional[str] = None
+    notes: Optional[NoteText] = None
 
 
-class SaveEventListRequest(BaseModel):
-    name: str
-    file_path: str
-    fmt: OutputEventFormat = "hdf5"
+class CheckFileSizeRequest(GrantedInputRequest):
+    pass
 
 
-class CheckFileSizeRequest(BaseModel):
-    file_path: str
-
-
-class LoadByTimeRangeRequest(BaseModel):
+class LoadByTimeRangeRequest(GrantedInputRequest):
     """Request model for true lazy loading by time range."""
-    file_path: str
-    name: str
-    start_time: float
-    end_time: float
+
+    name: NameText
+    start_time: TimeValue
+    end_time: TimeValue
     fmt: InputEventFormat = "ogip"
-    notes: Optional[str] = None
+    notes: Optional[NoteText] = None
+
+    @model_validator(mode="after")
+    def require_ordered_time_range(self):
+        if self.start_time >= self.end_time:
+            raise ValueError("start_time must be less than end_time")
+        return self
 
 
-class LoadByEventCountRequest(BaseModel):
+class LoadByEventCountRequest(GrantedInputRequest):
     """Request model for true lazy loading by event count."""
-    file_path: str
-    name: str
-    start_index: int = 0
-    count: int = 10000
+
+    name: NameText
+    start_index: int = Field(default=0, ge=0, le=100_000_000)
+    count: int = Field(default=10000, ge=1, le=10_000_000)
     fmt: InputEventFormat = "ogip"
-    notes: Optional[str] = None
+    notes: Optional[NoteText] = None
 
 
-class GetFileMetadataRequest(BaseModel):
+class GetFileMetadataRequest(GrantedInputRequest):
     """Request model for getting file metadata without loading."""
-    file_path: str
+
     fmt: InputEventFormat = "ogip"
 
 
-class SingleFileConfig(BaseModel):
+class SingleFileConfig(OptionalRmfRequest):
     """Configuration for a single file in batch load."""
-    file_path: str
-    name: str
+
+    file_path: PathText
+    file_grant: GrantText
+    name: NameText
     fmt: InputEventFormat = "ogip"
-    rmf_file: Optional[str] = None
-    additional_columns: Optional[List[str]] = None
+    additional_columns: Optional[List[ColumnText]] = Field(default=None, max_length=64)
     high_precision: bool = False
     skip_checks: bool = False
     # Per-file partial loading (only used if use_same_settings=False)
     use_partial_loading: bool = False
-    partial_mode: str = "time_range"
-    time_range_start: Optional[float] = None
-    time_range_end: Optional[float] = None
-    event_start_index: Optional[int] = None
-    event_count: Optional[int] = None
+    partial_mode: Literal["time_range", "event_count"] = "time_range"
+    time_range_start: Optional[TimeValue] = None
+    time_range_end: Optional[TimeValue] = None
+    event_start_index: Optional[int] = Field(default=None, ge=0, le=100_000_000)
+    event_count: Optional[int] = Field(default=None, ge=1, le=10_000_000)
     # Per-file notes
-    notes: Optional[str] = None
+    notes: Optional[NoteText] = None
+
+    @model_validator(mode="after")
+    def require_complete_partial_settings(self):
+        if not self.use_partial_loading:
+            return self
+        if self.partial_mode == "time_range":
+            if self.time_range_start is None or self.time_range_end is None:
+                raise ValueError("partial time-range loading requires both endpoints")
+            if self.time_range_start >= self.time_range_end:
+                raise ValueError("time_range_start must be less than time_range_end")
+        elif self.event_count is None:
+            raise ValueError("partial event-count loading requires event_count")
+        return self
 
 
-class BatchLoadEventListRequest(BaseModel):
+class BatchLoadEventListRequest(StrictRequest):
     """Request for batch loading multiple files."""
-    files: List[SingleFileConfig]
+
+    files: List[SingleFileConfig] = Field(min_length=1, max_length=32)
 
     # Toggle: same settings vs per-file
     use_same_settings: bool = True
 
     # Shared settings (used when use_same_settings=True)
     shared_fmt: InputEventFormat = "ogip"
-    shared_rmf_file: Optional[str] = None
-    shared_additional_columns: Optional[List[str]] = None
+    shared_rmf_file: Optional[PathText] = None
+    shared_rmf_grant: Optional[GrantText] = None
+    shared_additional_columns: Optional[List[ColumnText]] = Field(
+        default=None, max_length=64
+    )
     shared_high_precision: bool = False
     shared_skip_checks: bool = False
     shared_use_partial_loading: bool = False
-    shared_partial_mode: str = "time_range"
-    shared_time_range_start: Optional[float] = None
-    shared_time_range_end: Optional[float] = None
-    shared_event_start_index: Optional[int] = None
-    shared_event_count: Optional[int] = None
+    shared_partial_mode: Literal["time_range", "event_count"] = "time_range"
+    shared_time_range_start: Optional[TimeValue] = None
+    shared_time_range_end: Optional[TimeValue] = None
+    shared_event_start_index: Optional[int] = Field(default=None, ge=0, le=100_000_000)
+    shared_event_count: Optional[int] = Field(default=None, ge=1, le=10_000_000)
+
+    @model_validator(mode="after")
+    def require_complete_shared_rmf_pair(self):
+        if (self.shared_rmf_file is None) != (self.shared_rmf_grant is None):
+            raise ValueError(
+                "shared_rmf_file and shared_rmf_grant must be provided together"
+            )
+        if self.shared_use_partial_loading and self.shared_partial_mode == "time_range":
+            if (
+                self.shared_time_range_start is None
+                or self.shared_time_range_end is None
+            ):
+                raise ValueError(
+                    "shared partial time-range loading requires both endpoints"
+                )
+            if self.shared_time_range_start >= self.shared_time_range_end:
+                raise ValueError(
+                    "shared_time_range_start must be less than shared_time_range_end"
+                )
+        elif self.shared_use_partial_loading and self.shared_event_count is None:
+            raise ValueError(
+                "shared partial event-count loading requires shared_event_count"
+            )
+        return self
 
 
-class BatchFileSizeRequest(BaseModel):
+class BatchFileSizeRequest(StrictRequest):
     """Request for checking batch file sizes."""
-    file_paths: List[str]
+
+    files: List[GrantedInputRequest] = Field(min_length=1, max_length=32)
 
 
 # Routes
@@ -140,12 +237,15 @@ async def load_event_list(
     Uses asyncio.to_thread() to avoid blocking the event loop,
     allowing other async operations (like resource monitoring) to continue.
     """
-    return await asyncio.to_thread(
+    return await _run_data_operation(
+        "load",
         service.load_event_list,
         file_path=request.file_path,
+        file_grant=request.file_grant,
         name=request.name,
         fmt=request.fmt,
         rmf_file=request.rmf_file,
+        rmf_grant=request.rmf_grant,
         additional_columns=request.additional_columns,
         high_precision=request.high_precision,
         skip_checks=request.skip_checks,
@@ -162,15 +262,18 @@ async def load_event_list_from_url(
 
     Uses asyncio.to_thread() to avoid blocking the event loop.
     """
-    return await asyncio.to_thread(
+    return await _run_data_operation(
+        "remote_load",
         service.load_event_list_from_url,
         url=request.url,
         name=request.name,
         fmt=request.fmt,
         rmf_file=request.rmf_file,
+        rmf_grant=request.rmf_grant,
         additional_columns=request.additional_columns,
         high_precision=request.high_precision,
         skip_checks=request.skip_checks,
+        notes=request.notes,
     )
 
 
@@ -191,12 +294,14 @@ async def load_event_list_from_url_stream(
     - type: "complete" - Successfully loaded, includes data summary
     - type: "error" - An error occurred
     """
+
     async def event_generator():
         async for event in service.load_event_list_from_url_stream(
             url=request.url,
             name=request.name,
             fmt=request.fmt,
             rmf_file=request.rmf_file,
+            rmf_grant=request.rmf_grant,
             additional_columns=request.additional_columns,
             high_precision=request.high_precision,
             skip_checks=request.skip_checks,
@@ -208,33 +313,17 @@ async def load_event_list_from_url_stream(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-store",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            "X-Content-Type-Options": "nosniff",
         },
-    )
-
-
-@router.post("/save")
-async def save_event_list(
-    request: SaveEventListRequest,
-    service: DataService = Depends(get_data_service),
-):
-    """Save an EventList to disk.
-
-    Uses asyncio.to_thread() to avoid blocking the event loop.
-    """
-    return await asyncio.to_thread(
-        service.save_event_list,
-        name=request.name,
-        file_path=request.file_path,
-        fmt=request.fmt,
     )
 
 
 @router.delete("/{name}")
 async def delete_event_list(
-    name: str,
+    name: NameText,
     service: DataService = Depends(get_data_service),
 ):
     """Delete an EventList from state."""
@@ -243,7 +332,7 @@ async def delete_event_list(
 
 @router.get("/{name}")
 async def get_event_list_info(
-    name: str,
+    name: NameText,
     service: DataService = Depends(get_data_service),
 ):
     """Get information about an EventList."""
@@ -264,7 +353,12 @@ async def check_file_size(
     service: DataService = Depends(get_data_service),
 ):
     """Check file size and get loading recommendations."""
-    return service.check_file_size(request.file_path)
+    return await _run_data_operation(
+        "size_check",
+        service.check_file_size,
+        request.file_path,
+        request.file_grant,
+    )
 
 
 @router.delete("/")
@@ -277,8 +371,9 @@ async def clear_all_event_lists(
 
 @router.get("/{name}/full-preview")
 async def get_event_list_full_preview(
-    name: str,
-    time_limit: int = 10,
+    name: NameText,
+    # HTTP query values are text; FastAPI must parse them before enforcing bounds.
+    time_limit: Annotated[int, Query(ge=1, le=10_000)] = 10,
     service: DataService = Depends(get_data_service),
 ):
     """Get full preview of an EventList with all attributes."""
@@ -304,9 +399,11 @@ async def load_event_list_by_time_range(
 
     Uses asyncio.to_thread() to avoid blocking the event loop.
     """
-    return await asyncio.to_thread(
+    return await _run_data_operation(
+        "time_range_load",
         service.load_event_list_by_time_range,
         file_path=request.file_path,
+        file_grant=request.file_grant,
         name=request.name,
         start_time=request.start_time,
         end_time=request.end_time,
@@ -328,9 +425,11 @@ async def load_event_list_by_event_count(
 
     Uses asyncio.to_thread() to avoid blocking the event loop.
     """
-    return await asyncio.to_thread(
+    return await _run_data_operation(
+        "event_count_load",
         service.load_event_list_by_event_count,
         file_path=request.file_path,
+        file_grant=request.file_grant,
         name=request.name,
         start_index=request.start_index,
         count=request.count,
@@ -352,9 +451,11 @@ async def get_file_metadata(
 
     Uses asyncio.to_thread() to avoid blocking the event loop.
     """
-    return await asyncio.to_thread(
+    return await _run_data_operation(
+        "metadata",
         service.get_file_metadata,
         file_path=request.file_path,
+        file_grant=request.file_grant,
         fmt=request.fmt,
     )
 
@@ -375,7 +476,11 @@ async def check_batch_file_size(
 
     Returns per-file and total memory estimates with risk levels.
     """
-    return service.check_batch_file_size(file_paths=request.file_paths)
+    return await _run_data_operation(
+        "batch_size_check",
+        service.check_batch_file_size,
+        files=[item.model_dump() for item in request.files],
+    )
 
 
 @router.post("/load-batch")
@@ -399,12 +504,14 @@ async def load_batch_event_lists(
     files_dict = [f.model_dump() for f in request.files]
 
     # Run the blocking batch load in a thread to avoid blocking the event loop
-    return await asyncio.to_thread(
+    return await _run_data_operation(
+        "batch_load",
         service.load_batch_event_lists,
         files=files_dict,
         use_same_settings=request.use_same_settings,
         shared_fmt=request.shared_fmt,
         shared_rmf_file=request.shared_rmf_file,
+        shared_rmf_grant=request.shared_rmf_grant,
         shared_additional_columns=request.shared_additional_columns,
         shared_high_precision=request.shared_high_precision,
         shared_skip_checks=request.shared_skip_checks,
@@ -445,6 +552,7 @@ async def load_batch_event_lists_stream(
             use_same_settings=request.use_same_settings,
             shared_fmt=request.shared_fmt,
             shared_rmf_file=request.shared_rmf_file,
+            shared_rmf_grant=request.shared_rmf_grant,
             shared_additional_columns=request.shared_additional_columns,
             shared_high_precision=request.shared_high_precision,
             shared_skip_checks=request.shared_skip_checks,
@@ -461,8 +569,9 @@ async def load_batch_event_lists_stream(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-store",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # Disable nginx buffering if behind proxy
+            "X-Content-Type-Options": "nosniff",
         },
     )

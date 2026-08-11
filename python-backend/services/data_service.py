@@ -6,27 +6,59 @@ Includes lazy loading support for large files.
 """
 
 import asyncio
+import gzip
 import os
+import re
 import tempfile
+import threading
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from contextlib import ExitStack, contextmanager
+from pathlib import Path
+from typing import Any, AsyncGenerator, BinaryIO, Dict, Generator, List, Optional
 
 import numpy as np
 import psutil
-import requests
 from astropy.io import fits
 from stingray import EventList
 from stingray.io import FITSTimeseriesReader
 
+try:
+    import h5py
+except ImportError:  # Optional format support must not prevent app startup.
+    h5py = None
+
 from models.event_formats import (
     require_batch_input_formats,
     require_input_event_format,
-    require_output_event_format,
 )
 
 from .base_service import BaseService
+from .remote_source import (
+    GENERAL_HTTPS_POLICY,
+    RemoteSourceCancelled,
+    RemoteSourceClient,
+    RemoteSourceError,
+)
+from .utility_helpers import (
+    MAX_FITS_INSPECT_BYTES,
+    MAX_RMF_BYTES,
+    GrantedReadFile,
+    open_verified_read_grant,
+    validate_derived_name,
+)
+
+
+SPOOL_MEMORY_LIMIT = 64 * 1024**2
+REMOTE_EVENT_LIMIT = MAX_FITS_INSPECT_BYTES
+COPY_CHUNK_SIZE = 1024 * 1024
+MAX_PUBLIC_SCIENTIFIC_WARNINGS = 32
+MAX_PUBLIC_WARNING_CHARS = 4096
+_PRIVATE_LOCATOR = re.compile(
+    r"(?:[A-Za-z][A-Za-z0-9+.-]*://|stingray-input-|"
+    r"(?:^|[\s'\"(<])(?:/[^\s'\"<>]+|[A-Za-z]:[\\/]|\\\\))"
+)
 
 
 def _to_python_float(val):
@@ -48,7 +80,225 @@ def _to_python_float_list(arr):
         # Convert each element explicitly to handle longdouble
         return [float(x) for x in arr]
     except (TypeError, ValueError):
-        return arr.tolist() if hasattr(arr, 'tolist') else list(arr)
+        return arr.tolist() if hasattr(arr, "tolist") else list(arr)
+
+
+def _safe_scientific_warning(captured_warning: Any) -> str | None:
+    """Keep useful bounded warnings while dropping locator-bearing details."""
+    if issubclass(captured_warning.category, ResourceWarning):
+        return None
+    text = str(captured_warning.message)[:MAX_PUBLIC_WARNING_CHARS]
+    if _PRIVATE_LOCATOR.search(text):
+        return f"{captured_warning.category.__name__} details were omitted"
+    return text
+
+
+@contextmanager
+def _open_granted_source(
+    file_path: str,
+    file_grant: str | None,
+    pinned_source: GrantedReadFile | None,
+) -> Generator[GrantedReadFile, None, None]:
+    """Yield an already pinned source or verify and pin a native grant now."""
+    if pinned_source is not None:
+        yield pinned_source
+        return
+    if not file_grant:
+        raise PermissionError("A native read grant is required for the selected file")
+    source_context = open_verified_read_grant(file_path, file_grant)
+    try:
+        source = source_context.__enter__()
+    except Exception:
+        # Native open failures can contain the selected pathname.  Keep that
+        # capability out of API responses and framework exception logs.
+        raise PermissionError(
+            "The selected file could not be verified; select it again"
+        ) from None
+
+    body_failed = False
+    try:
+        yield source
+    except BaseException:
+        body_failed = True
+        raise
+    finally:
+        try:
+            source_context.__exit__(None, None, None)
+        except Exception:
+            if not body_failed:
+                raise OSError("The selected input could not be closed safely") from None
+
+
+@contextmanager
+def _spooled_copy(
+    source: GrantedReadFile,
+    *,
+    max_bytes: int,
+    cancellation_check=None,
+) -> Generator[BinaryIO, None, None]:
+    """Copy one pinned input into a bounded anonymous application-owned file."""
+    if source.size_bytes < 0 or source.size_bytes > max_bytes:
+        raise ValueError(f"Selected input exceeds the {max_bytes}-byte safety cap")
+    before = os.fstat(source.stream.fileno())
+    if before.st_size != source.size_bytes:
+        raise OSError("Selected input changed before it could be retained")
+    with tempfile.SpooledTemporaryFile(
+        max_size=SPOOL_MEMORY_LIMIT, mode="w+b"
+    ) as spool:
+        source.stream.seek(0)
+        copied = 0
+        while True:
+            _raise_if_cancelled(cancellation_check)
+            chunk = source.stream.read(COPY_CHUNK_SIZE)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > max_bytes:
+                raise ValueError(
+                    f"Selected input exceeds the {max_bytes}-byte safety cap"
+                )
+            spool.write(chunk)
+        if copied != source.size_bytes:
+            raise OSError("Selected input changed while it was being retained")
+        after = os.fstat(source.stream.fileno())
+        before_identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        after_identity = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if after_identity != before_identity:
+            raise OSError("Selected input changed while it was being retained")
+        _raise_if_cancelled(cancellation_check)
+        spool.seek(0)
+        yield spool
+
+
+def _rewind(stream: BinaryIO | None) -> None:
+    if stream is not None:
+        stream.seek(0)
+
+
+def _raise_if_cancelled(cancellation_check) -> None:
+    if cancellation_check is not None and cancellation_check():
+        raise InterruptedError("The data operation was cancelled")
+
+
+@contextmanager
+def _decoded_event_stream(
+    stream: BinaryIO,
+    *,
+    fmt: str,
+    cancellation_check=None,
+) -> Generator[BinaryIO, None, None]:
+    """Decode gzip OGIP input into another capped anonymous spool."""
+    _rewind(stream)
+    magic = stream.read(2)
+    _rewind(stream)
+    if fmt not in {"ogip", "fits"} or magic != b"\x1f\x8b":
+        yield stream
+        return
+
+    with gzip.GzipFile(fileobj=stream, mode="rb") as compressed:
+        with tempfile.SpooledTemporaryFile(
+            max_size=SPOOL_MEMORY_LIMIT, mode="w+b"
+        ) as decoded:
+            copied = 0
+            while True:
+                _raise_if_cancelled(cancellation_check)
+                chunk = compressed.read(COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > MAX_FITS_INSPECT_BYTES:
+                    raise ValueError(
+                        "Decompressed event input exceeds the scientific input cap"
+                    )
+                decoded.write(chunk)
+            decoded.seek(0)
+            _raise_if_cancelled(cancellation_check)
+            yield decoded
+
+
+@contextmanager
+def _cloned_stream(
+    stream: BinaryIO, *, cancellation_check=None
+) -> Generator[BinaryIO, None, None]:
+    """Give a reader that closes file objects its own bounded anonymous clone."""
+    with tempfile.SpooledTemporaryFile(
+        max_size=SPOOL_MEMORY_LIMIT, mode="w+b"
+    ) as clone:
+        _rewind(stream)
+        copied = 0
+        while True:
+            _raise_if_cancelled(cancellation_check)
+            chunk = stream.read(COPY_CHUNK_SIZE)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > MAX_FITS_INSPECT_BYTES:
+                raise ValueError("Event input exceeds the scientific input cap")
+            clone.write(chunk)
+        _rewind(stream)
+        clone.seek(0)
+        _raise_if_cancelled(cancellation_check)
+        yield clone
+
+
+@contextmanager
+def _scientific_reader_source(
+    stream: BinaryIO,
+    *,
+    fmt: str,
+    cancellation_check=None,
+) -> Generator[BinaryIO | str, None, None]:
+    """Adapt a retained stream for third-party readers that reopen by name.
+
+    Astropy table/HDF5 readers consume file objects safely. Stingray's OGIP
+    reader reopens its input multiple times, so it receives a private 0700
+    directory snapshot rather than the originally selected pathname.
+    """
+    if fmt not in {"ogip", "fits"}:
+        _rewind(stream)
+        yield stream
+        return
+
+    with tempfile.TemporaryDirectory(prefix="stingray-input-") as directory:
+        snapshot = Path(directory) / "events.evt"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        descriptor = os.open(snapshot, flags, 0o600)
+        try:
+            _rewind(stream)
+            copied = 0
+            while True:
+                _raise_if_cancelled(cancellation_check)
+                chunk = stream.read(COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > MAX_FITS_INSPECT_BYTES:
+                    raise ValueError("Event input exceeds the scientific input cap")
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError("Could not retain the selected event input")
+                    remaining = remaining[written:]
+            os.fsync(descriptor)
+            _raise_if_cancelled(cancellation_check)
+        finally:
+            os.close(descriptor)
+        yield str(snapshot)
 
 
 class DataService(BaseService):
@@ -112,7 +362,9 @@ class DataService(BaseService):
 
         # Check 1: Empty or missing GTI
         if event_list.gti is None or len(event_list.gti) == 0:
-            warnings.append("GTI is empty or missing - no valid observation intervals defined")
+            warnings.append(
+                "GTI is empty or missing - no valid observation intervals defined"
+            )
             return warnings  # Can't do further checks without GTI
 
         # Check 2: Invalid GTI intervals (stop <= start)
@@ -166,149 +418,185 @@ class DataService(BaseService):
         # Check 1: NaN in time array
         if event_list.time is not None and len(event_list.time) > 0:
             nan_count = int(np.sum(np.isnan(event_list.time)))
-            validations.append({
-                "type": "nan_time",
-                "name": "Time Array NaN Check",
-                "description": "Check for NaN (Not a Number) values in time array",
-                "status": "fail" if nan_count > 0 else "pass",
-                "severity": "error" if nan_count > 0 else "pass",
-                "message": f"Found {nan_count} NaN values" if nan_count > 0 else "No NaN values found",
-                "count": nan_count,
-                "total": len(event_list.time)
-            })
+            validations.append(
+                {
+                    "type": "nan_time",
+                    "name": "Time Array NaN Check",
+                    "description": "Check for NaN (Not a Number) values in time array",
+                    "status": "fail" if nan_count > 0 else "pass",
+                    "severity": "error" if nan_count > 0 else "pass",
+                    "message": f"Found {nan_count} NaN values"
+                    if nan_count > 0
+                    else "No NaN values found",
+                    "count": nan_count,
+                    "total": len(event_list.time),
+                }
+            )
 
             # Check 2: Time ordering (monotonically increasing)
             time_diffs = np.diff(event_list.time)
             disorder_count = int(np.sum(time_diffs < 0))
-            validations.append({
-                "type": "time_ordering",
-                "name": "Time Ordering Check",
-                "description": "Check if time values are monotonically increasing",
-                "status": "fail" if disorder_count > 0 else "pass",
-                "severity": "warning" if disorder_count > 0 else "pass",
-                "message": f"Found {disorder_count} time inversions (not monotonically increasing)" if disorder_count > 0 else "Time values are monotonically increasing",
-                "count": disorder_count,
-                "total": len(event_list.time) - 1
-            })
+            validations.append(
+                {
+                    "type": "time_ordering",
+                    "name": "Time Ordering Check",
+                    "description": "Check if time values are monotonically increasing",
+                    "status": "fail" if disorder_count > 0 else "pass",
+                    "severity": "warning" if disorder_count > 0 else "pass",
+                    "message": f"Found {disorder_count} time inversions (not monotonically increasing)"
+                    if disorder_count > 0
+                    else "Time values are monotonically increasing",
+                    "count": disorder_count,
+                    "total": len(event_list.time) - 1,
+                }
+            )
         else:
-            validations.append({
-                "type": "nan_time",
-                "name": "Time Array NaN Check",
-                "description": "Check for NaN values in time array",
-                "status": "skip",
-                "severity": "skip",
-                "message": "No time data available",
-                "count": 0,
-                "total": 0
-            })
-            validations.append({
-                "type": "time_ordering",
-                "name": "Time Ordering Check",
-                "description": "Check if time values are monotonically increasing",
-                "status": "skip",
-                "severity": "skip",
-                "message": "No time data available",
-                "count": 0,
-                "total": 0
-            })
+            validations.append(
+                {
+                    "type": "nan_time",
+                    "name": "Time Array NaN Check",
+                    "description": "Check for NaN values in time array",
+                    "status": "skip",
+                    "severity": "skip",
+                    "message": "No time data available",
+                    "count": 0,
+                    "total": 0,
+                }
+            )
+            validations.append(
+                {
+                    "type": "time_ordering",
+                    "name": "Time Ordering Check",
+                    "description": "Check if time values are monotonically increasing",
+                    "status": "skip",
+                    "severity": "skip",
+                    "message": "No time data available",
+                    "count": 0,
+                    "total": 0,
+                }
+            )
 
         # Check 3: NaN in energy array
         if event_list.energy is not None and len(event_list.energy) > 0:
             nan_energy = int(np.sum(np.isnan(event_list.energy)))
-            validations.append({
-                "type": "nan_energy",
-                "name": "Energy Array NaN Check",
-                "description": "Check for NaN values in energy array",
-                "status": "fail" if nan_energy > 0 else "pass",
-                "severity": "error" if nan_energy > 0 else "pass",
-                "message": f"Found {nan_energy} NaN values" if nan_energy > 0 else "No NaN values found",
-                "count": nan_energy,
-                "total": len(event_list.energy)
-            })
+            validations.append(
+                {
+                    "type": "nan_energy",
+                    "name": "Energy Array NaN Check",
+                    "description": "Check for NaN values in energy array",
+                    "status": "fail" if nan_energy > 0 else "pass",
+                    "severity": "error" if nan_energy > 0 else "pass",
+                    "message": f"Found {nan_energy} NaN values"
+                    if nan_energy > 0
+                    else "No NaN values found",
+                    "count": nan_energy,
+                    "total": len(event_list.energy),
+                }
+            )
 
             # Check 4: Negative energy values
             neg_energy = int(np.sum(event_list.energy < 0))
-            validations.append({
-                "type": "negative_energy",
-                "name": "Negative Energy Check",
-                "description": "Check for negative energy values (physically invalid)",
-                "status": "fail" if neg_energy > 0 else "pass",
-                "severity": "error" if neg_energy > 0 else "pass",
-                "message": f"Found {neg_energy} negative energy values" if neg_energy > 0 else "All energy values are non-negative",
-                "count": neg_energy,
-                "total": len(event_list.energy)
-            })
+            validations.append(
+                {
+                    "type": "negative_energy",
+                    "name": "Negative Energy Check",
+                    "description": "Check for negative energy values (physically invalid)",
+                    "status": "fail" if neg_energy > 0 else "pass",
+                    "severity": "error" if neg_energy > 0 else "pass",
+                    "message": f"Found {neg_energy} negative energy values"
+                    if neg_energy > 0
+                    else "All energy values are non-negative",
+                    "count": neg_energy,
+                    "total": len(event_list.energy),
+                }
+            )
         else:
-            validations.append({
-                "type": "nan_energy",
-                "name": "Energy Array NaN Check",
-                "description": "Check for NaN values in energy array",
-                "status": "skip",
-                "severity": "skip",
-                "message": "No energy data available",
-                "count": 0,
-                "total": 0
-            })
-            validations.append({
-                "type": "negative_energy",
-                "name": "Negative Energy Check",
-                "description": "Check for negative energy values",
-                "status": "skip",
-                "severity": "skip",
-                "message": "No energy data available",
-                "count": 0,
-                "total": 0
-            })
+            validations.append(
+                {
+                    "type": "nan_energy",
+                    "name": "Energy Array NaN Check",
+                    "description": "Check for NaN values in energy array",
+                    "status": "skip",
+                    "severity": "skip",
+                    "message": "No energy data available",
+                    "count": 0,
+                    "total": 0,
+                }
+            )
+            validations.append(
+                {
+                    "type": "negative_energy",
+                    "name": "Negative Energy Check",
+                    "description": "Check for negative energy values",
+                    "status": "skip",
+                    "severity": "skip",
+                    "message": "No energy data available",
+                    "count": 0,
+                    "total": 0,
+                }
+            )
 
         # Check 5: Negative PI values
         if event_list.pi is not None and len(event_list.pi) > 0:
             neg_pi = int(np.sum(event_list.pi < 0))
-            validations.append({
-                "type": "negative_pi",
-                "name": "Negative PI Check",
-                "description": "Check for negative PI (Pulse Invariant) channel values",
-                "status": "fail" if neg_pi > 0 else "pass",
-                "severity": "error" if neg_pi > 0 else "pass",
-                "message": f"Found {neg_pi} negative PI values" if neg_pi > 0 else "All PI values are non-negative",
-                "count": neg_pi,
-                "total": len(event_list.pi)
-            })
+            validations.append(
+                {
+                    "type": "negative_pi",
+                    "name": "Negative PI Check",
+                    "description": "Check for negative PI (Pulse Invariant) channel values",
+                    "status": "fail" if neg_pi > 0 else "pass",
+                    "severity": "error" if neg_pi > 0 else "pass",
+                    "message": f"Found {neg_pi} negative PI values"
+                    if neg_pi > 0
+                    else "All PI values are non-negative",
+                    "count": neg_pi,
+                    "total": len(event_list.pi),
+                }
+            )
         else:
-            validations.append({
-                "type": "negative_pi",
-                "name": "Negative PI Check",
-                "description": "Check for negative PI channel values",
-                "status": "skip",
-                "severity": "skip",
-                "message": "No PI data available",
-                "count": 0,
-                "total": 0
-            })
+            validations.append(
+                {
+                    "type": "negative_pi",
+                    "name": "Negative PI Check",
+                    "description": "Check for negative PI channel values",
+                    "status": "skip",
+                    "severity": "skip",
+                    "message": "No PI data available",
+                    "count": 0,
+                    "total": 0,
+                }
+            )
 
         # Check 6: GTI validity (start < stop for all intervals)
         if event_list.gti is not None and len(event_list.gti) > 0:
             invalid_gti = sum(1 for g in event_list.gti if g[1] <= g[0])
-            validations.append({
-                "type": "gti_validity",
-                "name": "GTI Interval Check",
-                "description": "Check that all GTI intervals have valid start < stop times",
-                "status": "fail" if invalid_gti > 0 else "pass",
-                "severity": "error" if invalid_gti > 0 else "pass",
-                "message": f"Found {invalid_gti} invalid GTI intervals (stop <= start)" if invalid_gti > 0 else "All GTI intervals are valid",
-                "count": invalid_gti,
-                "total": len(event_list.gti)
-            })
+            validations.append(
+                {
+                    "type": "gti_validity",
+                    "name": "GTI Interval Check",
+                    "description": "Check that all GTI intervals have valid start < stop times",
+                    "status": "fail" if invalid_gti > 0 else "pass",
+                    "severity": "error" if invalid_gti > 0 else "pass",
+                    "message": f"Found {invalid_gti} invalid GTI intervals (stop <= start)"
+                    if invalid_gti > 0
+                    else "All GTI intervals are valid",
+                    "count": invalid_gti,
+                    "total": len(event_list.gti),
+                }
+            )
         else:
-            validations.append({
-                "type": "gti_validity",
-                "name": "GTI Interval Check",
-                "description": "Check that all GTI intervals have valid start < stop times",
-                "status": "skip",
-                "severity": "skip",
-                "message": "No GTI data available",
-                "count": 0,
-                "total": 0
-            })
+            validations.append(
+                {
+                    "type": "gti_validity",
+                    "name": "GTI Interval Check",
+                    "description": "Check that all GTI intervals have valid start < stop times",
+                    "status": "skip",
+                    "severity": "skip",
+                    "message": "No GTI data available",
+                    "count": 0,
+                    "total": 0,
+                }
+            )
 
         return validations
 
@@ -331,11 +619,11 @@ class DataService(BaseService):
 
         # Split into 80-character cards (FITS standard)
         # Some headers may be newline-separated instead
-        if '\n' in header_str:
-            lines = header_str.split('\n')
+        if "\n" in header_str:
+            lines = header_str.split("\n")
         else:
             # Split into 80-char chunks
-            lines = [header_str[i:i+80] for i in range(0, len(header_str), 80)]
+            lines = [header_str[i : i + 80] for i in range(0, len(header_str), 80)]
 
         for line in lines:
             if not line or len(line) < 8:
@@ -343,11 +631,11 @@ class DataService(BaseService):
 
             # Skip COMMENT, HISTORY, and END cards
             keyword = line[:8].strip()
-            if not keyword or keyword in ('COMMENT', 'HISTORY', 'END', ''):
+            if not keyword or keyword in ("COMMENT", "HISTORY", "END", ""):
                 continue
 
             # Check for value indicator '='
-            if len(line) > 9 and line[8] == '=':
+            if len(line) > 9 and line[8] == "=":
                 value_part = line[9:].strip()
 
                 # Handle quoted string values
@@ -356,7 +644,10 @@ class DataService(BaseService):
                     end_quote = 1
                     while end_quote < len(value_part):
                         if value_part[end_quote] == "'":
-                            if end_quote + 1 < len(value_part) and value_part[end_quote + 1] == "'":
+                            if (
+                                end_quote + 1 < len(value_part)
+                                and value_part[end_quote + 1] == "'"
+                            ):
                                 end_quote += 2  # Skip escaped quote
                             else:
                                 break
@@ -365,16 +656,16 @@ class DataService(BaseService):
                     value = value_part[1:end_quote].replace("''", "'").strip()
                 else:
                     # Numeric or boolean value - take until comment marker
-                    if '/' in value_part:
-                        value = value_part.split('/')[0].strip()
+                    if "/" in value_part:
+                        value = value_part.split("/")[0].strip()
                     else:
                         value = value_part.strip()
 
                     # Handle boolean
-                    if value == 'T':
-                        value = 'True'
-                    elif value == 'F':
-                        value = 'False'
+                    if value == "T":
+                        value = "True"
+                    elif value == "F":
+                        value = "False"
 
                 if value:
                     parsed[keyword] = value
@@ -410,11 +701,11 @@ class DataService(BaseService):
             header_dict = self._parse_fits_header_string(raw_header)
         elif isinstance(raw_header, dict):
             header_dict = {str(k): str(v) for k, v in raw_header.items()}
-        elif hasattr(raw_header, 'get'):
+        elif hasattr(raw_header, "get"):
             # Handle astropy Header-like objects - convert to dict
             try:
                 for key in raw_header.keys():
-                    if key and key.strip() and key not in ('COMMENT', 'HISTORY', ''):
+                    if key and key.strip() and key not in ("COMMENT", "HISTORY", ""):
                         val = raw_header.get(key)
                         if val is not None:
                             header_dict[str(key)] = str(val)
@@ -469,7 +760,7 @@ class DataService(BaseService):
 
         return header_info
 
-    def _detect_fits_file_type(self, file_path: str) -> Dict[str, Any]:
+    def _detect_fits_file_type(self, file_stream: BinaryIO | str) -> Dict[str, Any]:
         """
         Detect the type of a FITS file by reading its headers.
 
@@ -487,27 +778,29 @@ class DataService(BaseService):
             "file_type": "unknown",
             "details": {},
             "is_event_list": False,
-            "error_message": None
+            "error_message": None,
         }
 
         try:
-            with fits.open(file_path) as hdulist:
+            if not isinstance(file_stream, str):
+                _rewind(file_stream)
+            with fits.open(file_stream, memmap=False) as hdulist:
                 for hdu in hdulist:
-                    if hdu.name in ['PRIMARY', '']:
+                    if hdu.name in ["PRIMARY", ""]:
                         continue
 
                     header = hdu.header
-                    extname = header.get('EXTNAME', '').upper()
-                    hduclas1 = header.get('HDUCLAS1', '').upper()
+                    extname = header.get("EXTNAME", "").upper()
+                    hduclas1 = header.get("HDUCLAS1", "").upper()
 
                     result["details"] = {
                         "extname": extname,
                         "hduclas1": hduclas1,
-                        "extension_name": hdu.name
+                        "extension_name": hdu.name,
                     }
 
                     # Check for Light Curve
-                    if 'LIGHT' in hduclas1 or extname == 'RATE':
+                    if "LIGHT" in hduclas1 or extname == "RATE":
                         result["file_type"] = "light_curve"
                         result["is_event_list"] = False
                         result["error_message"] = (
@@ -518,13 +811,13 @@ class DataService(BaseService):
                         return result
 
                     # Check for Event List
-                    if extname == 'EVENTS' or hduclas1 == 'EVENTS':
+                    if extname == "EVENTS" or hduclas1 == "EVENTS":
                         result["file_type"] = "event_list"
                         result["is_event_list"] = True
                         return result
 
                     # Check for Spectrum
-                    if 'SPECTRUM' in hduclas1 or extname == 'SPECTRUM':
+                    if "SPECTRUM" in hduclas1 or extname == "SPECTRUM":
                         result["file_type"] = "spectrum"
                         result["is_event_list"] = False
                         result["error_message"] = (
@@ -541,7 +834,7 @@ class DataService(BaseService):
             # If we can't read headers, let the normal loading handle errors
             result["file_type"] = "unknown"
             result["is_event_list"] = True
-            result["details"]["error"] = str(e)
+            result["details"]["error"] = type(e).__name__
 
         return result
 
@@ -555,6 +848,77 @@ class DataService(BaseService):
         high_precision: bool = False,
         skip_checks: bool = False,
         notes: Optional[str] = None,
+        file_grant: str | None = None,
+        rmf_grant: Optional[str] = None,
+        *,
+        _file_source: GrantedReadFile | None = None,
+        _rmf_source: GrantedReadFile | None = None,
+        _cancellation_check=None,
+    ) -> Dict[str, Any]:
+        """Verify native grants and load only from retained anonymous streams."""
+        fmt = require_input_event_format(fmt)
+        name_error = validate_derived_name(name)
+        if name_error:
+            raise ValueError(name_error)
+        if (rmf_file is None) != (rmf_grant is None) and _rmf_source is None:
+            raise ValueError("rmf_file and rmf_grant must be provided together")
+        with ExitStack() as stack:
+            selected = stack.enter_context(
+                _open_granted_source(file_path, file_grant, _file_source)
+            )
+            retained_stream = stack.enter_context(
+                _spooled_copy(
+                    selected,
+                    max_bytes=MAX_FITS_INSPECT_BYTES,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            event_stream = stack.enter_context(
+                _decoded_event_stream(
+                    retained_stream,
+                    fmt=fmt,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            rmf_stream = None
+            if rmf_file is not None or _rmf_source is not None:
+                rmf_selected = stack.enter_context(
+                    _open_granted_source(
+                        rmf_file or "<retained RMF>", rmf_grant, _rmf_source
+                    )
+                )
+                rmf_stream = stack.enter_context(
+                    _spooled_copy(
+                        rmf_selected,
+                        max_bytes=MAX_RMF_BYTES,
+                        cancellation_check=_cancellation_check,
+                    )
+                )
+            return self._load_event_list_from_stream(
+                event_stream=event_stream,
+                source_name=Path(file_path).name,
+                name=name,
+                fmt=fmt,
+                rmf_stream=rmf_stream,
+                additional_columns=additional_columns,
+                high_precision=high_precision,
+                skip_checks=skip_checks,
+                notes=notes,
+                cancellation_check=_cancellation_check,
+            )
+
+    def _load_event_list_from_stream(
+        self,
+        event_stream: BinaryIO,
+        source_name: str,
+        name: str,
+        fmt: str,
+        rmf_stream: BinaryIO | None,
+        additional_columns: Optional[List[str]],
+        high_precision: bool,
+        skip_checks: bool,
+        notes: Optional[str],
+        cancellation_check=None,
     ) -> Dict[str, Any]:
         """
         Load an EventList from a file.
@@ -572,7 +936,6 @@ class DataService(BaseService):
         Returns:
             Result dictionary with the EventList data
         """
-        fmt = require_input_event_format(fmt)
         try:
             # Validate the name doesn't already exist
             if self.state.has_event_data(name):
@@ -584,23 +947,26 @@ class DataService(BaseService):
                 )
 
             # Auto-detect format from file extension if not explicitly specified differently
-            file_ext = os.path.splitext(file_path)[1].lower()
-            if file_ext in ['.hdf5', '.h5']:
-                fmt = 'hdf5'
-            elif file_ext in ['.ecsv']:
-                fmt = 'ascii.ecsv'
+            file_ext = os.path.splitext(source_name)[1].lower()
+            if file_ext in [".hdf5", ".h5"]:
+                fmt = "hdf5"
+            elif file_ext in [".ecsv"]:
+                fmt = "ascii.ecsv"
             # Otherwise use the provided fmt (default: ogip for FITS files)
 
             # Detect file type before attempting to load (for FITS files)
             is_fits = fmt in ("ogip", "fits")
             if is_fits:
-                file_type_info = self._detect_fits_file_type(file_path)
+                with _cloned_stream(
+                    event_stream, cancellation_check=cancellation_check
+                ) as detection_stream:
+                    file_type_info = self._detect_fits_file_type(detection_stream)
                 if not file_type_info["is_event_list"]:
                     return self.create_result(
                         success=False,
                         data=None,
                         message=f"Cannot load '{name}' as Event List: "
-                                f"{file_type_info['error_message']}",
+                        f"{file_type_info['error_message']}",
                         error=f"File type: {file_type_info['file_type']}",
                     )
 
@@ -610,18 +976,34 @@ class DataService(BaseService):
                 warnings.simplefilter("always")  # Catch all warnings
 
                 # Load the event list using Stingray
-                event_list = EventList.read(
-                    file_path,
+                _rewind(rmf_stream)
+                with _scientific_reader_source(
+                    event_stream,
                     fmt=fmt,
-                    rmf_file=rmf_file,
-                    additional_columns=additional_columns,
-                    high_precision=high_precision,
-                    skip_checks=skip_checks,
-                )
+                    cancellation_check=cancellation_check,
+                ) as reader_source:
+                    if fmt == "hdf5":
+                        if h5py is None:
+                            raise RuntimeError("HDF5 support is unavailable")
+                        with h5py.File(reader_source, "r") as hdf5_source:
+                            event_list = EventList.read(hdf5_source, fmt=fmt)
+                    else:
+                        event_list = EventList.read(
+                            reader_source,
+                            fmt=fmt,
+                            rmf_file=rmf_stream,
+                            additional_columns=additional_columns,
+                            high_precision=high_precision,
+                            skip_checks=skip_checks,
+                        )
 
                 # Collect warning messages
                 for w in caught_warnings:
-                    stingray_warnings.append(str(w.message))
+                    safe_warning = _safe_scientific_warning(w)
+                    if safe_warning is not None:
+                        stingray_warnings.append(safe_warning)
+                    if len(stingray_warnings) >= MAX_PUBLIC_SCIENTIFIC_WARNINGS:
+                        break
 
             # Fix inverted GTI intervals (common with unsorted data)
             # This must be done before storing, as Stingray's check_gtis
@@ -638,6 +1020,7 @@ class DataService(BaseService):
                 event_list.notes = notes
 
             # Add to state manager
+            _raise_if_cancelled(cancellation_check)
             self.state.add_event_data(name, event_list)
 
             # Validate GTI and collect warnings
@@ -652,7 +1035,7 @@ class DataService(BaseService):
                 "n_events": len(event_list.time),
                 "time_range": [
                     _to_python_float(event_list.time.min()),
-                    _to_python_float(event_list.time.max())
+                    _to_python_float(event_list.time.max()),
                 ],
                 "has_energy": event_list.energy is not None,
                 "has_pi": event_list.pi is not None,
@@ -670,8 +1053,12 @@ class DataService(BaseService):
             if stingray_warnings:
                 message += f" [Stingray warnings: {len(stingray_warnings)}]"
             if validation_issues:
-                error_count = sum(1 for v in validation_issues if v["severity"] == "error")
-                warn_count = sum(1 for v in validation_issues if v["severity"] == "warning")
+                error_count = sum(
+                    1 for v in validation_issues if v["severity"] == "error"
+                )
+                warn_count = sum(
+                    1 for v in validation_issues if v["severity"] == "warning"
+                )
                 if error_count > 0:
                     message += f" [Data errors: {error_count}]"
                 if warn_count > 0:
@@ -683,9 +1070,12 @@ class DataService(BaseService):
                 message=message,
             )
 
-        except Exception as e:
-            return self.handle_error(
-                e, "Loading event list", file_path=file_path, name=name, fmt=fmt
+        except Exception:
+            return self.create_result(
+                success=False,
+                data=None,
+                message="The selected event file could not be read",
+                error="event_read_failed",
             )
 
     def load_event_list_from_url(
@@ -694,124 +1084,175 @@ class DataService(BaseService):
         name: str,
         fmt: str = "ogip",
         rmf_file: Optional[str] = None,
+        rmf_grant: Optional[str] = None,
         additional_columns: Optional[List[str]] = None,
         high_precision: bool = False,
         skip_checks: bool = False,
+        notes: Optional[str] = None,
+        *,
+        _rmf_source: GrantedReadFile | None = None,
+        _cancellation_check=None,
     ) -> Dict[str, Any]:
-        """
-        Load an EventList from a URL.
-
-        Args:
-            url: URL to download the event file from
-            name: Name to assign to the loaded event list
-            fmt: File format
-            rmf_file: Optional path to local RMF file for energy calibration
-            additional_columns: Optional list of additional columns to read
-            high_precision: Use numpy.float128 for time array (pulsar timing)
-            skip_checks: Skip time ordering and GTI validation (performance)
-
-        Returns:
-            Result dictionary
-        """
+        """Fetch one bounded HTTPS source and load it from an anonymous spool."""
         fmt = require_input_event_format(fmt)
-        try:
-            # Validate the name doesn't already exist
-            if self.state.has_event_data(name):
-                return self.create_result(
-                    success=False,
-                    data=None,
-                    message=f"An event list with the name '{name}' already exists.",
-                    error=None,
+        name_error = validate_derived_name(name)
+        if name_error:
+            raise ValueError(name_error)
+        if (rmf_file is None) != (rmf_grant is None) and _rmf_source is None:
+            raise ValueError("rmf_file and rmf_grant must be provided together")
+        with ExitStack() as stack:
+            retained_rmf = _rmf_source
+            if retained_rmf is None and rmf_file is not None:
+                retained_rmf = stack.enter_context(
+                    _open_granted_source(rmf_file, rmf_grant, None)
                 )
-
-            # Download file to temporary location
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-
-            # Create temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f".{fmt}") as tmp_file:
-                for chunk in response.iter_content(chunk_size=1024):
-                    if chunk:
-                        tmp_file.write(chunk)
-                temp_filename = tmp_file.name
-
-            # Detect file type before attempting to load (for FITS files)
-            is_fits = fmt in ("ogip", "fits")
-            if is_fits:
-                file_type_info = self._detect_fits_file_type(temp_filename)
-                if not file_type_info["is_event_list"]:
-                    # Clean up temp file
-                    if os.path.exists(temp_filename):
-                        os.remove(temp_filename)
-                    return self.create_result(
-                        success=False,
-                        data=None,
-                        message=f"Cannot load '{name}' as Event List: "
-                                f"{file_type_info['error_message']}",
-                        error=f"File type: {file_type_info['file_type']}",
-                    )
-
-            # Load the event list with guaranteed temp file cleanup
-            try:
-                event_list = EventList.read(
-                    temp_filename,
+            return asyncio.run(
+                self._load_event_list_from_url_async(
+                    url=url,
+                    name=name,
                     fmt=fmt,
                     rmf_file=rmf_file,
+                    rmf_grant=rmf_grant,
                     additional_columns=additional_columns,
                     high_precision=high_precision,
                     skip_checks=skip_checks,
+                    notes=notes,
+                    rmf_source=retained_rmf,
+                    cancellation_check=_cancellation_check,
                 )
-            finally:
-                # Clean up temporary file even if loading fails
-                if os.path.exists(temp_filename):
-                    os.remove(temp_filename)
-
-            # Fix inverted GTI intervals (common with unsorted data)
-            gti_was_fixed = self._fix_inverted_gti(event_list)
-
-            # Add to state manager
-            self.state.add_event_data(name, event_list)
-
-            # Validate GTI and collect warnings
-            gti_warnings = self._validate_gti(event_list)
-            if gti_was_fixed:
-                gti_warnings.insert(0, "GTI intervals were inverted and automatically fixed.")
-
-            summary = {
-                "name": name,
-                "n_events": len(event_list.time),
-                "time_range": [
-                    _to_python_float(event_list.time.min()),
-                    _to_python_float(event_list.time.max())
-                ],
-                "has_energy": event_list.energy is not None,
-                "has_pi": event_list.pi is not None,
-                "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
-                "gti_warnings": gti_warnings if gti_warnings else None,
-            }
-
-            # Build message with warnings if present
-            message = f"EventList '{name}' loaded successfully from URL"
-            if gti_warnings:
-                message += f" [GTI warnings: {len(gti_warnings)}]"
-
-            return self.create_result(
-                success=True,
-                data=summary,
-                message=message,
             )
 
-        except requests.RequestException as e:
+    async def _load_event_list_from_url_async(
+        self,
+        *,
+        url: str,
+        name: str,
+        fmt: str,
+        rmf_file: str | None,
+        rmf_grant: str | None,
+        additional_columns: List[str] | None,
+        high_precision: bool,
+        skip_checks: bool,
+        notes: str | None,
+        rmf_source: GrantedReadFile | None,
+        cancellation_check,
+    ) -> Dict[str, Any]:
+        if self.state.has_event_data(name):
             return self.create_result(
                 success=False,
                 data=None,
-                message=f"Failed to download file from URL: {str(e)}",
-                error=str(e),
+                message=f"An event list with the name '{name}' already exists.",
+                error=None,
             )
-        except Exception as e:
-            return self.handle_error(
-                e, "Loading event list from URL", url=url, name=name, fmt=fmt
+
+        client = RemoteSourceClient(GENERAL_HTTPS_POLICY)
+        try:
+            with tempfile.SpooledTemporaryFile(
+                max_size=SPOOL_MEMORY_LIMIT, mode="w+b"
+            ) as event_stream:
+                async with client.stream(
+                    url,
+                    max_bytes=REMOTE_EVENT_LIMIT,
+                    cancellation_check=cancellation_check,
+                ) as remote_stream:
+                    async for chunk in remote_stream.aiter_bytes():
+                        event_stream.write(chunk)
+                event_stream.seek(0)
+                return await asyncio.to_thread(
+                    self._load_remote_stream,
+                    event_stream,
+                    name,
+                    fmt,
+                    rmf_file,
+                    rmf_grant,
+                    additional_columns,
+                    high_precision,
+                    skip_checks,
+                    notes,
+                    rmf_source,
+                    cancellation_check,
+                )
+        except RemoteSourceCancelled:
+            return self.create_result(
+                success=False,
+                data=None,
+                message="Remote load was cancelled",
+                error="cancelled",
             )
+        except RemoteSourceError as error:
+            return self.create_result(
+                success=False,
+                data=None,
+                message="The selected remote event source could not be retrieved",
+                error=type(error).__name__,
+            )
+        except Exception:
+            return self.create_result(
+                success=False,
+                data=None,
+                message="The selected remote event source could not be read",
+                error="remote_event_read_failed",
+            )
+
+    def _load_remote_stream(
+        self,
+        event_stream: BinaryIO,
+        name: str,
+        fmt: str,
+        rmf_file: str | None,
+        rmf_grant: str | None,
+        additional_columns: List[str] | None,
+        high_precision: bool,
+        skip_checks: bool,
+        notes: str | None,
+        rmf_source: GrantedReadFile | None,
+        cancellation_check=None,
+    ) -> Dict[str, Any]:
+        if (rmf_file is None) != (rmf_grant is None) and rmf_source is None:
+            raise ValueError("rmf_file and rmf_grant must be provided together")
+        with ExitStack() as stack:
+            rmf_stream = None
+            if rmf_file is not None or rmf_source is not None:
+                selected = stack.enter_context(
+                    _open_granted_source(
+                        rmf_file or "<retained RMF>", rmf_grant, rmf_source
+                    )
+                )
+                rmf_stream = stack.enter_context(
+                    _spooled_copy(
+                        selected,
+                        max_bytes=MAX_RMF_BYTES,
+                        cancellation_check=cancellation_check,
+                    )
+                )
+            decoded_stream = stack.enter_context(
+                _decoded_event_stream(
+                    event_stream,
+                    fmt=fmt,
+                    cancellation_check=cancellation_check,
+                )
+            )
+            result = self._load_event_list_from_stream(
+                event_stream=decoded_stream,
+                source_name=(
+                    "remote.hdf5"
+                    if fmt == "hdf5"
+                    else "remote.ecsv"
+                    if fmt == "ascii.ecsv"
+                    else "remote.evt"
+                ),
+                name=name,
+                fmt=fmt,
+                rmf_stream=rmf_stream,
+                additional_columns=additional_columns,
+                high_precision=high_precision,
+                skip_checks=skip_checks,
+                notes=notes,
+                cancellation_check=cancellation_check,
+            )
+            if result.get("success"):
+                result["message"] = f"EventList '{name}' loaded successfully from URL"
+            return result
 
     async def load_event_list_from_url_stream(
         self,
@@ -819,221 +1260,127 @@ class DataService(BaseService):
         name: str,
         fmt: str = "ogip",
         rmf_file: Optional[str] = None,
+        rmf_grant: Optional[str] = None,
         additional_columns: Optional[List[str]] = None,
         high_precision: bool = False,
         skip_checks: bool = False,
         notes: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """
-        Load an EventList from a URL with SSE streaming for progress updates.
-
-        Yields progress events during download and processing, allowing
-        the frontend to show real-time progress.
-
-        Args:
-            url: URL to download the event file from
-            name: Name to assign to the loaded event list
-            fmt: File format
-            rmf_file: Optional path to local RMF file for energy calibration
-            additional_columns: Optional list of additional columns to read
-            high_precision: Use numpy.float128 for time array (pulsar timing)
-            skip_checks: Skip time ordering and GTI validation (performance)
-            notes: Optional notes/comments to attach to the event list
-
-        Yields:
-            Dict events with types: 'progress', 'processing', 'complete', 'error'
-        """
+        """Stream bounded remote progress without exposing the selected URL."""
         fmt = require_input_event_format(fmt)
+        name_error = validate_derived_name(name)
+        if name_error:
+            raise ValueError(name_error)
+        if self.state.has_event_data(name):
+            yield {
+                "type": "error",
+                "error": f"An event list with the name '{name}' already exists.",
+            }
+            return
 
-        import httpx
-
+        cancellation_signal = threading.Event()
+        client = RemoteSourceClient(GENERAL_HTTPS_POLICY)
         try:
-            # Validate the name doesn't already exist
-            if self.state.has_event_data(name):
-                yield {
-                    "type": "error",
-                    "error": f"An event list with the name '{name}' already exists.",
-                }
-                return
+            with ExitStack() as stack:
+                if (rmf_file is None) != (rmf_grant is None):
+                    raise ValueError("rmf_file and rmf_grant must be provided together")
+                retained_rmf = None
+                if rmf_file is not None:
+                    retained_rmf = stack.enter_context(
+                        _open_granted_source(rmf_file, rmf_grant, None)
+                    )
+                event_stream = stack.enter_context(
+                    tempfile.SpooledTemporaryFile(
+                        max_size=SPOOL_MEMORY_LIMIT, mode="w+b"
+                    )
+                )
+                async with client.stream(
+                    url,
+                    max_bytes=REMOTE_EVENT_LIMIT,
+                    cancellation_check=cancellation_signal.is_set,
+                ) as remote_stream:
+                    total_bytes = remote_stream.info.content_length or 0
+                    async for chunk in remote_stream.aiter_bytes():
+                        event_stream.write(chunk)
+                        downloaded = remote_stream.bytes_read
+                        percent = (
+                            downloaded / total_bytes * 100 if total_bytes > 0 else 0
+                        )
+                        yield {
+                            "type": "progress",
+                            "bytes_downloaded": downloaded,
+                            "total_bytes": total_bytes,
+                            "percent": round(percent, 1),
+                        }
+                        await asyncio.sleep(0)
 
-            # Start download with progress tracking
-            temp_filename = None
-            try:
-                async with httpx.AsyncClient(timeout=300.0) as client:
-                    # Use streaming response to track download progress
-                    async with client.stream("GET", url) as response:
-                        response.raise_for_status()
-
-                        # Get total file size if available
-                        total_bytes = int(response.headers.get("content-length", 0))
-
-                        # Create temporary file
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{fmt}") as tmp_file:
-                            temp_filename = tmp_file.name
-                            bytes_downloaded = 0
-
-                            # Download in chunks with progress updates
-                            async for chunk in response.aiter_bytes(chunk_size=65536):
-                                tmp_file.write(chunk)
-                                bytes_downloaded += len(chunk)
-
-                                # Yield progress event
-                                percent = (bytes_downloaded / total_bytes * 100) if total_bytes > 0 else 0
-                                yield {
-                                    "type": "progress",
-                                    "bytes_downloaded": bytes_downloaded,
-                                    "total_bytes": total_bytes,
-                                    "percent": round(percent, 1),
-                                }
-
-                                # Allow event loop to process
-                                await asyncio.sleep(0)
-
-                # Yield processing event
                 yield {
                     "type": "processing",
                     "message": "Download complete, loading event list...",
                 }
-                await asyncio.sleep(0)
-
-                # Detect file type before attempting to load (for FITS files)
-                is_fits = fmt in ("ogip", "fits")
-                if is_fits:
-                    file_type_info = self._detect_fits_file_type(temp_filename)
-                    if not file_type_info["is_event_list"]:
-                        # Clean up temp file
-                        if temp_filename and os.path.exists(temp_filename):
-                            os.remove(temp_filename)
-                        yield {
-                            "type": "error",
-                            "error": f"Cannot load '{name}' as Event List: {file_type_info['error_message']}",
-                        }
-                        return
-
-                # Load the event list (blocking, but typically fast after download)
-                def _load_event_list():
-                    return EventList.read(
-                        temp_filename,
-                        fmt=fmt,
-                        rmf_file=rmf_file,
-                        additional_columns=additional_columns,
-                        high_precision=high_precision,
-                        skip_checks=skip_checks,
+                event_stream.seek(0)
+                processing_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._load_remote_stream,
+                        event_stream,
+                        name,
+                        fmt,
+                        rmf_file,
+                        rmf_grant,
+                        additional_columns,
+                        high_precision,
+                        skip_checks,
+                        notes,
+                        retained_rmf,
+                        cancellation_signal.is_set,
                     )
-
-                # Run blocking I/O in thread pool
-                loop = asyncio.get_event_loop()
-                event_list = await loop.run_in_executor(None, _load_event_list)
-
-            finally:
-                # Clean up temporary file
-                if temp_filename and os.path.exists(temp_filename):
-                    os.remove(temp_filename)
-
-            # Fix inverted GTI intervals (common with unsorted data)
-            gti_was_fixed = self._fix_inverted_gti(event_list)
-
-            # Add to state manager with notes
-            self.state.add_event_data(name, event_list, notes=notes)
-
-            # Validate GTI and collect warnings
-            gti_warnings = self._validate_gti(event_list)
-            if gti_was_fixed:
-                gti_warnings.insert(0, "GTI intervals were inverted and automatically fixed.")
-
-            # Validate data quality
-            validation_issues = self._validate_data_quality(event_list)
-
-            summary = {
-                "name": name,
-                "n_events": len(event_list.time),
-                "time_range": [
-                    _to_python_float(event_list.time.min()),
-                    _to_python_float(event_list.time.max())
-                ],
-                "has_energy": event_list.energy is not None,
-                "has_pi": event_list.pi is not None,
-                "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
-                "gti_warnings": gti_warnings if gti_warnings else None,
-                "validation_issues": validation_issues,
-                "notes": notes,
-            }
-
-            # Build message with warnings if present
-            message = f"EventList '{name}' loaded successfully from URL"
-            if gti_warnings:
-                message += f" [GTI warnings: {len(gti_warnings)}]"
-
-            yield {
-                "type": "complete",
-                "data": summary,
-                "message": message,
-            }
-
-        except httpx.HTTPStatusError as e:
-            yield {
-                "type": "error",
-                "error": f"HTTP error {e.response.status_code}: {e.response.reason_phrase}",
-            }
-        except httpx.RequestError as e:
-            yield {
-                "type": "error",
-                "error": f"Failed to download file from URL: {str(e)}",
-            }
-        except Exception as e:
-            yield {
-                "type": "error",
-                "error": f"Error loading event list: {str(e)}",
-            }
-
-    def save_event_list(
-        self,
-        name: str,
-        file_path: str,
-        fmt: str = "hdf5",
-    ) -> Dict[str, Any]:
-        """
-        Save an EventList to disk.
-
-        Args:
-            name: Name of the event list in state
-            file_path: Path where to save the file
-            fmt: File format to save as ('hdf5' or 'ascii.ecsv')
-
-        Returns:
-            Result dictionary
-        """
-        fmt = require_output_event_format(fmt)
-        try:
-            if not self.state.has_event_data(name):
-                return self.create_result(
-                    success=False,
-                    data=None,
-                    message=f"No event list found with name '{name}'",
-                    error=None,
                 )
-
-            event_list = self.state.get_event_data(name)
-
-            # Ensure directory exists (handle case where file_path has no directory)
-            dirname = os.path.dirname(file_path)
-            if dirname:
-                os.makedirs(dirname, exist_ok=True)
-
-            # Preserve the caller's explicitly validated format.  Never
-            # reinterpret an unknown value as a different on-disk format.
-            event_list.write(file_path, fmt=fmt)
-
-            return self.create_result(
-                success=True,
-                data={"file_path": file_path},
-                message=f"EventList '{name}' saved to '{file_path}' (format: {fmt})",
-            )
-
-        except Exception as e:
-            return self.handle_error(
-                e, "Saving event list", name=name, file_path=file_path, fmt=fmt
-            )
+                try:
+                    result = await asyncio.shield(processing_task)
+                except asyncio.CancelledError:
+                    # to_thread workers are not cancelled with their awaiting
+                    # task. Signal the worker and drain it before ExitStack
+                    # closes the pinned RMF and anonymous event snapshot.
+                    cancellation_signal.set()
+                    while not processing_task.done():
+                        try:
+                            await asyncio.shield(processing_task)
+                        except asyncio.CancelledError:
+                            # Repeated disconnect/cancel signals must not break
+                            # ownership before the non-cancellable thread exits.
+                            continue
+                    try:
+                        processing_task.result()
+                    except BaseException:
+                        pass
+                    raise
+                if result.get("success"):
+                    yield {
+                        "type": "complete",
+                        "data": result.get("data"),
+                        "message": result.get("message"),
+                    }
+                else:
+                    yield {
+                        "type": "error",
+                        "error": result.get("message") or "Remote load failed",
+                    }
+        except RemoteSourceCancelled:
+            yield {"type": "error", "error": "Remote load was cancelled"}
+        except RemoteSourceError:
+            yield {
+                "type": "error",
+                "error": "The selected remote event source could not be retrieved",
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            yield {
+                "type": "error",
+                "error": "Error loading the selected remote event list",
+            }
+        finally:
+            cancellation_signal.set()
 
     def delete_event_list(self, name: str) -> Dict[str, Any]:
         """Delete an EventList from state."""
@@ -1085,7 +1432,7 @@ class DataService(BaseService):
                 "n_events": len(event_list.time),
                 "time_range": [
                     _to_python_float(event_list.time.min()),
-                    _to_python_float(event_list.time.max())
+                    _to_python_float(event_list.time.max()),
                 ],
                 "duration": duration,
                 "has_energy": event_list.energy is not None,
@@ -1100,21 +1447,23 @@ class DataService(BaseService):
                     [_to_python_float(g[0]), _to_python_float(g[1])]
                     for g in event_list.gti
                 ]
-                info["total_gti_time"] = _to_python_float(sum(g[1] - g[0] for g in event_list.gti))
+                info["total_gti_time"] = _to_python_float(
+                    sum(g[1] - g[0] for g in event_list.gti)
+                )
 
             # Energy/PI range
             if event_list.energy is not None:
                 info["energy_range"] = [
                     _to_python_float(event_list.energy.min()),
-                    _to_python_float(event_list.energy.max())
+                    _to_python_float(event_list.energy.max()),
                 ]
             if event_list.pi is not None:
                 info["pi_range"] = [int(event_list.pi.min()), int(event_list.pi.max())]
 
             # Mission metadata (if available)
-            if hasattr(event_list, 'mission') and event_list.mission:
+            if hasattr(event_list, "mission") and event_list.mission:
                 info["mission"] = str(event_list.mission)
-            if hasattr(event_list, 'instr') and event_list.instr:
+            if hasattr(event_list, "instr") and event_list.instr:
                 info["instrument"] = str(event_list.instr)
 
             # Time statistics
@@ -1122,7 +1471,11 @@ class DataService(BaseService):
                 # Sort times to get accurate time differences
                 sorted_times = np.sort(event_list.time)
                 time_diffs = sorted_times[1:] - sorted_times[:-1]
-                info["mean_count_rate"] = _to_python_float(len(event_list.time) / duration) if duration and duration > 0 else 0
+                info["mean_count_rate"] = (
+                    _to_python_float(len(event_list.time) / duration)
+                    if duration and duration > 0
+                    else 0
+                )
                 info["min_time_diff"] = _to_python_float(time_diffs.min())
                 info["max_time_diff"] = _to_python_float(time_diffs.max())
                 info["mean_time_diff"] = _to_python_float(np.mean(time_diffs))
@@ -1137,13 +1490,15 @@ class DataService(BaseService):
                     gti_events = int(np.sum(mask))
                     gti_duration = float(stop - start)
                     rate = gti_events / gti_duration if gti_duration > 0 else 0
-                    per_gti_rates.append({
-                        "start": _to_python_float(start),
-                        "stop": _to_python_float(stop),
-                        "events": gti_events,
-                        "duration": _to_python_float(gti_duration),
-                        "rate": _to_python_float(rate),
-                    })
+                    per_gti_rates.append(
+                        {
+                            "start": _to_python_float(start),
+                            "stop": _to_python_float(stop),
+                            "events": gti_events,
+                            "duration": _to_python_float(gti_duration),
+                            "rate": _to_python_float(rate),
+                        }
+                    )
                 info["per_gti_rates"] = per_gti_rates
 
             # Notes
@@ -1165,17 +1520,21 @@ class DataService(BaseService):
 
             summaries = []
             for name, event_list in event_data:
-                summaries.append({
-                    "name": name,
-                    "n_events": len(event_list.time),
-                    "time_range": [
-                        _to_python_float(event_list.time.min()),
-                        _to_python_float(event_list.time.max())
-                    ],
-                    "has_energy": event_list.energy is not None,
-                    "has_pi": event_list.pi is not None,
-                    "gti_count": len(event_list.gti) if event_list.gti is not None else 0,
-                })
+                summaries.append(
+                    {
+                        "name": name,
+                        "n_events": len(event_list.time),
+                        "time_range": [
+                            _to_python_float(event_list.time.min()),
+                            _to_python_float(event_list.time.max()),
+                        ],
+                        "has_energy": event_list.energy is not None,
+                        "has_pi": event_list.pi is not None,
+                        "gti_count": len(event_list.gti)
+                        if event_list.gti is not None
+                        else 0,
+                    }
+                )
 
             return self.create_result(
                 success=True,
@@ -1186,12 +1545,20 @@ class DataService(BaseService):
         except Exception as e:
             return self.handle_error(e, "Listing event lists")
 
-    def check_file_size(self, file_path: str) -> Dict[str, Any]:
+    def check_file_size(
+        self,
+        file_path: str,
+        file_grant: str | None = None,
+        *,
+        _file_source: GrantedReadFile | None = None,
+        _cancellation_check=None,
+    ) -> Dict[str, Any]:
         """Check file size and provide loading recommendations based on available RAM."""
         try:
-            file_size = os.path.getsize(file_path)
-            file_size_mb = file_size / (1024**2)
-            file_size_gb = file_size / (1024**3)
+            with _open_granted_source(file_path, file_grant, _file_source) as selected:
+                file_size = selected.size_bytes
+                file_size_mb = file_size / (1024**2)
+                file_size_gb = file_size / (1024**3)
 
             # Get memory info first - we need this for smart recommendations
             memory_info = self._get_memory_info()
@@ -1199,21 +1566,27 @@ class DataService(BaseService):
 
             # Estimate memory needed to load the EventList
             # FITS files typically expand to ~3x file size in memory
-            estimated_memory_mb = self._estimate_memory_usage(file_size, "fits") / (1024**2)
+            estimated_memory_mb = self._estimate_memory_usage(file_size, "fits") / (
+                1024**2
+            )
 
             # Calculate what percentage of available RAM this would use
-            ram_usage_percent = (estimated_memory_mb / available_ram_mb) * 100 if available_ram_mb > 0 else 100
+            ram_usage_percent = (
+                (estimated_memory_mb / available_ram_mb) * 100
+                if available_ram_mb > 0
+                else 100
+            )
 
             # Determine risk level based on RAM usage percentage
             # This is smarter than just file size - adapts to user's system
             if ram_usage_percent > 80:
                 risk_level = "critical"  # Would use >80% of available RAM
             elif ram_usage_percent > 50:
-                risk_level = "risky"     # Would use >50% of available RAM
+                risk_level = "risky"  # Would use >50% of available RAM
             elif ram_usage_percent > 30:
-                risk_level = "caution"   # Would use >30% of available RAM
+                risk_level = "caution"  # Would use >30% of available RAM
             else:
-                risk_level = "safe"      # Would use <30% of available RAM
+                risk_level = "safe"  # Would use <30% of available RAM
 
             # Recommend lazy loading if it would use more than 30% of available RAM
             recommend_lazy = ram_usage_percent > 30
@@ -1233,8 +1606,13 @@ class DataService(BaseService):
                 message=f"File size: {file_size_mb:.2f} MB, Est. RAM usage: {ram_usage_percent:.1f}% of available",
             )
 
-        except Exception as e:
-            return self.handle_error(e, "Checking file size", file_path=file_path)
+        except Exception:
+            return self.create_result(
+                success=False,
+                data=None,
+                message="The selected file size could not be checked",
+                error="file_size_check_failed",
+            )
 
     def clear_all_event_lists(self) -> Dict[str, Any]:
         """Clear all loaded event lists from memory."""
@@ -1281,19 +1659,20 @@ class DataService(BaseService):
 
     def _can_load_safely(
         self,
-        file_path: str,
+        file_size: int,
         safety_margin: float = 0.5,
         fmt: str = "fits",
     ) -> bool:
         """Check if file can be safely loaded into memory."""
         fmt = require_input_event_format(fmt)
-        file_size = os.path.getsize(file_path)
         available_ram = psutil.virtual_memory().available
         needed_ram = self._estimate_memory_usage(file_size, fmt)
         safe_limit = available_ram * safety_margin
         return needed_ram < safe_limit
 
-    def get_event_list_full_preview(self, name: str, time_limit: int = 10) -> Dict[str, Any]:
+    def get_event_list_full_preview(
+        self, name: str, time_limit: int = 10
+    ) -> Dict[str, Any]:
         """
         Get full preview of an EventList with all attributes.
 
@@ -1324,10 +1703,11 @@ class DataService(BaseService):
                 "n_events": len(event_list.time),
                 "time_range": [
                     _to_python_float(event_list.time.min()),
-                    _to_python_float(event_list.time.max())
+                    _to_python_float(event_list.time.max()),
                 ],
-                "duration": _to_python_float(event_list.time.max() - event_list.time.min()),
-
+                "duration": _to_python_float(
+                    event_list.time.max() - event_list.time.min()
+                ),
                 # Energy data
                 "has_energy": event_list.energy is not None,
                 "energy_preview": (
@@ -1338,12 +1718,11 @@ class DataService(BaseService):
                 "energy_range": (
                     [
                         _to_python_float(event_list.energy.min()),
-                        _to_python_float(event_list.energy.max())
+                        _to_python_float(event_list.energy.max()),
                     ]
                     if event_list.energy is not None
                     else None
                 ),
-
                 # PI data
                 "has_pi": event_list.pi is not None,
                 "pi_preview": (
@@ -1356,29 +1735,36 @@ class DataService(BaseService):
                     if event_list.pi is not None
                     else None
                 ),
-
                 # GTI data - sort each interval to handle inverted GTIs from unsorted data
                 # When Stingray loads unsorted data without a GTI extension, it sets
                 # GTI to [time[0], time[-1]] which can have start > stop for unsorted times
                 "gti_count": 0,  # Will be set below
                 "gti_list": None,  # Will be set below
                 "total_gti_time": None,  # Will be set below
-
                 # Reference time - mjdref is often numpy.longdouble
                 "mjdref": _to_python_float(event_list.mjdref),
-
                 # Metadata (if available) - convert to string to be safe
-                "mission": str(getattr(event_list, "mission", None)) if getattr(event_list, "mission", None) else None,
-                "instrument": str(getattr(event_list, "instr", None)) if getattr(event_list, "instr", None) else None,
+                "mission": str(getattr(event_list, "mission", None))
+                if getattr(event_list, "mission", None)
+                else None,
+                "instrument": str(getattr(event_list, "instr", None))
+                if getattr(event_list, "instr", None)
+                else None,
                 "detector_id": (
                     str(getattr(event_list, "detector_id", None))
-                    if hasattr(event_list, "detector_id") and event_list.detector_id is not None
+                    if hasattr(event_list, "detector_id")
+                    and event_list.detector_id is not None
                     else None
                 ),
-                "ephem": str(getattr(event_list, "ephem", None)) if getattr(event_list, "ephem", None) else None,
-                "timeref": str(getattr(event_list, "timeref", None)) if getattr(event_list, "timeref", None) else None,
-                "timesys": str(getattr(event_list, "timesys", None)) if getattr(event_list, "timesys", None) else None,
-
+                "ephem": str(getattr(event_list, "ephem", None))
+                if getattr(event_list, "ephem", None)
+                else None,
+                "timeref": str(getattr(event_list, "timeref", None))
+                if getattr(event_list, "timeref", None)
+                else None,
+                "timesys": str(getattr(event_list, "timesys", None))
+                if getattr(event_list, "timesys", None)
+                else None,
                 # Statistics
                 "mean_count_rate": None,
                 "min_time_diff": None,
@@ -1392,7 +1778,10 @@ class DataService(BaseService):
             if event_list.gti is not None and len(event_list.gti) > 0:
                 # Sort each GTI interval to ensure [start, stop] order (start <= stop)
                 valid_gti = [
-                    [_to_python_float(min(g[0], g[1])), _to_python_float(max(g[0], g[1]))]
+                    [
+                        _to_python_float(min(g[0], g[1])),
+                        _to_python_float(max(g[0], g[1])),
+                    ]
                     for g in event_list.gti
                 ]
             preview["gti_count"] = len(valid_gti) if valid_gti else 0
@@ -1406,7 +1795,9 @@ class DataService(BaseService):
             # Calculate time statistics
             duration = preview["duration"]
             if duration and duration > 0:
-                preview["mean_count_rate"] = _to_python_float(len(event_list.time) / duration)
+                preview["mean_count_rate"] = _to_python_float(
+                    len(event_list.time) / duration
+                )
 
             if len(event_list.time) > 1:
                 sorted_times = np.sort(event_list.time)
@@ -1427,22 +1818,37 @@ class DataService(BaseService):
                     gti_events = int(np.sum(mask))
                     gti_duration = float(stop - start)
                     rate = gti_events / gti_duration if gti_duration > 0 else 0
-                    per_gti_rates.append({
-                        "start": _to_python_float(start),
-                        "stop": _to_python_float(stop),
-                        "events": gti_events,
-                        "duration": _to_python_float(gti_duration),
-                        "rate": _to_python_float(rate),
-                    })
+                    per_gti_rates.append(
+                        {
+                            "start": _to_python_float(start),
+                            "stop": _to_python_float(stop),
+                            "events": gti_events,
+                            "duration": _to_python_float(gti_duration),
+                            "rate": _to_python_float(rate),
+                        }
+                    )
                 preview["per_gti_rates"] = per_gti_rates
 
             # Check for additional columns
             additional_cols = []
             for attr in dir(event_list):
                 if not attr.startswith("_") and attr not in [
-                    "time", "energy", "pi", "gti", "mjdref", "mission", "instr",
-                    "detector_id", "ephem", "timeref", "timesys", "header",
-                    "notes", "ncounts", "dt", "n"
+                    "time",
+                    "energy",
+                    "pi",
+                    "gti",
+                    "mjdref",
+                    "mission",
+                    "instr",
+                    "detector_id",
+                    "ephem",
+                    "timeref",
+                    "timesys",
+                    "header",
+                    "notes",
+                    "ncounts",
+                    "dt",
+                    "n",
                 ]:
                     val = getattr(event_list, attr, None)
                     if isinstance(val, np.ndarray) and len(val) == len(event_list.time):
@@ -1454,7 +1860,9 @@ class DataService(BaseService):
 
             # Data quality validation
             validation_issues = self._validate_data_quality(event_list)
-            preview["validation_issues"] = validation_issues if validation_issues else None
+            preview["validation_issues"] = (
+                validation_issues if validation_issues else None
+            )
 
             # FITS header information
             header_info = self._extract_fits_header(event_list)
@@ -1503,6 +1911,83 @@ class DataService(BaseService):
         end_time: float,
         fmt: str = "ogip",
         notes: Optional[str] = None,
+        file_grant: str | None = None,
+        *,
+        _file_source: GrantedReadFile | None = None,
+        _cancellation_check=None,
+    ) -> Dict[str, Any]:
+        """Load a time slice after retaining the exact granted input."""
+        fmt = require_input_event_format(fmt)
+        name_error = validate_derived_name(name)
+        if name_error:
+            raise ValueError(name_error)
+        with ExitStack() as stack:
+            selected = stack.enter_context(
+                _open_granted_source(file_path, file_grant, _file_source)
+            )
+            retained_event_stream = stack.enter_context(
+                _spooled_copy(
+                    selected,
+                    max_bytes=MAX_FITS_INSPECT_BYTES,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            retained_times_stream = stack.enter_context(
+                _spooled_copy(
+                    selected,
+                    max_bytes=MAX_FITS_INSPECT_BYTES,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            event_stream = stack.enter_context(
+                _decoded_event_stream(
+                    retained_event_stream,
+                    fmt=fmt,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            times_stream = stack.enter_context(
+                _decoded_event_stream(
+                    retained_times_stream,
+                    fmt=fmt,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            event_source = stack.enter_context(
+                _scientific_reader_source(
+                    event_stream,
+                    fmt=fmt,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            times_source = stack.enter_context(
+                _scientific_reader_source(
+                    times_stream,
+                    fmt=fmt,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            return self._load_event_list_by_time_range_from_stream(
+                event_source,
+                times_source,
+                name,
+                start_time,
+                end_time,
+                fmt,
+                notes,
+                _cancellation_check,
+            )
+
+    def _load_event_list_by_time_range_from_stream(
+        self,
+        event_stream: BinaryIO | str,
+        times_stream: BinaryIO | str,
+        name: str,
+        start_time: float,
+        end_time: float,
+        fmt: str,
+        notes: Optional[str],
+        cancellation_check=None,
     ) -> Dict[str, Any]:
         """
         Load events within a specific time range using true lazy loading.
@@ -1521,7 +2006,6 @@ class DataService(BaseService):
         Returns:
             Result dictionary with the filtered EventList
         """
-        fmt = require_input_event_format(fmt)
         try:
             # Validate the name doesn't already exist
             if self.state.has_event_data(name):
@@ -1543,29 +2027,39 @@ class DataService(BaseService):
                 )
 
             # Detect file type before attempting to load
-            file_type_info = self._detect_fits_file_type(file_path)
+            if isinstance(event_stream, str):
+                file_type_info = self._detect_fits_file_type(event_stream)
+            else:
+                with _cloned_stream(
+                    event_stream, cancellation_check=cancellation_check
+                ) as detection_stream:
+                    file_type_info = self._detect_fits_file_type(detection_stream)
             if not file_type_info["is_event_list"]:
                 return self.create_result(
                     success=False,
                     data=None,
                     message=f"Cannot load '{name}' as Event List: "
-                            f"{file_type_info['error_message']}",
+                    f"{file_type_info['error_message']}",
                     error=f"File type: {file_type_info['file_type']}",
                 )
 
             # Create the reader
+            if not isinstance(event_stream, str):
+                _rewind(event_stream)
             reader = FITSTimeseriesReader(
-                file_path, output_class=EventList, data_kind="events"
+                event_stream, output_class=EventList, data_kind="events"
             )
 
             # Get file metadata
             original_gti = reader.gti
-            mjdref = getattr(reader, 'mjdref', 0.0)
-            mission = getattr(reader, 'mission', None)
-            instr = getattr(reader, 'instr', None)
+            mjdref = getattr(reader, "mjdref", 0.0)
+            mission = getattr(reader, "mission", None)
+            instr = getattr(reader, "instr", None)
 
             # Get total event count for reporting
-            times_reader = FITSTimeseriesReader(file_path, data_kind="times")
+            if not isinstance(times_stream, str):
+                _rewind(times_stream)
+            times_reader = FITSTimeseriesReader(times_stream, data_kind="times")
             total_events = len(times_reader[:])
 
             # Calculate absolute times if relative times are provided
@@ -1631,12 +2125,15 @@ class DataService(BaseService):
             gti_was_fixed = self._fix_inverted_gti(event_list)
 
             # Add to state manager
+            _raise_if_cancelled(cancellation_check)
             self.state.add_event_data(name, event_list)
 
             # Validate GTI and collect warnings
             gti_warnings = self._validate_gti(event_list)
             if gti_was_fixed:
-                gti_warnings.insert(0, "GTI intervals were inverted and automatically fixed.")
+                gti_warnings.insert(
+                    0, "GTI intervals were inverted and automatically fixed."
+                )
 
             # Run comprehensive data quality validation
             validation_issues = self._validate_data_quality(event_list)
@@ -1649,7 +2146,7 @@ class DataService(BaseService):
                 "n_events": len(event_list.time),
                 "time_range": [
                     _to_python_float(event_list.time.min()),
-                    _to_python_float(event_list.time.max())
+                    _to_python_float(event_list.time.max()),
                 ],
                 "has_energy": event_list.energy is not None,
                 "has_pi": event_list.pi is not None,
@@ -1664,7 +2161,9 @@ class DataService(BaseService):
                     "loaded_duration": loaded_duration,
                     "total_file_duration": total_duration,
                     "total_file_events": total_events,
-                    "events_loaded_percent": (len(event_list.time) / total_events * 100) if total_events > 0 else 0,
+                    "events_loaded_percent": (len(event_list.time) / total_events * 100)
+                    if total_events > 0
+                    else 0,
                 },
             }
 
@@ -1676,8 +2175,12 @@ class DataService(BaseService):
             if gti_warnings:
                 message += f" [GTI warnings: {len(gti_warnings)}]"
             if validation_issues:
-                error_count = sum(1 for v in validation_issues if v["severity"] == "error")
-                warn_count = sum(1 for v in validation_issues if v["severity"] == "warning")
+                error_count = sum(
+                    1 for v in validation_issues if v["severity"] == "error"
+                )
+                warn_count = sum(
+                    1 for v in validation_issues if v["severity"] == "warning"
+                )
                 if error_count > 0:
                     message += f" [Data errors: {error_count}]"
                 if warn_count > 0:
@@ -1689,10 +2192,12 @@ class DataService(BaseService):
                 message=message,
             )
 
-        except Exception as e:
-            return self.handle_error(
-                e, "Loading event list by time range",
-                file_path=file_path, name=name, start_time=start_time, end_time=end_time
+        except Exception:
+            return self.create_result(
+                success=False,
+                data=None,
+                message="The selected event time range could not be read",
+                error="event_range_read_failed",
             )
 
     def load_event_list_by_event_count(
@@ -1703,6 +2208,83 @@ class DataService(BaseService):
         count: int = 10000,
         fmt: str = "ogip",
         notes: Optional[str] = None,
+        file_grant: str | None = None,
+        *,
+        _file_source: GrantedReadFile | None = None,
+        _cancellation_check=None,
+    ) -> Dict[str, Any]:
+        """Load an event slice after retaining the exact granted input."""
+        fmt = require_input_event_format(fmt)
+        name_error = validate_derived_name(name)
+        if name_error:
+            raise ValueError(name_error)
+        with ExitStack() as stack:
+            selected = stack.enter_context(
+                _open_granted_source(file_path, file_grant, _file_source)
+            )
+            retained_event_stream = stack.enter_context(
+                _spooled_copy(
+                    selected,
+                    max_bytes=MAX_FITS_INSPECT_BYTES,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            retained_times_stream = stack.enter_context(
+                _spooled_copy(
+                    selected,
+                    max_bytes=MAX_FITS_INSPECT_BYTES,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            event_stream = stack.enter_context(
+                _decoded_event_stream(
+                    retained_event_stream,
+                    fmt=fmt,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            times_stream = stack.enter_context(
+                _decoded_event_stream(
+                    retained_times_stream,
+                    fmt=fmt,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            event_source = stack.enter_context(
+                _scientific_reader_source(
+                    event_stream,
+                    fmt=fmt,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            times_source = stack.enter_context(
+                _scientific_reader_source(
+                    times_stream,
+                    fmt=fmt,
+                    cancellation_check=_cancellation_check,
+                )
+            )
+            return self._load_event_list_by_event_count_from_stream(
+                event_source,
+                times_source,
+                name,
+                start_index,
+                count,
+                fmt,
+                notes,
+                _cancellation_check,
+            )
+
+    def _load_event_list_by_event_count_from_stream(
+        self,
+        event_stream: BinaryIO | str,
+        times_stream: BinaryIO | str,
+        name: str,
+        start_index: int,
+        count: int,
+        fmt: str,
+        notes: Optional[str],
+        cancellation_check=None,
     ) -> Dict[str, Any]:
         """
         Load a specific number of events using true lazy loading.
@@ -1721,7 +2303,6 @@ class DataService(BaseService):
         Returns:
             Result dictionary with the sliced EventList
         """
-        fmt = require_input_event_format(fmt)
         try:
             # Validate the name doesn't already exist
             if self.state.has_event_data(name):
@@ -1743,36 +2324,50 @@ class DataService(BaseService):
                 )
 
             # Detect file type before attempting to load
-            file_type_info = self._detect_fits_file_type(file_path)
+            if isinstance(event_stream, str):
+                file_type_info = self._detect_fits_file_type(event_stream)
+            else:
+                with _cloned_stream(
+                    event_stream, cancellation_check=cancellation_check
+                ) as detection_stream:
+                    file_type_info = self._detect_fits_file_type(detection_stream)
             if not file_type_info["is_event_list"]:
                 return self.create_result(
                     success=False,
                     data=None,
                     message=f"Cannot load '{name}' as Event List: "
-                            f"{file_type_info['error_message']}",
+                    f"{file_type_info['error_message']}",
                     error=f"File type: {file_type_info['file_type']}",
                 )
 
             # Create the reader
+            if not isinstance(event_stream, str):
+                _rewind(event_stream)
             reader = FITSTimeseriesReader(
-                file_path, output_class=EventList, data_kind="events"
+                event_stream, output_class=EventList, data_kind="events"
             )
 
             # Get file metadata
             original_gti = reader.gti
-            mjdref = getattr(reader, 'mjdref', 0.0)
-            mission = getattr(reader, 'mission', None)
-            instr = getattr(reader, 'instr', None)
+            mjdref = getattr(reader, "mjdref", 0.0)
+            mission = getattr(reader, "mission", None)
+            instr = getattr(reader, "instr", None)
 
             # Get total event count
-            times_reader = FITSTimeseriesReader(file_path, data_kind="times")
+            if not isinstance(times_stream, str):
+                _rewind(times_stream)
+            times_reader = FITSTimeseriesReader(times_stream, data_kind="times")
             all_times = times_reader[:]
             total_events = len(all_times)
 
             if original_gti is not None and len(original_gti) > 0:
                 total_duration = float(np.sum(original_gti[:, 1] - original_gti[:, 0]))
             else:
-                total_duration = float(all_times.max() - all_times.min()) if total_events > 0 else 0.0
+                total_duration = (
+                    float(all_times.max() - all_times.min())
+                    if total_events > 0
+                    else 0.0
+                )
 
             # Validate indices
             if start_index < 0:
@@ -1814,12 +2409,15 @@ class DataService(BaseService):
             gti_was_fixed = self._fix_inverted_gti(event_list)
 
             # Add to state manager
+            _raise_if_cancelled(cancellation_check)
             self.state.add_event_data(name, event_list)
 
             # Validate GTI and collect warnings
             gti_warnings = self._validate_gti(event_list)
             if gti_was_fixed:
-                gti_warnings.insert(0, "GTI intervals were inverted and automatically fixed.")
+                gti_warnings.insert(
+                    0, "GTI intervals were inverted and automatically fixed."
+                )
 
             # Run comprehensive data quality validation
             validation_issues = self._validate_data_quality(event_list)
@@ -1829,7 +2427,7 @@ class DataService(BaseService):
                 "n_events": len(event_list.time),
                 "time_range": [
                     _to_python_float(event_list.time.min()),
-                    _to_python_float(event_list.time.max())
+                    _to_python_float(event_list.time.max()),
                 ],
                 "has_energy": event_list.energy is not None,
                 "has_pi": event_list.pi is not None,
@@ -1845,7 +2443,9 @@ class DataService(BaseService):
                     "events_loaded": actual_count,
                     "total_file_events": total_events,
                     "total_file_duration": total_duration,
-                    "events_loaded_percent": (actual_count / total_events * 100) if total_events > 0 else 0,
+                    "events_loaded_percent": (actual_count / total_events * 100)
+                    if total_events > 0
+                    else 0,
                 },
             }
 
@@ -1857,8 +2457,12 @@ class DataService(BaseService):
             if gti_warnings:
                 message += f" [GTI warnings: {len(gti_warnings)}]"
             if validation_issues:
-                error_count = sum(1 for v in validation_issues if v["severity"] == "error")
-                warn_count = sum(1 for v in validation_issues if v["severity"] == "warning")
+                error_count = sum(
+                    1 for v in validation_issues if v["severity"] == "error"
+                )
+                warn_count = sum(
+                    1 for v in validation_issues if v["severity"] == "warning"
+                )
                 if error_count > 0:
                     message += f" [Data errors: {error_count}]"
                 if warn_count > 0:
@@ -1870,13 +2474,42 @@ class DataService(BaseService):
                 message=message,
             )
 
-        except Exception as e:
-            return self.handle_error(
-                e, "Loading event list by event count",
-                file_path=file_path, name=name, start_index=start_index, count=count
+        except Exception:
+            return self.create_result(
+                success=False,
+                data=None,
+                message="The selected event range could not be read",
+                error="event_count_read_failed",
             )
 
-    def get_file_metadata(self, file_path: str, fmt: str = "ogip") -> Dict[str, Any]:
+    def get_file_metadata(
+        self,
+        file_path: str,
+        fmt: str = "ogip",
+        file_grant: str | None = None,
+        *,
+        _file_source: GrantedReadFile | None = None,
+    ) -> Dict[str, Any]:
+        """Inspect metadata only through the exact granted input."""
+        fmt = require_input_event_format(fmt)
+        with ExitStack() as stack:
+            selected = stack.enter_context(
+                _open_granted_source(file_path, file_grant, _file_source)
+            )
+            retained_stream = stack.enter_context(
+                _spooled_copy(selected, max_bytes=MAX_FITS_INSPECT_BYTES)
+            )
+            stream = stack.enter_context(
+                _decoded_event_stream(retained_stream, fmt=fmt)
+            )
+            return self._get_file_metadata_from_stream(stream, selected.size_bytes, fmt)
+
+    def _get_file_metadata_from_stream(
+        self,
+        file_stream: BinaryIO,
+        file_size: int,
+        fmt: str,
+    ) -> Dict[str, Any]:
         """
         Get metadata from a FITS file without loading the full data.
 
@@ -1897,7 +2530,6 @@ class DataService(BaseService):
         Returns:
             Result dictionary with file metadata
         """
-        fmt = require_input_event_format(fmt)
         try:
             # Check format
             is_fits = fmt in ("ogip", "fits")
@@ -1909,7 +2541,6 @@ class DataService(BaseService):
                     error="Unsupported format",
                 )
 
-            file_size = os.path.getsize(file_path)
             file_size_mb = file_size / (1024**2)
             file_size_gb = file_size / (1024**3)
 
@@ -1924,59 +2555,74 @@ class DataService(BaseService):
             instr = None
             original_gti = None
 
-            with fits.open(file_path) as hdulist:
+            _rewind(file_stream)
+            with fits.open(file_stream, memmap=False) as hdulist:
                 # Find the EVENTS or EVT extension
                 events_hdu = None
                 for hdu in hdulist:
-                    if hdu.name.upper() in ['EVENTS', 'EVT']:
+                    if hdu.name.upper() in ["EVENTS", "EVT"]:
                         events_hdu = hdu
                         break
 
                 if events_hdu is not None:
                     # Get row count from header (NAXIS2) - no data loading!
-                    total_events = events_hdu.header.get('NAXIS2', 0)
+                    total_events = events_hdu.header.get("NAXIS2", 0)
                     available_columns = [col.name for col in events_hdu.columns]
 
                     # Get MJDREF from header
-                    mjdref = events_hdu.header.get('MJDREF', 0.0)
+                    mjdref = events_hdu.header.get("MJDREF", 0.0)
                     if mjdref == 0.0:
                         # Some files split MJDREF into integer and fractional parts
-                        mjdrefi = events_hdu.header.get('MJDREFI', 0)
-                        mjdreff = events_hdu.header.get('MJDREFF', 0.0)
+                        mjdrefi = events_hdu.header.get("MJDREFI", 0)
+                        mjdreff = events_hdu.header.get("MJDREFF", 0.0)
                         mjdref = mjdrefi + mjdreff
 
                     # Get mission/instrument from header
-                    mission = events_hdu.header.get('TELESCOP', None) or events_hdu.header.get('MISSION', None)
-                    instr = events_hdu.header.get('INSTRUME', None)
+                    mission = events_hdu.header.get(
+                        "TELESCOP", None
+                    ) or events_hdu.header.get("MISSION", None)
+                    instr = events_hdu.header.get("INSTRUME", None)
 
                     # Get time range from header keywords if available (fast!)
-                    tstart = events_hdu.header.get('TSTART', None)
-                    tstop = events_hdu.header.get('TSTOP', None)
+                    tstart = events_hdu.header.get("TSTART", None)
+                    tstop = events_hdu.header.get("TSTOP", None)
 
                     if tstart is not None and tstop is not None:
                         time_min = float(tstart)
                         time_max = float(tstop)
                     elif total_events > 0:
                         # Fallback: read only first and last few rows (much faster than full load)
-                        time_col = events_hdu.data['TIME']
+                        time_col = events_hdu.data["TIME"]
                         time_min = float(time_col[0])
                         time_max = float(time_col[-1])
 
                 # Read GTI extension (usually small, OK to load fully)
                 gti_hdu = None
                 for hdu in hdulist:
-                    if hdu.name.upper() in ['GTI', 'STDGTI']:
+                    if hdu.name.upper() in ["GTI", "STDGTI"]:
                         gti_hdu = hdu
                         break
 
                 if gti_hdu is not None and gti_hdu.data is not None:
-                    start_col = gti_hdu.data['START'] if 'START' in gti_hdu.columns.names else None
-                    stop_col = gti_hdu.data['STOP'] if 'STOP' in gti_hdu.columns.names else None
+                    start_col = (
+                        gti_hdu.data["START"]
+                        if "START" in gti_hdu.columns.names
+                        else None
+                    )
+                    stop_col = (
+                        gti_hdu.data["STOP"]
+                        if "STOP" in gti_hdu.columns.names
+                        else None
+                    )
                     if start_col is not None and stop_col is not None:
                         original_gti = np.column_stack([start_col, stop_col])
 
             # Calculate duration
-            duration = (time_max - time_min) if (time_min is not None and time_max is not None) else 0.0
+            duration = (
+                (time_max - time_min)
+                if (time_min is not None and time_max is not None)
+                else 0.0
+            )
 
             # GTI info
             gti_count = len(original_gti) if original_gti is not None else 0
@@ -1995,7 +2641,6 @@ class DataService(BaseService):
                 risk_level = "safe"
 
             metadata = {
-                "file_path": file_path,
                 "file_size_mb": file_size_mb,
                 "file_size_gb": file_size_gb,
                 "risk_level": risk_level,
@@ -2005,7 +2650,10 @@ class DataService(BaseService):
                 "gti_count": gti_count,
                 "total_gti_time": total_gti_time,
                 "gti_list": (
-                    [[_to_python_float(g[0]), _to_python_float(g[1])] for g in original_gti]
+                    [
+                        [_to_python_float(g[0]), _to_python_float(g[1])]
+                        for g in original_gti
+                    ]
                     if original_gti is not None
                     else None
                 ),
@@ -2024,9 +2672,12 @@ class DataService(BaseService):
                 message=f"Metadata retrieved: {total_events} events, {file_size_mb:.1f} MB, {gti_count} GTI",
             )
 
-        except Exception as e:
-            return self.handle_error(
-                e, "Getting file metadata", file_path=file_path
+        except Exception:
+            return self.create_result(
+                success=False,
+                data=None,
+                message="The selected file metadata could not be read",
+                error="metadata_read_failed",
             )
 
     def _recommend_loading_strategy(
@@ -2056,17 +2707,23 @@ class DataService(BaseService):
         if risk_level == "critical":
             # Very large file (>10GB) - must use partial loading
             recommendations["strategy"] = "event_count"
-            recommendations["suggested_chunk_size"] = min(100000, max(1000, total_events // 10))
+            recommendations["suggested_chunk_size"] = min(
+                100000, max(1000, total_events // 10)
+            )
             recommendations["suggested_time_chunk"] = 100.0  # seconds
         elif risk_level == "risky":
             # Large file (5-10GB) - strongly recommend partial loading
             recommendations["strategy"] = "time_range"
-            recommendations["suggested_chunk_size"] = min(500000, max(10000, total_events // 5))
+            recommendations["suggested_chunk_size"] = min(
+                500000, max(10000, total_events // 5)
+            )
             recommendations["suggested_time_chunk"] = 500.0
         elif risk_level == "caution":
             # Medium file (1-5GB) - partial loading recommended
             recommendations["strategy"] = "time_range"
-            recommendations["suggested_chunk_size"] = min(1000000, max(50000, total_events // 2))
+            recommendations["suggested_chunk_size"] = min(
+                1000000, max(50000, total_events // 2)
+            )
             recommendations["suggested_time_chunk"] = 1000.0
         else:
             # Small file (<1GB) - safe to load fully
@@ -2090,88 +2747,106 @@ class DataService(BaseService):
         else:
             return "safe"
 
-    def check_batch_file_size(self, file_paths: List[str]) -> Dict[str, Any]:
-        """
-        Check sizes of multiple files and estimate total memory usage.
-
-        Args:
-            file_paths: List of file paths to check
-
-        Returns:
-            Result dictionary with per-file and total memory estimates
-        """
+    def check_batch_file_size(
+        self,
+        files: List[Dict[str, str]],
+        *,
+        _file_sources: List[GrantedReadFile] | None = None,
+    ) -> Dict[str, Any]:
+        """Check a bounded batch after atomically pinning every selected input."""
         try:
-            memory_info = self._get_memory_info()
-            available_ram_mb = memory_info["available_mb"]
+            with ExitStack() as stack:
+                sources: List[GrantedReadFile] = []
+                for index, item in enumerate(files):
+                    retained = (
+                        _file_sources[index] if _file_sources is not None else None
+                    )
+                    sources.append(
+                        stack.enter_context(
+                            _open_granted_source(
+                                item["file_path"],
+                                item.get("file_grant"),
+                                retained,
+                            )
+                        )
+                    )
 
-            files_info = []
-            total_size_mb = 0.0
-            total_estimated_ram_mb = 0.0
+                memory_info = self._get_memory_info()
+                available_ram_mb = memory_info["available_mb"]
+                files_info = []
+                total_size_mb = 0.0
+                total_estimated_ram_mb = 0.0
 
-            for path in file_paths:
-                if not os.path.exists(path):
-                    files_info.append({
-                        "file_path": path,
-                        "file_name": os.path.basename(path),
-                        "error": "File not found",
-                        "size_mb": 0,
-                        "estimated_ram_mb": 0,
-                        "ram_percent": 0,
-                        "risk_level": "critical",
-                    })
-                    continue
+                for item, source in zip(files, sources):
+                    size_bytes = source.size_bytes
+                    size_mb = size_bytes / (1024**2)
+                    suffix = source.path.suffix.lower()
+                    fmt = (
+                        "fits"
+                        if suffix in {".fits", ".fit", ".fts", ".evt", ".gz"}
+                        else "hdf5"
+                        if suffix in {".hdf5", ".h5"}
+                        else "fits"
+                    )
+                    estimated_ram_mb = self._estimate_memory_usage(size_bytes, fmt) / (
+                        1024**2
+                    )
+                    ram_percent = (
+                        estimated_ram_mb / available_ram_mb * 100
+                        if available_ram_mb > 0
+                        else 100
+                    )
+                    files_info.append(
+                        {
+                            "file_name": source.path.name,
+                            "size_mb": round(size_mb, 1),
+                            "estimated_ram_mb": round(estimated_ram_mb, 1),
+                            "ram_percent": round(ram_percent, 1),
+                            "risk_level": self._get_risk_level(ram_percent),
+                        }
+                    )
+                    total_size_mb += size_mb
+                    total_estimated_ram_mb += estimated_ram_mb
 
-                size_bytes = os.path.getsize(path)
-                size_mb = size_bytes / (1024**2)
-
-                # Determine format from extension
-                ext = os.path.splitext(path)[1].lower()
-                fmt = "fits" if ext in ['.fits', '.fit', '.fts', '.evt'] else "hdf5" if ext in ['.hdf5', '.h5'] else "fits"
-
-                estimated_ram_mb = self._estimate_memory_usage(size_bytes, fmt) / (1024**2)
-                ram_percent = (estimated_ram_mb / available_ram_mb) * 100 if available_ram_mb > 0 else 100
-
-                files_info.append({
-                    "file_path": path,
-                    "file_name": os.path.basename(path),
-                    "size_mb": round(size_mb, 1),
-                    "estimated_ram_mb": round(estimated_ram_mb, 1),
-                    "ram_percent": round(ram_percent, 1),
-                    "risk_level": self._get_risk_level(ram_percent),
-                })
-
-                total_size_mb += size_mb
-                total_estimated_ram_mb += estimated_ram_mb
-
-            total_ram_percent = (total_estimated_ram_mb / available_ram_mb) * 100 if available_ram_mb > 0 else 100
-
-            return self.create_result(
-                success=True,
-                data={
-                    "files": files_info,
-                    "total": {
-                        "size_mb": round(total_size_mb, 1),
-                        "estimated_ram_mb": round(total_estimated_ram_mb, 1),
-                        "ram_percent": round(total_ram_percent, 1),
-                        "risk_level": self._get_risk_level(total_ram_percent),
+                total_ram_percent = (
+                    total_estimated_ram_mb / available_ram_mb * 100
+                    if available_ram_mb > 0
+                    else 100
+                )
+                return self.create_result(
+                    success=True,
+                    data={
+                        "files": files_info,
+                        "total": {
+                            "size_mb": round(total_size_mb, 1),
+                            "estimated_ram_mb": round(total_estimated_ram_mb, 1),
+                            "ram_percent": round(total_ram_percent, 1),
+                            "risk_level": self._get_risk_level(total_ram_percent),
+                        },
+                        "available_ram_mb": round(available_ram_mb, 1),
+                        "file_count": len(files),
+                        "recommend_partial_loading": total_ram_percent > 30,
                     },
-                    "available_ram_mb": round(available_ram_mb, 1),
-                    "file_count": len(file_paths),
-                    "recommend_partial_loading": total_ram_percent > 30,
-                },
-                message=f"Checked {len(file_paths)} files: {total_size_mb:.1f} MB total, ~{total_ram_percent:.0f}% of available RAM",
+                    message=(
+                        f"Checked {len(files)} files: {total_size_mb:.1f} MB total, "
+                        f"~{total_ram_percent:.0f}% of available RAM"
+                    ),
+                )
+        except Exception:
+            return self.create_result(
+                success=False,
+                data=None,
+                message="The selected batch sizes could not be checked",
+                error="batch_size_check_failed",
             )
-
-        except Exception as e:
-            return self.handle_error(e, "Checking batch file sizes")
 
     def load_batch_event_lists(
         self,
         files: List[Dict[str, Any]],
         use_same_settings: bool = True,
-        # Shared settings (used when use_same_settings=True)
         shared_fmt: str = "ogip",
         shared_rmf_file: Optional[str] = None,
+        shared_rmf_grant: Optional[str] = None,
         shared_additional_columns: Optional[List[str]] = None,
         shared_high_precision: bool = False,
         shared_skip_checks: bool = False,
@@ -2182,209 +2857,235 @@ class DataService(BaseService):
         shared_event_start_index: Optional[int] = None,
         shared_event_count: Optional[int] = None,
         max_workers: Optional[int] = None,
+        *,
+        _file_sources: List[GrantedReadFile] | None = None,
+        _rmf_sources: List[GrantedReadFile | None] | None = None,
+        _shared_rmf_source: GrantedReadFile | None = None,
+        _cancellation_check=None,
     ) -> Dict[str, Any]:
-        """
-        Load multiple EventLists in parallel using threads.
-
-        Args:
-            files: List of dicts with file configurations. Each dict should have:
-                - file_path: str (required)
-                - name: str (required)
-                - fmt: str (optional, used if use_same_settings=False)
-                - rmf_file: Optional[str]
-                - additional_columns: Optional[List[str]]
-                - high_precision: bool
-                - skip_checks: bool
-                - use_partial_loading: bool
-                - partial_mode: str ('time_range' or 'event_count')
-                - time_range_start/end: Optional[float]
-                - event_start_index/count: Optional[int]
-            use_same_settings: If True, use shared_* settings for all files
-            shared_*: Settings applied to all files when use_same_settings=True
-            max_workers: Max parallel threads (default: min(cpu_count, len(files), 8))
-
-        Returns:
-            Result with successful[], failed[], and summary statistics
-        """
+        """Pin an entire batch before loading and never reopen selected paths."""
         files, shared_fmt = require_batch_input_formats(files, shared_fmt)
+        for item in files:
+            name_error = validate_derived_name(item.get("name", ""))
+            if name_error:
+                raise ValueError(name_error)
         start_time = time.time()
-
         if not files:
             return self.create_result(
-                success=False,
-                message="No files provided for batch loading",
+                success=False, message="No files provided for batch loading"
             )
 
-        # Pre-validate: check for duplicate names in the request
-        names = [f.get("name", "") for f in files]
-        duplicate_names = [name for name in set(names) if names.count(name) > 1]
+        names = [item.get("name", "") for item in files]
+        duplicate_names = sorted({name for name in names if names.count(name) > 1})
         if duplicate_names:
             return self.create_result(
-                success=False,
-                message=f"Duplicate names in request: {duplicate_names}",
+                success=False, message=f"Duplicate names in request: {duplicate_names}"
             )
-
-        # Pre-validate: check no names already exist in state
-        existing_names = []
-        for f in files:
-            name = f.get("name", "")
-            if name and self.state.has_event_data(name):
-                existing_names.append(name)
+        existing_names = [
+            name for name in names if name and self.state.has_event_data(name)
+        ]
         if existing_names:
             return self.create_result(
-                success=False,
-                message=f"Names already exist in state: {existing_names}",
+                success=False, message=f"Names already exist in state: {existing_names}"
+            )
+        if (shared_rmf_file is None) != (shared_rmf_grant is None) and (
+            _shared_rmf_source is None
+        ):
+            raise ValueError(
+                "shared_rmf_file and shared_rmf_grant must be provided together"
             )
 
-        # Determine worker count
-        if max_workers is None:
-            max_workers = min(os.cpu_count() or 4, len(files), 8)
-
-        successful: List[Dict[str, Any]] = []
-        failed: List[Dict[str, Any]] = []
-
-        def load_single_file(file_config: Dict[str, Any]) -> Dict[str, Any]:
-            """Load a single file with the appropriate settings."""
-            file_path = file_config.get("file_path", "")
-            name = file_config.get("name", "")
-
-            if not file_path or not name:
-                return {
-                    "success": False,
-                    "name": name,
-                    "file_path": file_path,
-                    "error": "Missing file_path or name",
-                }
-
-            # Determine settings to use
-            if use_same_settings:
-                fmt = shared_fmt
-                rmf_file = shared_rmf_file
-                additional_columns = shared_additional_columns
-                high_precision = shared_high_precision
-                skip_checks = shared_skip_checks
-                use_partial = shared_use_partial_loading
-                partial_mode = shared_partial_mode
-                time_start = shared_time_range_start
-                time_end = shared_time_range_end
-                event_start = shared_event_start_index
-                event_cnt = shared_event_count
-                notes = None  # No shared notes for batch loading
-            else:
-                # Use per-file settings
-                fmt = file_config.get("fmt", "ogip")
-                rmf_file = file_config.get("rmf_file")
-                additional_columns = file_config.get("additional_columns")
-                high_precision = file_config.get("high_precision", False)
-                skip_checks = file_config.get("skip_checks", False)
-                use_partial = file_config.get("use_partial_loading", False)
-                partial_mode = file_config.get("partial_mode", "time_range")
-                time_start = file_config.get("time_range_start")
-                time_end = file_config.get("time_range_end")
-                event_start = file_config.get("event_start_index")
-                event_cnt = file_config.get("event_count")
-                notes = file_config.get("notes")
-
-            try:
-                if use_partial:
-                    if partial_mode == "time_range":
-                        if time_start is None or time_end is None:
-                            return {
-                                "success": False,
-                                "name": name,
-                                "file_path": file_path,
-                                "error": "Partial loading (time_range) requires time_range_start and time_range_end",
-                            }
-                        result = self.load_event_list_by_time_range(
-                            file_path, name, time_start, time_end, fmt, notes
+        with ExitStack() as stack:
+            retained_files: List[GrantedReadFile] = []
+            retained_rmfs: List[GrantedReadFile | None] = []
+            for index, item in enumerate(files):
+                private_source = (
+                    _file_sources[index] if _file_sources is not None else None
+                )
+                retained_files.append(
+                    stack.enter_context(
+                        _open_granted_source(
+                            item["file_path"],
+                            item.get("file_grant"),
+                            private_source,
                         )
-                    else:  # event_count
-                        result = self.load_event_list_by_event_count(
-                            file_path, name,
-                            event_start or 0,
-                            event_cnt or 10000,
-                            fmt,
-                            notes
-                        )
+                    )
+                )
+
+            shared_source = None
+            if shared_rmf_file is not None or _shared_rmf_source is not None:
+                shared_source = stack.enter_context(
+                    _open_granted_source(
+                        shared_rmf_file or "<retained RMF>",
+                        shared_rmf_grant,
+                        _shared_rmf_source,
+                    )
+                )
+
+            for index, item in enumerate(files):
+                private_rmf = _rmf_sources[index] if _rmf_sources is not None else None
+                if use_same_settings:
+                    retained_rmfs.append(shared_source)
+                    continue
+                rmf_path = item.get("rmf_file")
+                rmf_grant = item.get("rmf_grant")
+                if (rmf_path is None) != (rmf_grant is None) and private_rmf is None:
+                    raise ValueError("rmf_file and rmf_grant must be provided together")
+                if rmf_path is None and private_rmf is None:
+                    retained_rmfs.append(None)
                 else:
-                    result = self.load_event_list(
-                        file_path, name, fmt,
-                        rmf_file, additional_columns,
-                        high_precision, skip_checks,
-                        notes
+                    retained_rmfs.append(
+                        stack.enter_context(
+                            _open_granted_source(
+                                rmf_path or "<retained RMF>",
+                                rmf_grant,
+                                private_rmf,
+                            )
+                        )
                     )
 
-                return {
-                    "success": result.get("success", False),
-                    "name": name,
-                    "file_path": file_path,
-                    "data": result.get("data"),
-                    "message": result.get("message"),
-                    "error": result.get("error") if not result.get("success") else None,
-                }
-            except Exception as e:
-                return {
-                    "success": False,
-                    "name": name,
-                    "file_path": file_path,
-                    "error": str(e),
-                }
+            def load_single(index: int) -> Dict[str, Any]:
+                item = files[index]
+                name = item["name"]
+                if use_same_settings:
+                    fmt = shared_fmt
+                    rmf_path = shared_rmf_file
+                    columns = shared_additional_columns
+                    high_precision = shared_high_precision
+                    skip_checks = shared_skip_checks
+                    use_partial = shared_use_partial_loading
+                    partial_mode = shared_partial_mode
+                    range_start = shared_time_range_start
+                    range_end = shared_time_range_end
+                    event_start = shared_event_start_index
+                    event_count = shared_event_count
+                    notes = None
+                else:
+                    fmt = item.get("fmt", "ogip")
+                    rmf_path = item.get("rmf_file")
+                    columns = item.get("additional_columns")
+                    high_precision = bool(item.get("high_precision", False))
+                    skip_checks = bool(item.get("skip_checks", False))
+                    use_partial = bool(item.get("use_partial_loading", False))
+                    partial_mode = item.get("partial_mode", "time_range")
+                    range_start = item.get("time_range_start")
+                    range_end = item.get("time_range_end")
+                    event_start = item.get("event_start_index")
+                    event_count = item.get("event_count")
+                    notes = item.get("notes")
 
-        # Execute loading in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_file = {
-                executor.submit(load_single_file, f): f
-                for f in files
-            }
-
-            # Collect results as they complete
-            for future in as_completed(future_to_file):
-                file_info = future_to_file[future]
                 try:
-                    result = future.result()
-                    if result.get("success"):
-                        successful.append({
-                            "name": result["name"],
-                            "file_path": result["file_path"],
-                            "data": result.get("data"),
-                            "message": result.get("message"),
-                        })
+                    if use_partial and partial_mode == "time_range":
+                        if range_start is None or range_end is None:
+                            raise ValueError(
+                                "Partial time-range loading requires both endpoints"
+                            )
+                        result = self.load_event_list_by_time_range(
+                            item["file_path"],
+                            name,
+                            range_start,
+                            range_end,
+                            fmt,
+                            notes,
+                            _file_source=retained_files[index],
+                            _cancellation_check=_cancellation_check,
+                        )
+                    elif use_partial:
+                        result = self.load_event_list_by_event_count(
+                            item["file_path"],
+                            name,
+                            event_start or 0,
+                            event_count or 10000,
+                            fmt,
+                            notes,
+                            _file_source=retained_files[index],
+                            _cancellation_check=_cancellation_check,
+                        )
                     else:
-                        failed.append({
-                            "name": result.get("name", file_info.get("name", "")),
-                            "file_path": result.get("file_path", file_info.get("file_path", "")),
-                            "error": result.get("error", "Unknown error"),
-                        })
-                except Exception as e:
-                    failed.append({
-                        "name": file_info.get("name", ""),
-                        "file_path": file_info.get("file_path", ""),
-                        "error": str(e),
-                    })
+                        result = self.load_event_list(
+                            item["file_path"],
+                            name,
+                            fmt=fmt,
+                            rmf_file=rmf_path,
+                            additional_columns=columns,
+                            high_precision=high_precision,
+                            skip_checks=skip_checks,
+                            notes=notes,
+                            _file_source=retained_files[index],
+                            _rmf_source=retained_rmfs[index],
+                            _cancellation_check=_cancellation_check,
+                        )
+                    return {
+                        "success": bool(result.get("success")),
+                        "name": name,
+                        "data": result.get("data"),
+                        "message": result.get("message"),
+                        "error": result.get("error") or result.get("message"),
+                    }
+                except Exception:
+                    return {
+                        "success": False,
+                        "name": name,
+                        "error": "The selected file could not be loaded",
+                    }
 
-        total_time_ms = (time.time() - start_time) * 1000
-        total_events = sum(
-            s.get("data", {}).get("n_events", 0) if s.get("data") else 0
-            for s in successful
-        )
+            worker_count = max_workers or min(os.cpu_count() or 4, len(files), 8)
+            worker_count = max(1, min(worker_count, len(files), 8))
+            # One shared seekable RMF stream must never be consumed concurrently.
+            if shared_source is not None:
+                worker_count = 1
 
-        return self.create_result(
-            success=len(failed) == 0,
-            data={
-                "successful": successful,
-                "failed": failed,
-                "summary": {
-                    "total_files": len(files),
-                    "success_count": len(successful),
-                    "failure_count": len(failed),
-                    "total_events_loaded": total_events,
-                    "total_time_ms": round(total_time_ms, 1),
-                    "workers_used": max_workers,
+            successful: List[Dict[str, Any]] = []
+            failed: List[Dict[str, Any]] = []
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                _raise_if_cancelled(_cancellation_check)
+                futures = {
+                    executor.submit(load_single, index): index
+                    for index in range(len(files))
+                }
+                for future in as_completed(futures):
+                    _raise_if_cancelled(_cancellation_check)
+                    result = future.result()
+                    if result["success"]:
+                        successful.append(
+                            {
+                                "name": result["name"],
+                                "data": result.get("data"),
+                                "message": result.get("message"),
+                            }
+                        )
+                    else:
+                        failed.append(
+                            {
+                                "name": result["name"],
+                                "error": result.get("error") or "Unknown error",
+                            }
+                        )
+
+            total_time_ms = (time.time() - start_time) * 1000
+            total_events = sum(
+                item.get("data", {}).get("n_events", 0) if item.get("data") else 0
+                for item in successful
+            )
+            return self.create_result(
+                success=not failed,
+                data={
+                    "successful": successful,
+                    "failed": failed,
+                    "summary": {
+                        "total_files": len(files),
+                        "success_count": len(successful),
+                        "failure_count": len(failed),
+                        "total_events_loaded": total_events,
+                        "total_time_ms": round(total_time_ms, 1),
+                        "workers_used": worker_count,
+                    },
                 },
-            },
-            message=f"Loaded {len(successful)}/{len(files)} files ({total_events:,} total events) in {total_time_ms:.0f}ms",
-        )
+                message=(
+                    f"Loaded {len(successful)}/{len(files)} files "
+                    f"({total_events:,} total events) in {total_time_ms:.0f}ms"
+                ),
+            )
 
     async def load_batch_event_lists_stream(
         self,
@@ -2392,6 +3093,7 @@ class DataService(BaseService):
         use_same_settings: bool = True,
         shared_fmt: str = "ogip",
         shared_rmf_file: Optional[str] = None,
+        shared_rmf_grant: Optional[str] = None,
         shared_additional_columns: Optional[List[str]] = None,
         shared_high_precision: bool = False,
         shared_skip_checks: bool = False,
@@ -2403,241 +3105,86 @@ class DataService(BaseService):
         shared_event_count: Optional[int] = None,
         max_workers: Optional[int] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """
-        Stream batch loading results as they complete via SSE.
-
-        Yields events for each file completion and a final summary event.
-        This allows the frontend to update progress incrementally instead of
-        waiting for all files to complete.
-
-        Args:
-            files: List of file configurations (same as load_batch_event_lists)
-            use_same_settings: If True, use shared_* settings for all files
-            shared_*: Shared settings applied when use_same_settings=True
-            max_workers: Max parallel threads
-
-        Yields:
-            Dict events with type 'file_complete' or 'complete'
-        """
+        """Return the legacy SSE envelope backed by the secure batch loader."""
+        # Format policy is an admission decision, not a runtime SSE failure.
+        # Preserve fail-fast behavior before any worker or native I/O exists.
         files, shared_fmt = require_batch_input_formats(files, shared_fmt)
-        start_time = time.time()
-
-        if not files:
-            yield {
-                "type": "error",
-                "error": "No files provided for batch loading",
-            }
-            return
-
-        # Pre-validate: check for duplicate names in the request
-        names = [f.get("name", "") for f in files]
-        duplicate_names = [name for name in set(names) if names.count(name) > 1]
-        if duplicate_names:
-            yield {
-                "type": "error",
-                "error": f"Duplicate names in request: {duplicate_names}",
-            }
-            return
-
-        # Pre-validate: check no names already exist in state
-        existing_names = []
-        for f in files:
-            name = f.get("name", "")
-            if name and self.state.has_event_data(name):
-                existing_names.append(name)
-        if existing_names:
-            yield {
-                "type": "error",
-                "error": f"Names already exist in state: {existing_names}",
-            }
-            return
-
-        # Determine worker count
-        if max_workers is None:
-            max_workers = min(os.cpu_count() or 4, len(files), 8)
-
-        successful: List[Dict[str, Any]] = []
-        failed: List[Dict[str, Any]] = []
-
-        def load_single_file(file_config: Dict[str, Any]) -> Dict[str, Any]:
-            """Load a single file with the appropriate settings."""
-            file_path = file_config.get("file_path", "")
-            name = file_config.get("name", "")
-
-            if not file_path or not name:
-                return {
-                    "success": False,
-                    "name": name,
-                    "file_path": file_path,
-                    "error": "Missing file_path or name",
-                }
-
-            # Determine settings to use
-            if use_same_settings:
-                fmt = shared_fmt
-                rmf_file = shared_rmf_file
-                additional_columns = shared_additional_columns
-                high_precision = shared_high_precision
-                skip_checks = shared_skip_checks
-                use_partial = shared_use_partial_loading
-                partial_mode = shared_partial_mode
-                time_start = shared_time_range_start
-                time_end = shared_time_range_end
-                event_start = shared_event_start_index
-                event_cnt = shared_event_count
-                notes = None  # No shared notes for batch loading
-            else:
-                # Use per-file settings
-                fmt = file_config.get("fmt", "ogip")
-                rmf_file = file_config.get("rmf_file")
-                additional_columns = file_config.get("additional_columns")
-                high_precision = file_config.get("high_precision", False)
-                skip_checks = file_config.get("skip_checks", False)
-                use_partial = file_config.get("use_partial_loading", False)
-                partial_mode = file_config.get("partial_mode", "time_range")
-                time_start = file_config.get("time_range_start")
-                time_end = file_config.get("time_range_end")
-                event_start = file_config.get("event_start_index")
-                event_cnt = file_config.get("event_count")
-                notes = file_config.get("notes")
-
-            try:
-                if use_partial:
-                    if partial_mode == "time_range":
-                        if time_start is None or time_end is None:
-                            return {
-                                "success": False,
-                                "name": name,
-                                "file_path": file_path,
-                                "error": "Partial loading (time_range) requires time_range_start and time_range_end",
-                            }
-                        result = self.load_event_list_by_time_range(
-                            file_path, name, time_start, time_end, fmt, notes
-                        )
-                    else:  # event_count
-                        result = self.load_event_list_by_event_count(
-                            file_path, name,
-                            event_start or 0,
-                            event_cnt or 10000,
-                            fmt,
-                            notes
-                        )
-                else:
-                    result = self.load_event_list(
-                        file_path, name, fmt,
-                        rmf_file, additional_columns,
-                        high_precision, skip_checks,
-                        notes
-                    )
-
-                return {
-                    "success": result.get("success", False),
-                    "name": name,
-                    "file_path": file_path,
-                    "data": result.get("data"),
-                    "message": result.get("message"),
-                    "error": result.get("error") if not result.get("success") else None,
-                }
-            except Exception as e:
-                return {
-                    "success": False,
-                    "name": name,
-                    "file_path": file_path,
-                    "error": str(e),
-                }
-
-        # Execute loading in parallel, yielding results as they complete
-        # Use asyncio to wrap thread pool futures for proper async handling
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks and wrap them as asyncio futures
-            future_to_file = {
-                executor.submit(load_single_file, f): f
-                for f in files
-            }
-
-            # Convert to asyncio futures for proper async iteration
-            pending = {
-                asyncio.wrap_future(future): (future, file_info)
-                for future, file_info in future_to_file.items()
-            }
-
-            completed = 0
-            while pending:
-                # Wait for the next future to complete (non-blocking)
-                done, _ = await asyncio.wait(
-                    pending.keys(),
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-
-                for async_future in done:
-                    original_future, file_info = pending.pop(async_future)
-                    completed += 1
-
-                    try:
-                        result = async_future.result()
-                        if result.get("success"):
-                            successful.append({
-                                "name": result["name"],
-                                "file_path": result["file_path"],
-                                "data": result.get("data"),
-                                "message": result.get("message"),
-                            })
-                            yield {
-                                "type": "file_complete",
-                                "name": result["name"],
-                                "file_path": result["file_path"],
-                                "success": True,
-                                "completed": completed,
-                                "total": len(files),
-                                "data": result.get("data"),
-                            }
-                        else:
-                            error_msg = result.get("error", "Unknown error")
-                            failed.append({
-                                "name": result.get("name", file_info.get("name", "")),
-                                "file_path": result.get("file_path", file_info.get("file_path", "")),
-                                "error": error_msg,
-                            })
-                            yield {
-                                "type": "file_complete",
-                                "name": result.get("name", file_info.get("name", "")),
-                                "file_path": result.get("file_path", file_info.get("file_path", "")),
-                                "success": False,
-                                "completed": completed,
-                                "total": len(files),
-                                "error": error_msg,
-                            }
-                    except Exception as e:
-                        failed.append({
-                            "name": file_info.get("name", ""),
-                            "file_path": file_info.get("file_path", ""),
-                            "error": str(e),
-                        })
-                        yield {
-                            "type": "file_complete",
-                            "name": file_info.get("name", ""),
-                            "file_path": file_info.get("file_path", ""),
-                            "success": False,
-                            "completed": completed,
-                            "total": len(files),
-                            "error": str(e),
-                        }
-
-                    # Allow event loop to flush the SSE response
-                    await asyncio.sleep(0)
-
-        # Final completion event with summary
-        total_time_ms = (time.time() - start_time) * 1000
-        total_events = sum(
-            s.get("data", {}).get("n_events", 0) if s.get("data") else 0
-            for s in successful
+        cancellation_signal = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self.load_batch_event_lists,
+                files,
+                use_same_settings,
+                shared_fmt,
+                shared_rmf_file,
+                shared_rmf_grant,
+                shared_additional_columns,
+                shared_high_precision,
+                shared_skip_checks,
+                shared_use_partial_loading,
+                shared_partial_mode,
+                shared_time_range_start,
+                shared_time_range_end,
+                shared_event_start_index,
+                shared_event_count,
+                max_workers,
+                _cancellation_check=cancellation_signal.is_set,
+            )
         )
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancellation_signal.set()
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+            try:
+                worker.result()
+            except BaseException:
+                pass
+            raise
+        except Exception:
+            yield {
+                "type": "error",
+                "error": "The selected batch could not be admitted or loaded",
+            }
+            return
+        finally:
+            cancellation_signal.set()
+        if result.get("data") is None:
+            yield {
+                "type": "error",
+                "error": result.get("message") or "Batch load failed",
+            }
+            return
 
+        data = result["data"]
+        completed = 0
+        for item in [*data["successful"], *data["failed"]]:
+            completed += 1
+            success = "data" in item
+            event = {
+                "type": "file_complete",
+                "name": item["name"],
+                "success": success,
+                "completed": completed,
+                "total": len(files),
+            }
+            if success:
+                event["data"] = item.get("data")
+            else:
+                event["error"] = item.get("error", "Unknown error")
+            yield event
+            await asyncio.sleep(0)
+
+        summary = data["summary"]
         yield {
             "type": "complete",
-            "total_time_ms": round(total_time_ms, 1),
-            "success_count": len(successful),
-            "failure_count": len(failed),
-            "total_events": total_events,
-            "workers_used": max_workers,
+            "total_time_ms": summary["total_time_ms"],
+            "success_count": summary["success_count"],
+            "failure_count": summary["failure_count"],
+            "total_events": summary["total_events_loaded"],
+            "workers_used": summary["workers_used"],
         }
