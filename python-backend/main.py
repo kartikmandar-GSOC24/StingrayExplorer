@@ -23,7 +23,6 @@ from routes import (
     correlation_routes,
     data_routes,
     deadtime_routes,
-    export_routes,
     gti_routes,
     internal_grant_routes,
     io_utility_routes,
@@ -367,7 +366,6 @@ def create_app(
         spectrum_routes.router, prefix="/api/spectrum", tags=["Spectrum"]
     )
     app.include_router(timing_routes.router, prefix="/api/timing", tags=["Timing"])
-    app.include_router(export_routes.router, prefix="/api/export", tags=["Export"])
     app.include_router(log_routes.router, prefix="/api/logs", tags=["Logs"])
     app.include_router(archive_routes.router, prefix="/api/archive", tags=["Archive"])
     app.include_router(job_routes.router, prefix="/api/jobs", tags=["Jobs"])

@@ -1,5 +1,5 @@
 name: Check file size
-on:               # or directly `on: [push]` to run the action on every push on any branch
+on:
   pull_request:
     branches: [main]
 
@@ -7,10 +7,10 @@ on:               # or directly `on: [push]` to run the action on every push on 
   workflow_dispatch:
 
 jobs:
-  sync-to-hub:
+  check-file-size:
     runs-on: ubuntu-latest
     steps:
       - name: Check large files
         uses: ActionsDesk/lfs-warning@v2.0
         with:
-          filesizelimit: 10485760 # this is 10MB so we can sync to HF Spaces
+          filesizelimit: 10485760 # 10 MiB

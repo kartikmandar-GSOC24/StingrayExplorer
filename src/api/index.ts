@@ -18,7 +18,6 @@ export {
   type TimeLagsData,
   type CoherenceData,
 } from './timingApi';
-export { exportApi, type ExportResult } from './exportApi';
 export { correlationApi, type CorrelationData } from './correlationApi';
 export {
   varenergyApi,
