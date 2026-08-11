@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import BinaryIO, TextIO
 
 from .utility_helpers import (
+    GrantedWindowsWriteDestination,
     GrantedWriteDestination,
     open_verified_write_grant,
-    verify_file_grant,
+    revalidate_admitted_file_grant,
 )
 
 PublicationStream = BinaryIO | TextIO
@@ -147,12 +148,11 @@ def _descriptor_stream(
     and also mirrors the explicit handle ownership required by the Windows
     adapter.
     """
-    if mode not in {"r", "rb", "w", "wb"}:
-        raise ValueError(f"Unsupported secure publication stream mode: {mode}")
-
     raw_stream: io.FileIO | None = None
     stream: PublicationStream | None = None
     try:
+        if mode not in {"r", "rb", "w", "wb", "w+b"}:
+            raise ValueError(f"Unsupported secure publication stream mode: {mode}")
         raw_stream = io.FileIO(
             descriptor,
             mode.replace("b", ""),
@@ -187,6 +187,7 @@ class PosixSecurePublication(SecurePublication):
         self._filename = destination.filename
         self._destination_path = destination_path
         self._destination_grant = destination_grant
+        self._admitted_at = destination.admitted_at
 
         self._staging_descriptor = -1
         self._staging_name: str | None = None
@@ -195,7 +196,9 @@ class PosixSecurePublication(SecurePublication):
         self._artifact_identity: FileIdentity | None = None
         self._writer_descriptor = -1
         self._writer_completed = False
+        self._writer_active = False
         self._reader_completed = False
+        self._reader_active = False
         self._size_verified = False
         self._published = False
         self._failed = False
@@ -210,11 +213,12 @@ class PosixSecurePublication(SecurePublication):
         return self._filename
 
     def revalidate(self, changed_message: str) -> None:
-        verified_path = verify_file_grant(
+        verified_path = revalidate_admitted_file_grant(
             self._destination_path,
             self._destination_grant,
             access="write",
             must_exist=False,
+            admitted_at=self._admitted_at,
         )
         if verified_path != self._path:
             raise PermissionError(changed_message)
@@ -273,7 +277,9 @@ class PosixSecurePublication(SecurePublication):
         self._staging_identity = _identity(staging_stat)
 
         self._artifact_name = f"artifact{extension}"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        # HDF5's file-object driver needs one seekable bidirectional stream.
+        # Reserving O_RDWR avoids reopening the stage by pathname.
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = os.open(
@@ -306,10 +312,13 @@ class PosixSecurePublication(SecurePublication):
             raise RuntimeError("The secure publication has already failed")
         if self._writer_completed:
             raise RuntimeError("The private staging writer already completed")
+        if self._writer_active:
+            raise RuntimeError("The private staging writer is already active")
         if self._writer_descriptor < 0:
             raise RuntimeError("The private staging writer is unavailable")
         descriptor = self._writer_descriptor
         self._writer_descriptor = -1
+        self._writer_active = True
         try:
             with _descriptor_stream(descriptor, mode, encoding=encoding) as stream:
                 yield stream
@@ -318,6 +327,8 @@ class PosixSecurePublication(SecurePublication):
         except BaseException:
             self._failed = True
             raise
+        finally:
+            self._writer_active = False
         self._writer_completed = True
 
     def _assert_staged_identity(self, changed_message: str) -> os.stat_result:
@@ -343,6 +354,8 @@ class PosixSecurePublication(SecurePublication):
             raise RuntimeError("The private staging writer has not completed")
         if self._reader_completed:
             raise RuntimeError("The private staging reader already completed")
+        if self._reader_active:
+            raise RuntimeError("The private staging reader is already active")
         self.revalidate("Written artifact path changed during verification")
         artifact_name, artifact_identity = self._require_artifact()
         self._assert_staged_identity(
@@ -357,17 +370,17 @@ class PosixSecurePublication(SecurePublication):
             read_flags,
             dir_fd=self._staging_descriptor,
         )
+        self._reader_active = True
         try:
             read_stat = os.fstat(read_descriptor)
-        except Exception:
-            os.close(read_descriptor)
-            raise
-        if _identity(read_stat) != artifact_identity:
-            os.close(read_descriptor)
-            raise PermissionError("Export destination was replaced before verification")
-        try:
+            if _identity(read_stat) != artifact_identity:
+                raise PermissionError(
+                    "Export destination was replaced before verification"
+                )
+            stream_descriptor = read_descriptor
+            read_descriptor = -1
             with _descriptor_stream(
-                read_descriptor,
+                stream_descriptor,
                 mode,
                 encoding=encoding,
             ) as stream:
@@ -375,6 +388,10 @@ class PosixSecurePublication(SecurePublication):
         except BaseException:
             self._failed = True
             raise
+        finally:
+            if read_descriptor >= 0:
+                os.close(read_descriptor)
+            self._reader_active = False
         self._reader_completed = True
 
     def verified_size(self) -> int:
@@ -504,6 +521,158 @@ class PosixSecurePublication(SecurePublication):
                 pass
 
 
+class WindowsSecurePublication(SecurePublication):
+    """Handle-relative NTFS publication with a no-replacement rename."""
+
+    def __init__(
+        self,
+        destination: GrantedWindowsWriteDestination,
+        destination_path: str,
+        destination_grant: str,
+    ) -> None:
+        from .windows_secure_fs import WindowsPublicationReservation
+
+        self._path = destination.path
+        self._filename = destination.filename
+        self._destination_path = destination_path
+        self._destination_grant = destination_grant
+        self._admitted_at = destination.admitted_at
+        self._reservation = WindowsPublicationReservation(
+            destination.parent,
+            destination.filename,
+        )
+        self._writer_completed = False
+        self._writer_active = False
+        self._reader_completed = False
+        self._reader_active = False
+        self._size_verified = False
+        self._published = False
+        self._failed = False
+        self._closed = False
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def filename(self) -> str:
+        return self._filename
+
+    def revalidate(self, changed_message: str) -> None:
+        verified_path = revalidate_admitted_file_grant(
+            self._destination_path,
+            self._destination_grant,
+            access="write",
+            must_exist=False,
+            admitted_at=self._admitted_at,
+        )
+        if verified_path != self._path:
+            raise PermissionError(changed_message)
+
+    def assert_destination_available(self) -> None:
+        self._reservation.assert_destination_available()
+
+    def reserve_staging(self, extension: str) -> None:
+        if self._closed:
+            raise RuntimeError("The secure publication is already closed")
+        if self._failed:
+            raise RuntimeError("The secure publication has already failed")
+        if self._published:
+            raise RuntimeError("The secure publication is already published")
+        self._reservation.reserve(extension)
+
+    @contextmanager
+    def open_writer(
+        self, mode: str, *, encoding: str | None
+    ) -> Generator[PublicationStream, None, None]:
+        if self._closed:
+            raise RuntimeError("The secure publication is already closed")
+        if self._failed:
+            raise RuntimeError("The secure publication has already failed")
+        if self._writer_completed:
+            raise RuntimeError("The private staging writer already completed")
+        if self._writer_active:
+            raise RuntimeError("The private staging writer is already active")
+        self._writer_active = True
+        try:
+            descriptor = self._reservation.duplicate_fd(writable=True)
+            with _descriptor_stream(descriptor, mode, encoding=encoding) as stream:
+                yield stream
+                stream.flush()
+                self._reservation.flush()
+        except BaseException:
+            self._failed = True
+            raise
+        finally:
+            self._writer_active = False
+        self._writer_completed = True
+
+    @contextmanager
+    def open_reader(
+        self, mode: str, *, encoding: str | None
+    ) -> Generator[PublicationStream, None, None]:
+        if self._closed:
+            raise RuntimeError("The secure publication is already closed")
+        if self._failed:
+            raise RuntimeError("The secure publication has already failed")
+        if not self._writer_completed:
+            raise RuntimeError("The private staging writer has not completed")
+        if self._reader_completed:
+            raise RuntimeError("The private staging reader already completed")
+        if self._reader_active:
+            raise RuntimeError("The private staging reader is already active")
+        self.revalidate("Written artifact path changed during verification")
+        self._reader_active = True
+        try:
+            descriptor = self._reservation.duplicate_fd(writable=False)
+            with _descriptor_stream(descriptor, mode, encoding=encoding) as stream:
+                yield stream
+        except BaseException:
+            self._failed = True
+            raise
+        finally:
+            self._reader_active = False
+        self._reader_completed = True
+
+    def verified_size(self) -> int:
+        if self._closed:
+            raise RuntimeError("The secure publication is already closed")
+        if self._failed:
+            raise RuntimeError("The secure publication has already failed")
+        if not self._reader_completed:
+            raise RuntimeError("Scientific reopen verification has not completed")
+        if self._published:
+            raise RuntimeError("The secure publication is already published")
+        size = self._reservation.verified_size()
+        if size < 1:
+            raise ValueError("Written artifact is empty")
+        self._size_verified = True
+        return size
+
+    def publish(self) -> list[str]:
+        if self._closed:
+            raise RuntimeError("The secure publication is already closed")
+        if self._failed:
+            raise RuntimeError("The secure publication has already failed")
+        if self._published:
+            raise RuntimeError("The secure publication is already published")
+        if not self._size_verified:
+            raise RuntimeError("The staged artifact has not completed verification")
+        self.revalidate("The selected destination path changed")
+        try:
+            warnings = self._reservation.publish()
+        except FileExistsError as exc:
+            raise FileExistsError(f"Destination already exists: {self._path}") from exc
+        self._published = True
+        return warnings
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._reservation.close()
+
+
 def _platform_name() -> str:
     return os.name
 
@@ -514,7 +683,8 @@ def open_secure_publication(
     destination_grant: str,
 ) -> Generator[SecurePublication, None, None]:
     """Open the secure publication implementation for the current platform."""
-    if _platform_name() != "posix":
+    platform = _platform_name()
+    if platform not in {"posix", "nt"}:
         raise NotImplementedError(
             "Secure export publication is not supported on this platform"
         )
@@ -523,11 +693,22 @@ def open_secure_publication(
         destination_path,
         destination_grant,
     ) as destination:
-        publication = PosixSecurePublication(
-            destination,
-            destination_path,
-            destination_grant,
-        )
+        if platform == "posix":
+            if not isinstance(destination, GrantedWriteDestination):
+                raise PermissionError("A POSIX destination grant is required")
+            publication: SecurePublication = PosixSecurePublication(
+                destination,
+                destination_path,
+                destination_grant,
+            )
+        else:
+            if not isinstance(destination, GrantedWindowsWriteDestination):
+                raise PermissionError("A Windows destination grant is required")
+            publication = WindowsSecurePublication(
+                destination,
+                destination_path,
+                destination_grant,
+            )
         try:
             yield publication
         finally:

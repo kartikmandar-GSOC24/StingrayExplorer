@@ -2174,7 +2174,8 @@ def test_export_closes_raw_descriptors_on_setup_failure(
     def tracked_open(name, flags, *args, **kwargs):
         descriptor = real_open(name, flags, *args, **kwargs)
         if str(name).startswith("artifact"):
-            role = "write" if flags & os.O_WRONLY else "read"
+            access_mode = flags & os.O_ACCMODE
+            role = "write" if access_mode in {os.O_WRONLY, os.O_RDWR} else "read"
             captured[role] = descriptor
         return descriptor
 

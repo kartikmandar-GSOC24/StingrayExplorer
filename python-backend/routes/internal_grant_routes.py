@@ -14,6 +14,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 from services.utility_helpers import (
+    FileGrantEligibilityError,
     issue_file_grant,
     validated_file_grant_secret,
 )
@@ -95,6 +96,11 @@ async def issue_native_file_grant(
             access=request.access,
             secret=issuer_secret,
         )
+    except FileGrantEligibilityError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc)[:256],
+        ) from exc
     except PermissionError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

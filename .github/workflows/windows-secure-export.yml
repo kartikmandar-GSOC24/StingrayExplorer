@@ -1,0 +1,68 @@
+name: Windows secure export
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-secure-export-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-secure-export:
+    name: Windows NTFS grants and publication
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      STINGRAY_REQUIRE_WINDOWS_SECURE_EXPORT: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Pixi
+        uses: prefix-dev/setup-pixi@a09b6247153796b190642a2b53fac4241043cf6f # v0.10.0
+        with:
+          pixi-version: v0.74.0
+          cache: true
+          environments: dev
+
+      - name: Assert real Windows execution
+        shell: pwsh
+        run: pixi run -e dev python -c "import os; assert os.name == 'nt', os.name"
+
+      - name: Run secure Windows filesystem tests
+        shell: pwsh
+        run: >-
+          pixi run -e dev pytest -q
+          python-backend/tests/test_windows_secure_publication.py
+          python-backend/tests/test_internal_grant_routes.py
+
+      - name: Check Windows adapter formatting
+        shell: pwsh
+        run: >-
+          pixi run -e dev ruff format --check
+          python-backend/services/windows_secure_fs.py
+          python-backend/services/secure_publication.py
+          python-backend/services/utility_helpers.py
+          python-backend/routes/internal_grant_routes.py
+          python-backend/tests/test_windows_secure_publication.py
+          python-backend/tests/test_secure_publication.py
+          python-backend/tests/test_internal_grant_routes.py
+
+      - name: Lint Windows adapter
+        shell: pwsh
+        run: >-
+          pixi run -e dev ruff check
+          python-backend/services/windows_secure_fs.py
+          python-backend/services/secure_publication.py
+          python-backend/services/utility_helpers.py
+          python-backend/routes/internal_grant_routes.py
+          python-backend/tests/test_windows_secure_publication.py
+          python-backend/tests/test_secure_publication.py
+          python-backend/tests/test_internal_grant_routes.py

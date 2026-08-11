@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
 import services.secure_publication as publication_module
+import services.utility_helpers as utility_helpers
 from services.secure_publication import open_secure_publication
 from services.utility_helpers import (
     FILE_GRANT_SECRET_ENV,
+    FILE_GRANT_TTL_SECONDS,
     SECURE_DIR_FD_OPERATIONS_SUPPORTED,
     issue_file_grant,
 )
@@ -54,14 +57,82 @@ def test_posix_publication_contract_writes_reopens_and_publishes(tmp_path, monke
         publication.reserve_staging(".bin")
         with publication.open_writer("wb", encoding=None) as stream:
             stream.write(b"scientifically verified bytes")
+            with pytest.raises(RuntimeError, match="writer is already active"):
+                with publication.open_writer("wb", encoding=None):
+                    pass
         assert len(flushed_descriptors) == 1
         with publication.open_reader("rb", encoding=None) as stream:
             assert stream.read() == b"scientifically verified bytes"
+            with pytest.raises(RuntimeError, match="reader is already active"):
+                with publication.open_reader("rb", encoding=None):
+                    pass
         assert publication.verified_size() == len(b"scientifically verified bytes")
         assert publication.publish() == []
 
     assert destination.read_bytes() == b"scientifically verified bytes"
     assert list(tmp_path.glob(".stingray-export-*")) == []
+
+
+@requires_posix_publication
+def test_posix_publication_writer_supports_seekable_read_write_stream(tmp_path):
+    destination = tmp_path / "artifact.hdf5"
+
+    with open_secure_publication(
+        str(destination),
+        _write_grant(destination),
+    ) as publication:
+        publication.reserve_staging(".hdf5")
+        with publication.open_writer("w+b", encoding=None) as stream:
+            assert stream.seekable() is True
+            assert stream.readable() is True
+            assert stream.writable() is True
+            stream.write(b"HDF5-compatible stream")
+            stream.seek(0)
+            assert stream.read() == b"HDF5-compatible stream"
+        with publication.open_reader("rb", encoding=None) as stream:
+            assert stream.read() == b"HDF5-compatible stream"
+        publication.verified_size()
+        publication.publish()
+
+    assert destination.read_bytes() == b"HDF5-compatible stream"
+
+
+@requires_posix_publication
+def test_posix_publication_uses_fixed_grant_admission_time(tmp_path, monkeypatch):
+    destination = tmp_path / "long-running.bin"
+    grant = _write_grant(destination)
+    future_time = int(time.time()) + FILE_GRANT_TTL_SECONDS + 30
+
+    with open_secure_publication(str(destination), grant) as publication:
+        publication.reserve_staging(".bin")
+        with publication.open_writer("wb", encoding=None) as stream:
+            stream.write(b"long-running export")
+        monkeypatch.setattr(utility_helpers.time, "time", lambda: future_time)
+        with publication.open_reader("rb", encoding=None) as stream:
+            assert stream.read() == b"long-running export"
+        publication.verified_size()
+        publication.publish()
+
+    assert destination.read_bytes() == b"long-running export"
+
+
+@requires_posix_publication
+def test_posix_publication_rejects_grant_expired_before_admission(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "expired.bin"
+    admission_time = int(time.time())
+    monkeypatch.setattr(
+        utility_helpers.time,
+        "time",
+        lambda: admission_time - FILE_GRANT_TTL_SECONDS - 1,
+    )
+    expired_grant = _write_grant(destination)
+    monkeypatch.setattr(utility_helpers.time, "time", lambda: admission_time)
+
+    with pytest.raises(PermissionError, match="expired"):
+        with open_secure_publication(str(destination), expired_grant):
+            pytest.fail("An expired grant must not be admitted")
 
 
 @requires_posix_publication
@@ -172,11 +243,64 @@ def test_posix_writer_stream_construction_closes_descriptor_once(tmp_path, monke
     assert not destination.exists()
 
 
+@requires_posix_publication
+def test_posix_invalid_stream_modes_close_transferred_descriptors(
+    tmp_path, monkeypatch
+):
+    writer_destination = tmp_path / "invalid-writer.bin"
+    with open_secure_publication(
+        str(writer_destination),
+        _write_grant(writer_destination),
+    ) as publication:
+        publication.reserve_staging(".bin")
+        writer_descriptor = publication._writer_descriptor
+        real_close = publication_module.os.close
+        closed: list[int] = []
+
+        def tracked_close(descriptor: int) -> None:
+            closed.append(descriptor)
+            real_close(descriptor)
+
+        monkeypatch.setattr(publication_module.os, "close", tracked_close)
+        with pytest.raises(ValueError, match="Unsupported secure publication stream"):
+            with publication.open_writer("invalid", encoding=None):
+                pass
+        assert closed.count(writer_descriptor) == 1
+
+    reader_destination = tmp_path / "invalid-reader.bin"
+    with open_secure_publication(
+        str(reader_destination),
+        _write_grant(reader_destination),
+    ) as publication:
+        publication.reserve_staging(".bin")
+        with publication.open_writer("wb", encoding=None) as stream:
+            stream.write(b"private bytes")
+        closed.clear()
+        opened: list[int] = []
+        real_open = publication_module.os.open
+
+        def tracked_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            opened.append(descriptor)
+            return descriptor
+
+        monkeypatch.setattr(publication_module.os, "open", tracked_open)
+        with pytest.raises(ValueError, match="Unsupported secure publication stream"):
+            with publication.open_reader("invalid", encoding=None):
+                pass
+        assert opened
+        assert closed.count(opened[-1]) == 1
+
+    assert not writer_destination.exists()
+    assert not reader_destination.exists()
+    assert list(tmp_path.glob(".stingray-export-*")) == []
+
+
 def test_secure_publication_fails_closed_without_a_platform_adapter(
     tmp_path, monkeypatch
 ):
     destination = tmp_path / "artifact.bin"
-    monkeypatch.setattr(publication_module, "_platform_name", lambda: "nt")
+    monkeypatch.setattr(publication_module, "_platform_name", lambda: "unsupported")
 
     with pytest.raises(NotImplementedError, match="not supported"):
         with open_secure_publication(str(destination), "unused"):

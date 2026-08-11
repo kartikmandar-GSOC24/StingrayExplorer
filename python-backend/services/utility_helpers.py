@@ -47,6 +47,10 @@ SECURE_DIR_FD_OPERATIONS_SUPPORTED = all(
 )
 
 
+class FileGrantEligibilityError(ValueError):
+    """A selected path cannot satisfy the platform's secure-file boundary."""
+
+
 @dataclass(frozen=True)
 class GrantedReadFile:
     """An identity-verified file held open for the whole scientific read."""
@@ -63,6 +67,17 @@ class GrantedWriteDestination:
     path: Path
     parent_descriptor: int
     filename: str
+    admitted_at: int
+
+
+@dataclass(frozen=True)
+class GrantedWindowsWriteDestination:
+    """A Windows destination whose reparse-free prefix handles stay pinned."""
+
+    path: Path
+    parent: Any
+    filename: str
+    admitted_at: int
 
 
 @dataclass(frozen=True)
@@ -79,6 +94,14 @@ class _ParsedFileGrant:
     expires_at: int
     device: int
     inode: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class _ParsedWindowsFileGrant:
+    expires_at: int
+    volume_serial: int
+    file_id: bytes
     digest: str
 
 
@@ -408,6 +431,14 @@ def _canonical_path(file_path: str, *, must_exist: bool) -> Path:
         raise ValueError(
             "A non-empty file path selected through the native dialog is required"
         )
+    if os.name == "nt":
+        from .windows_secure_fs import canonicalize_windows_path
+
+        # Existence and type are checked through retained, reparse-safe native
+        # handles by the issuer/verifier.  Do not call Path.resolve() here: on
+        # Windows it would follow the very reparse points we must reject.
+        return canonicalize_windows_path(file_path)
+
     candidate = Path(file_path).expanduser()
     if must_exist:
         resolved = candidate.resolve(strict=True)
@@ -442,14 +473,46 @@ def _configured_file_grant_secret(secret: str | None = None) -> bytes:
     return encoded
 
 
-def _parse_file_grant(grant: str) -> _ParsedFileGrant:
+def _parse_file_grant(grant: str) -> _ParsedFileGrant | _ParsedWindowsFileGrant:
+    from .windows_secure_fs import WINDOWS_FILE_GRANT_VERSION
+
     try:
         if not isinstance(grant, str) or len(grant) > MAX_FILE_GRANT_TOKEN_CHARS:
             raise ValueError
         parts = grant.split(".")
-        if len(parts) != 5 or parts[0] != FILE_GRANT_VERSION:
+        if len(parts) != 5:
             raise ValueError
-        expires_text, device_text, inode_text, digest = parts[1:]
+        version, expires_text, first_identity, second_identity, digest = parts
+        if version not in {FILE_GRANT_VERSION, WINDOWS_FILE_GRANT_VERSION}:
+            raise ValueError
+        if version == WINDOWS_FILE_GRANT_VERSION:
+            if (
+                not expires_text
+                or len(expires_text) > MAX_FILE_GRANT_EXPIRY_DIGITS
+                or any(character not in "0123456789" for character in expires_text)
+                or len(first_identity) != 16
+                or any(
+                    character not in "0123456789abcdef" for character in first_identity
+                )
+                or len(second_identity) != 32
+                or any(
+                    character not in "0123456789abcdef" for character in second_identity
+                )
+            ):
+                raise ValueError
+            if len(digest) != hashlib.sha256().digest_size * 2 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError
+            return _ParsedWindowsFileGrant(
+                expires_at=int(expires_text),
+                volume_serial=int(first_identity, 16),
+                file_id=bytes.fromhex(second_identity),
+                digest=digest,
+            )
+
+        device_text = first_identity
+        inode_text = second_identity
         numeric_fields = (
             (expires_text, MAX_FILE_GRANT_EXPIRY_DIGITS),
             (device_text, MAX_FILE_GRANT_IDENTITY_DIGITS),
@@ -490,17 +553,65 @@ def _file_grant_message(
     ).encode()
 
 
+def _windows_file_grant_message(
+    *,
+    access: str,
+    expires_at: int,
+    path: Path,
+    volume_serial: int,
+    file_id: bytes,
+) -> bytes:
+    from .windows_secure_fs import WINDOWS_FILE_GRANT_VERSION
+
+    return (
+        f"{WINDOWS_FILE_GRANT_VERSION}\0{access}\0{expires_at}\0{path}\0"
+        f"{volume_serial:016x}\0{file_id.hex()}"
+    ).encode()
+
+
 def issue_file_grant(
     file_path: str,
     *,
     access: str,
     secret: str | None = None,
 ) -> IssuedFileGrant:
-    """Issue a v2 grant using Python's own canonical path and file identity."""
+    """Issue a platform-versioned grant using Python's native file identity."""
     if access not in {"read", "write"}:
         raise ValueError("Invalid file-grant access mode")
     secret_bytes = _configured_file_grant_secret(secret)
-    resolved = _canonical_path(file_path, must_exist=access == "read")
+    try:
+        resolved = _canonical_path(file_path, must_exist=access == "read")
+    except ValueError as exc:
+        if os.name == "nt":
+            raise FileGrantEligibilityError(str(exc)) from exc
+        raise
+    if os.name == "nt":
+        from .windows_secure_fs import WINDOWS_FILE_GRANT_VERSION, pin_windows_path
+
+        identity_path = resolved if access == "read" else resolved.parent
+        try:
+            with pin_windows_path(
+                identity_path,
+                directory=access == "write",
+            ) as pinned:
+                identity = pinned.identity
+        except PermissionError as exc:
+            raise FileGrantEligibilityError(str(exc)) from exc
+        expires_at = int(time.time()) + FILE_GRANT_TTL_SECONDS
+        message = _windows_file_grant_message(
+            access=access,
+            expires_at=expires_at,
+            path=resolved,
+            volume_serial=identity.volume_serial,
+            file_id=identity.file_id,
+        )
+        digest = hmac.new(secret_bytes, message, hashlib.sha256).hexdigest()
+        grant = (
+            f"{WINDOWS_FILE_GRANT_VERSION}.{expires_at}."
+            f"{identity.volume_hex}.{identity.file_id_hex}.{digest}"
+        )
+        return IssuedFileGrant(path=resolved, grant=grant, expires_at=expires_at)
+
     identity_path = resolved if access == "read" else resolved.parent
     identity = identity_path.stat()
     if access == "read" and not stat.S_ISREG(identity.st_mode):
@@ -524,33 +635,68 @@ def issue_file_grant(
     return IssuedFileGrant(path=resolved, grant=grant, expires_at=expires_at)
 
 
-def verify_file_grant(
+def _verify_file_grant_at_time(
     file_path: str,
     grant: str,
     *,
     access: str,
     must_exist: bool,
+    validation_time: int,
 ) -> Path:
-    """Verify a Python-issued HMAC grant for exactly one selected path.
-
-    The renderer receives the selected absolute path and a short-lived token,
-    but never receives the issuer/signing secret shared by Electron main and
-    FastAPI. It therefore cannot substitute an adjacent or manually typed path.
-    """
     if access not in {"read", "write"}:
         raise ValueError("Invalid file-grant access mode")
     secret = _configured_file_grant_secret()
     parsed = _parse_file_grant(grant)
 
-    now = int(time.time())
-    if parsed.expires_at < now:
+    if parsed.expires_at < validation_time:
         raise PermissionError(
             "The native file selection grant has expired; select the file again"
         )
-    if parsed.expires_at > now + FILE_GRANT_MAX_FUTURE_SECONDS:
+    if parsed.expires_at > validation_time + FILE_GRANT_MAX_FUTURE_SECONDS:
         raise PermissionError("The native file selection grant expiry is invalid")
 
     resolved = _canonical_path(file_path, must_exist=must_exist)
+    if os.name == "nt":
+        from .windows_secure_fs import pin_windows_path
+
+        if not isinstance(parsed, _ParsedWindowsFileGrant):
+            raise PermissionError(
+                "This native file grant is not valid for the Windows filesystem"
+            )
+        message = _windows_file_grant_message(
+            access=access,
+            expires_at=parsed.expires_at,
+            path=resolved,
+            volume_serial=parsed.volume_serial,
+            file_id=parsed.file_id,
+        )
+        expected = hmac.new(secret, message, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(parsed.digest, expected):
+            raise PermissionError(
+                "The path does not match the native file selection grant"
+            )
+        identity_path = resolved if access == "read" else resolved.parent
+        with pin_windows_path(
+            identity_path,
+            directory=access == "write",
+        ) as pinned:
+            if (
+                pinned.identity.volume_serial != parsed.volume_serial
+                or pinned.identity.file_id != parsed.file_id
+            ):
+                if access == "read":
+                    raise PermissionError(
+                        "The selected input file identity changed; select the file again"
+                    )
+                raise PermissionError(
+                    "The selected destination directory identity changed; choose it again"
+                )
+        return resolved
+
+    if not isinstance(parsed, _ParsedFileGrant):
+        raise PermissionError(
+            "This native file grant is not valid for the POSIX filesystem"
+        )
     message = _file_grant_message(
         access=access,
         expires_at=parsed.expires_at,
@@ -580,17 +726,65 @@ def verify_file_grant(
     return resolved
 
 
+def verify_file_grant(
+    file_path: str,
+    grant: str,
+    *,
+    access: str,
+    must_exist: bool,
+) -> Path:
+    """Verify a Python-issued HMAC grant for exactly one selected path.
+
+    The renderer receives the selected absolute path and a short-lived token,
+    but never receives the issuer/signing secret shared by Electron main and
+    FastAPI. It therefore cannot substitute an adjacent or manually typed path.
+    """
+    return _verify_file_grant_at_time(
+        file_path,
+        grant,
+        access=access,
+        must_exist=must_exist,
+        validation_time=int(time.time()),
+    )
+
+
+def revalidate_admitted_file_grant(
+    file_path: str,
+    grant: str,
+    *,
+    access: str,
+    must_exist: bool,
+    admitted_at: int,
+) -> Path:
+    """Revalidate an already-admitted grant at its immutable admission time.
+
+    This is an internal capability operation: no request model accepts
+    ``admitted_at``.  Long-running writes therefore retain their admission,
+    while signature, canonical path, future-window, and filesystem identity
+    checks are still recomputed before verification/publication.
+    """
+    if isinstance(admitted_at, bool) or not isinstance(admitted_at, int):
+        raise RuntimeError("The native file grant admission time is invalid")
+    return _verify_file_grant_at_time(
+        file_path,
+        grant,
+        access=access,
+        must_exist=must_exist,
+        validation_time=admitted_at,
+    )
+
+
 @contextmanager
 def open_verified_read_grant(
     file_path: str,
     grant: str,
 ) -> Generator[GrantedReadFile, None, None]:
-    """Open one granted file and pin all later reads to its verified inode.
+    """Open one granted file and pin all reads to its verified native identity.
 
-    The native grant includes the device/inode observed by Electron main.  We
-    re-check that identity on the descriptor itself and keep the descriptor
-    open, so replacing the pathname after validation cannot redirect Astropy
-    or Stingray to a different file.
+    POSIX uses device/inode identity; Windows uses the volume serial and
+    128-bit ``FILE_ID_INFO`` identity while retaining a reparse-free handle for
+    every path prefix.  In both cases, replacing the pathname after validation
+    cannot redirect Astropy or Stingray to a different file.
     """
     path = verify_file_grant(
         file_path,
@@ -598,6 +792,34 @@ def open_verified_read_grant(
         access="read",
         must_exist=True,
     )
+    if os.name == "nt":
+        from .windows_secure_fs import pin_windows_path
+
+        parsed = _parse_file_grant(grant)
+        if not isinstance(parsed, _ParsedWindowsFileGrant):
+            raise PermissionError("A Windows FILE_ID_INFO grant is required")
+        with pin_windows_path(path, directory=False) as pinned:
+            if (
+                pinned.identity.volume_serial != parsed.volume_serial
+                or pinned.identity.file_id != parsed.file_id
+            ):
+                raise PermissionError(
+                    "The selected input file identity changed; select the file again"
+                )
+            descriptor = pinned.api.duplicate_to_fd(pinned.handle, writable=False)
+            try:
+                with os.fdopen(descriptor, "rb", closefd=True) as stream:
+                    descriptor = -1
+                    yield GrantedReadFile(
+                        path=path,
+                        stream=stream,
+                        size_bytes=pinned.api.size(pinned.handle),
+                    )
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+        return
+
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -632,23 +854,63 @@ def open_verified_read_grant(
 def open_verified_write_grant(
     file_path: str,
     grant: str,
-) -> Generator[GrantedWriteDestination, None, None]:
+) -> Generator[
+    GrantedWriteDestination | GrantedWindowsWriteDestination,
+    None,
+    None,
+]:
     """Pin the identity-verified destination directory for an export.
 
-    Export mutations must use ``parent_descriptor`` and relative names.  This
-    prevents an ancestor rename/replacement after grant validation from
-    redirecting writes or cleanup into a different directory.
+    Export mutations use a retained POSIX directory descriptor or the complete
+    reparse-free Windows prefix-handle chain, followed only by relative native
+    operations. This prevents an ancestor rename/replacement after validation
+    from redirecting writes or cleanup into a different directory.
     """
+    admitted_at = int(time.time())
+    if os.name == "nt":
+        from .windows_secure_fs import pin_windows_path
+
+        path = _verify_file_grant_at_time(
+            file_path,
+            grant,
+            access="write",
+            must_exist=False,
+            validation_time=admitted_at,
+        )
+        parsed = _parse_file_grant(grant)
+        if not isinstance(parsed, _ParsedWindowsFileGrant):
+            raise PermissionError("A Windows FILE_ID_INFO grant is required")
+        with pin_windows_path(
+            path.parent,
+            directory=True,
+            writable_directory=True,
+        ) as parent:
+            if (
+                parent.identity.volume_serial != parsed.volume_serial
+                or parent.identity.file_id != parsed.file_id
+            ):
+                raise PermissionError(
+                    "The selected destination directory identity changed; choose it again"
+                )
+            yield GrantedWindowsWriteDestination(
+                path=path,
+                parent=parent,
+                filename=path.name,
+                admitted_at=admitted_at,
+            )
+        return
+
     if not SECURE_DIR_FD_OPERATIONS_SUPPORTED:
         raise PermissionError(
             "Secure native exports are unavailable on this platform because "
             "directory-relative file operations are unsupported"
         )
-    path = verify_file_grant(
+    path = _verify_file_grant_at_time(
         file_path,
         grant,
         access="write",
         must_exist=False,
+        validation_time=admitted_at,
     )
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
@@ -672,6 +934,7 @@ def open_verified_write_grant(
             path=path,
             parent_descriptor=descriptor,
             filename=path.name,
+            admitted_at=admitted_at,
         )
     finally:
         os.close(descriptor)

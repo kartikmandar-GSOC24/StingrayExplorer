@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import os
 import time
+from pathlib import Path
 
 import httpx
 import pytest
 from main import BACKEND_SESSION_HEADER, create_app
+from routes import internal_grant_routes
 from routes.internal_grant_routes import GRANT_ISSUER_HEADER
 from services.utility_helpers import (
+    FileGrantEligibilityError,
     FILE_GRANT_SECRET_ENV,
     FILE_GRANT_TTL_SECONDS,
     FILE_GRANT_VERSION,
     verify_file_grant,
 )
+from services.windows_secure_fs import WINDOWS_FILE_GRANT_VERSION
 
 SESSION_SECRET = "session-secret-for-route-tests-32-bytes"
 ISSUER_SECRET = "issuer-secret-for-route-tests-32-bytes"
@@ -102,6 +107,38 @@ async def test_missing_or_weak_issuer_configuration_fails_closed(
 
 
 @pytest.mark.asyncio
+async def test_ineligible_native_path_returns_bounded_actionable_400(
+    tmp_path, monkeypatch
+):
+    selected = tmp_path / "selected.fits"
+
+    def reject_ineligible_path(*_args, **_kwargs):
+        raise FileGrantEligibilityError(
+            "Windows reparse points, junctions, and symbolic links are not supported"
+        )
+
+    monkeypatch.setattr(
+        internal_grant_routes,
+        "issue_file_grant",
+        reject_ineligible_path,
+    )
+    async with make_client() as client:
+        response = await client.post(
+            ISSUE_PATH,
+            headers=ISSUER_HEADERS,
+            json={"path": str(selected), "access": "read"},
+        )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail == (
+        "Windows reparse points, junctions, and symbolic links are not supported"
+    )
+    assert len(detail) <= 256
+    assert str(selected) not in response.text
+
+
+@pytest.mark.asyncio
 async def test_main_can_issue_and_verify_read_and_write_grants(tmp_path, monkeypatch):
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, ISSUER_SECRET)
     selected = tmp_path / "selected.fits"
@@ -124,13 +161,16 @@ async def test_main_can_issue_and_verify_read_and_write_grants(tmp_path, monkeyp
     assert read_response.status_code == 200
     assert write_response.status_code == 200
     assert read_response.headers["cache-control"] == "no-store"
+    expected_version = (
+        WINDOWS_FILE_GRANT_VERSION if os.name == "nt" else FILE_GRANT_VERSION
+    )
     for response, path, access, must_exist in (
         (read_response, selected, "read", True),
         (write_response, destination, "write", False),
     ):
         payload = response.json()
-        assert payload["path"] == str(path.resolve())
-        assert payload["grant"].startswith(f"{FILE_GRANT_VERSION}.")
+        assert Path(payload["path"]) == path.resolve()
+        assert payload["grant"].startswith(f"{expected_version}.")
         assert before + FILE_GRANT_TTL_SECONDS <= payload["expires_at"]
         assert payload["expires_at"] <= int(time.time()) + FILE_GRANT_TTL_SECONDS
         assert (
