@@ -13,8 +13,8 @@ const trustedRequest = {
   requestWebContentsId: 7,
   trustedWebContentsId: 7,
   isMainFrame: true,
-  frameUrl: 'http://localhost:5173/data-ingestion',
-  rendererEntryUrl: 'http://localhost:5173',
+  frameUrl: 'http://localhost:5173/#/data-ingestion',
+  rendererEntryUrl: 'http://localhost:5173/',
 };
 
 describe('Electron backend session policy', () => {
@@ -49,17 +49,27 @@ describe('Electron backend session policy', () => {
     ).toBe(false);
   });
 
-  it('accepts the exact packaged file entry but not adjacent local files', () => {
+  it.each([
+    [
+      'macOS',
+      'file:///Applications/Stingray%20Explorer/dist/index.html',
+      'file://attacker.example/Applications/Stingray%20Explorer/dist/index.html',
+    ],
+    [
+      'Windows',
+      'file:///C:/Program%20Files/Stingray%20Explorer/dist/index.html',
+      'file://attacker.example/C:/Program%20Files/Stingray%20Explorer/dist/index.html',
+    ],
+  ])('accepts only the exact %s packaged file entry', (_platform, entry, foreignAuthority) => {
+    expect(isTrustedRendererLocation(`${entry}#/utilities/io`, entry)).toBe(true);
+    expect(isTrustedRendererLocation(foreignAuthority, entry)).toBe(false);
+    expect(isTrustedRendererLocation(`${entry}?source=attacker#/utilities/io`, entry)).toBe(
+      false
+    );
     expect(
       isTrustedRendererLocation(
-        'file:///Applications/Stingray%20Explorer/dist/index.html#/utilities/io',
-        'file:///Applications/Stingray%20Explorer/dist/index.html'
-      )
-    ).toBe(true);
-    expect(
-      isTrustedRendererLocation(
-        'file:///Applications/Stingray%20Explorer/dist/other.html',
-        'file:///Applications/Stingray%20Explorer/dist/index.html'
+        entry.replace('index.html', 'other.html'),
+        entry
       )
     ).toBe(false);
   });

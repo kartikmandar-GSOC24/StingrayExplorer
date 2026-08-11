@@ -16,10 +16,15 @@ export function isTrustedRendererLocation(currentUrl: string, entryUrl: string):
   try {
     const current = new URL(currentUrl);
     const entry = new URL(entryUrl);
-    if (entry.protocol === 'file:') {
-      return current.protocol === 'file:' && current.pathname === entry.pathname;
-    }
-    return current.origin === entry.origin;
+    return (
+      current.protocol === entry.protocol &&
+      current.username === entry.username &&
+      current.password === entry.password &&
+      current.hostname === entry.hostname &&
+      current.port === entry.port &&
+      current.pathname === entry.pathname &&
+      current.search === entry.search
+    );
   } catch {
     return false;
   }

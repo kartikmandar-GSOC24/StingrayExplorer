@@ -16,6 +16,15 @@ const FILE_GRANT_ISSUER_HEADER = 'X-Stingray-Grant-Issuer';
 const FILE_GRANT_REQUEST_TIMEOUT_MS = 5000;
 const MAX_SELECTED_PATH_LENGTH = 4096;
 const MAX_FILE_GRANT_REQUEST_BYTES = 16 * 1024;
+export const DEFAULT_BACKEND_PORT = 8765;
+
+/** Parse the backend's stdout protocol without accepting ambiguous port text. */
+export function parseBackendPortAnnouncement(line: string): number | null {
+  const match = /^BACKEND_PORT:([1-9][0-9]{0,4})$/.exec(line);
+  if (!match) return null;
+  const port = Number(match[1]);
+  return port >= 1 && port <= 65535 ? port : null;
+}
 
 export type LogLevel = 'info' | 'warn' | 'error' | 'debug';
 export type LogSource = 'python' | 'electron';
@@ -30,7 +39,8 @@ export type LogCallback = (level: LogLevel, message: string, source: LogSource) 
 
 export class PythonManager {
   private process: ChildProcess | null = null;
-  private port: number = 8765;
+  private port: number = DEFAULT_BACKEND_PORT;
+  private announcedPort: number | null = null;
   private retryInterval: number = 500; // ms between health checks
   // Soft threshold after which the wait for /health is logged as a warning.
   // A cold first launch imports the full scientific stack (stingray, numba,
@@ -41,6 +51,7 @@ export class PythonManager {
   private slowStartWarnMs: number = 180000; // 3 minutes
   private progressLogIntervalMs: number = 15000; // emit a "still waiting" log every 15s
   private isRunning: boolean = false;
+  private startupError: Error | null = null;
   private logCallback: LogCallback | null = null;
   // Shared only with Electron main and the child backend. The renderer never
   // receives this credential; main adds it to trusted loopback requests.
@@ -77,9 +88,14 @@ export class PythonManager {
       return;
     }
 
+    this.announcedPort = null;
+    this.port = DEFAULT_BACKEND_PORT;
+    this.isRunning = false;
+    this.startupError = null;
+
     // An external backend cannot prove that it shares this launch credential.
     // Refuse it instead of silently attaching to an unauthenticated process.
-    const alreadyRunning = await this.checkHealth();
+    const alreadyRunning = await this.checkHealth(DEFAULT_BACKEND_PORT);
     if (alreadyRunning) {
       throw new Error(
         `A backend is already responding on 127.0.0.1:${this.port}, but Electron did not launch it and cannot authenticate it. ` +
@@ -93,7 +109,7 @@ export class PythonManager {
 
     this.sendLog('info', `Starting Python backend: ${pythonPath} ${args.join(' ')}`);
 
-    this.process = spawn(pythonPath, args, {
+    const child = spawn(pythonPath, args, {
       cwd: isDev ? path.join(app.getAppPath(), 'python-backend') : undefined,
       env: {
         ...process.env,
@@ -113,55 +129,80 @@ export class PythonManager {
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    this.process = child;
+
+    let stdoutBuffer = '';
+    let stderrBuffer = '';
+    const handleOutput = (
+      chunk: Buffer | string,
+      defaultLevel: LogLevel,
+      stream: 'stdout' | 'stderr'
+    ) => {
+      const buffer = stream === 'stdout' ? stdoutBuffer : stderrBuffer;
+      const lines = (buffer + chunk.toString()).split('\n');
+      const partial = lines.pop() ?? '';
+      if (stream === 'stdout') stdoutBuffer = partial;
+      else stderrBuffer = partial;
+      for (const rawLine of lines) {
+        const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+        if (!line) continue;
+        if (defaultLevel === 'info' && line.startsWith('BACKEND_PORT:')) {
+          const parsedPort = parseBackendPortAnnouncement(line);
+          if (parsedPort === null || this.announcedPort !== null) {
+            this.startupError = new Error('Python backend announced an invalid or duplicate port');
+            if (this.process === child) child.kill('SIGTERM');
+          } else {
+            this.announcedPort = parsedPort;
+            this.port = parsedPort;
+            this.sendLog('info', `Backend will use port ${parsedPort}`);
+          }
+        }
+        const level = this.detectLogLevel(line, defaultLevel);
+        this.sendLog(level, line);
+      }
+    };
 
     // Handle stdout
-    this.process.stdout?.on('data', (data: Buffer) => {
-      const lines = data.toString().trim().split('\n');
-      for (const line of lines) {
-        if (line) {
-          // Check for port announcement
-          const portMatch = line.match(/^BACKEND_PORT:(\d+)$/);
-          if (portMatch) {
-            this.port = parseInt(portMatch[1], 10);
-            this.sendLog('info', `Backend will use port ${this.port}`);
-          }
-
-          // Detect log level from message content
-          const level = this.detectLogLevel(line);
-          this.sendLog(level, line);
-        }
-      }
-    });
+    child.stdout?.on('data', (data: Buffer) => handleOutput(data, 'info', 'stdout'));
 
     // Handle stderr
-    this.process.stderr?.on('data', (data: Buffer) => {
-      const lines = data.toString().trim().split('\n');
-      for (const line of lines) {
-        if (line) {
-          // Stderr messages are typically warnings or errors
-          const level = this.detectLogLevel(line, 'warn');
-          this.sendLog(level, line);
-        }
-      }
-    });
+    child.stderr?.on('data', (data: Buffer) => handleOutput(data, 'warn', 'stderr'));
 
     // Handle process exit
-    this.process.on('exit', (code, signal) => {
+    child.on('exit', (code, signal) => {
       const message = `Python backend exited with code ${code}, signal ${signal}`;
       this.sendLog(code === 0 ? 'info' : 'error', message);
-      this.isRunning = false;
-      this.process = null;
+      if (this.process === child) {
+        this.isRunning = false;
+        this.announcedPort = null;
+        this.port = DEFAULT_BACKEND_PORT;
+        this.process = null;
+      }
     });
 
     // Handle process error
-    this.process.on('error', (error) => {
+    child.on('error', (error) => {
       this.sendLog('error', `Failed to start Python backend: ${error.message}`);
-      this.isRunning = false;
+      if (this.process === child) {
+        this.isRunning = false;
+        this.announcedPort = null;
+        this.port = DEFAULT_BACKEND_PORT;
+        this.startupError = error;
+      }
     });
 
     // Wait for backend to be ready
-    await this.waitForReady();
-    this.isRunning = true;
+    try {
+      await this.waitForReady();
+      if (this.process === child && this.announcedPort !== null) {
+        this.isRunning = true;
+      }
+    } catch (error) {
+      if (this.process === child) {
+        await this.stop();
+      }
+      throw error;
+    }
   }
 
   /**
@@ -200,8 +241,10 @@ export class PythonManager {
     this.sendLog('info', 'Stopping Python backend...');
 
     // If we spawned it, kill the process
+    this.announcedPort = null;
+    this.port = DEFAULT_BACKEND_PORT;
+    this.isRunning = false;
     if (!this.process) {
-      this.isRunning = false;
       return;
     }
 
@@ -226,8 +269,12 @@ export class PythonManager {
       // Try graceful shutdown first
       proc.once('exit', () => {
         clearTimeout(forceKillTimer);
-        this.process = null;
-        this.isRunning = false;
+        if (this.process === proc) {
+          this.process = null;
+          this.announcedPort = null;
+          this.port = DEFAULT_BACKEND_PORT;
+          this.isRunning = false;
+        }
         this.sendLog('info', 'Python backend stopped');
         resolve();
       });
@@ -292,12 +339,16 @@ export class PythonManager {
       // If we spawned the process and it has already exited, fail fast so the
       // real error (crash, missing dependency, etc.) surfaces immediately.
       // The exit handler in start() sets this.process to null on child exit.
+      if (this.startupError) {
+        throw this.startupError;
+      }
       if (!this.process) {
         throw new Error('Python backend process exited before becoming ready');
       }
 
       try {
-        if (await this.checkAuthenticatedReady()) {
+        const announcedPort = this.announcedPort;
+        if (announcedPort !== null && await this.checkAuthenticatedReady(announcedPort)) {
           const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
           this.sendLog('info', `Python backend is ready! (took ${elapsed}s)`);
           return;
@@ -329,12 +380,12 @@ export class PythonManager {
   /**
    * Check if the backend is healthy
    */
-  private checkHealth(): Promise<boolean> {
+  private checkHealth(port: number = this.getPort()): Promise<boolean> {
     return new Promise((resolve) => {
       const req = http.request(
         {
           hostname: '127.0.0.1',
-          port: this.port,
+          port,
           path: '/health',
           method: 'GET',
           timeout: 1000,
@@ -358,12 +409,12 @@ export class PythonManager {
   }
 
   /** Confirm that the child received this launch's private session credential. */
-  private checkAuthenticatedReady(): Promise<boolean> {
+  private checkAuthenticatedReady(port: number): Promise<boolean> {
     return new Promise((resolve) => {
       const req = http.request(
         {
           hostname: '127.0.0.1',
-          port: this.port,
+          port,
           path: '/api/status',
           method: 'GET',
           headers: { [BACKEND_SESSION_HEADER]: this.backendSessionSecret },
@@ -395,7 +446,7 @@ export class PythonManager {
    * Get the port the Python backend is running on
    */
   getPort(): number {
-    return this.port;
+    return this.announcedPort ?? DEFAULT_BACKEND_PORT;
   }
 
   /**
@@ -407,7 +458,7 @@ export class PythonManager {
 
   /** Credential available to Electron main for trusted backend requests only. */
   getBackendSessionSecret(): string {
-    if (!this.process) {
+    if (!this.process || this.announcedPort === null || !this.isRunning) {
       throw new Error('Backend session authentication is unavailable before startup');
     }
     return this.backendSessionSecret;
@@ -459,7 +510,7 @@ export class PythonManager {
       const req = http.request(
         {
           hostname: '127.0.0.1',
-          port: this.port,
+          port: this.getPort(),
           path: FILE_GRANT_ENDPOINT,
           method: 'POST',
           headers: {

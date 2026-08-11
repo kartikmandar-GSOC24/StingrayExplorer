@@ -259,18 +259,83 @@ data_service: DataService = None
 job_manager: JobManager = None
 
 
-def find_free_port(start_port: int = 8765, max_attempts: int = 100) -> int:
-    """Find a free port starting from start_port."""
-    for port in range(start_port, start_port + max_attempts):
+def parse_requested_port(value: str) -> int:
+    """Parse an explicit port using one canonical decimal representation."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or not value.isascii()
+        or not value.isdigit()
+        or value[0] == "0"
+    ):
+        raise ValueError("PORT must be a canonical decimal port between 1 and 65535")
+    port = int(value)
+    if port < 1 or port > 65535:
+        raise ValueError("PORT must be a canonical decimal port between 1 and 65535")
+    return port
+
+
+def bind_backend_socket(
+    start_port: int = 8765,
+    max_attempts: int = 100,
+    requested_port: str | None = None,
+) -> socket.socket:
+    """Bind and listen on the selected loopback port before announcing it."""
+    if requested_port is not None:
+        candidates = (parse_requested_port(requested_port),)
+    else:
+        if not isinstance(start_port, int) or not 1 <= start_port <= 65535:
+            raise ValueError("start_port must be between 1 and 65535")
+        if not isinstance(max_attempts, int) or max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        candidates = range(start_port, min(65536, start_port + max_attempts))
+
+    last_error: OSError | None = None
+    for port in candidates:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("127.0.0.1", port))
-                return port
-        except OSError:
-            continue
+            if sys.platform == "win32":
+                exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+                if exclusive is not None:
+                    listener.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+            else:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", port))
+            listener.listen()
+            return listener
+        except OSError as error:
+            last_error = error
+            listener.close()
+            if requested_port is not None:
+                break
+
+    if requested_port is not None and last_error is not None:
+        raise RuntimeError("The requested backend port is unavailable") from last_error
     raise RuntimeError(
         f"Could not find a free port in range {start_port}-{start_port + max_attempts}"
+    ) from last_error
+
+
+def run_backend(requested_port: str | None = None) -> None:
+    """Own the listener for the complete Uvicorn lifetime."""
+    import uvicorn
+
+    listener = bind_backend_socket(8765, 100, requested_port)
+    actual_port = listener.getsockname()[1]
+    print(f"BACKEND_PORT:{actual_port}", flush=True)
+    config = uvicorn.Config(
+        "main:app",
+        host="127.0.0.1",
+        port=actual_port,
+        reload=False,
+        log_level="info",
+        workers=1,
     )
+    server = uvicorn.Server(config)
+    try:
+        server.run(sockets=[listener])
+    finally:
+        listener.close()
 
 
 @asynccontextmanager
@@ -466,8 +531,6 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    import uvicorn
-
     # Suppress /api/status access logs to avoid log flooding during polling
     logging.getLogger("uvicorn.access").addFilter(StatusEndpointFilter())
 
@@ -475,14 +538,6 @@ if __name__ == "__main__":
     requested_port = os.environ.get("PORT") or (
         sys.argv[1] if len(sys.argv) > 1 else None
     )
-
-    if requested_port:
-        port = int(requested_port)
-    else:
-        port = find_free_port(8765)
-
-    # Print port so parent process can read it
-    print(f"BACKEND_PORT:{port}", flush=True)
 
     # Handle signals for graceful shutdown
     def signal_handler(signum, frame):
@@ -492,10 +547,4 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    uvicorn.run(
-        "main:app",
-        host="127.0.0.1",
-        port=port,
-        reload=False,
-        log_level="info",
-    )
+    run_backend(requested_port)

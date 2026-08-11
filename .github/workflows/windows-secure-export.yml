@@ -42,6 +42,7 @@ jobs:
           pixi run -e dev pytest -q
           python-backend/tests/test_windows_secure_publication.py
           python-backend/tests/test_internal_grant_routes.py
+          python-backend/tests/test_backend_startup.py
 
       - name: Check Windows adapter formatting
         shell: pwsh
@@ -54,6 +55,8 @@ jobs:
           python-backend/tests/test_windows_secure_publication.py
           python-backend/tests/test_secure_publication.py
           python-backend/tests/test_internal_grant_routes.py
+          python-backend/main.py
+          python-backend/tests/test_backend_startup.py
 
       - name: Lint Windows adapter
         shell: pwsh
@@ -66,3 +69,5 @@ jobs:
           python-backend/tests/test_windows_secure_publication.py
           python-backend/tests/test_secure_publication.py
           python-backend/tests/test_internal_grant_routes.py
+          python-backend/main.py
+          python-backend/tests/test_backend_startup.py
