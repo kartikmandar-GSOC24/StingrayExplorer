@@ -570,28 +570,32 @@ class RemoteSourceClient:
         )
 
     @staticmethod
-    def _validate_peer(response: httpx.Response, validated: ValidatedRemoteURL) -> None:
+    def _validate_peer(
+        response: httpx.Response,
+        validated: ValidatedRemoteURL,
+        pinned_address: IPAddress,
+    ) -> None:
         network_stream = response.extensions.get("network_stream")
         if network_stream is None or not hasattr(network_stream, "get_extra_info"):
-            return
+            raise RemoteSourcePeerError(
+                f"Connected peer identity was unavailable for {validated.display_url}"
+            )
 
         try:
             server_address = network_stream.get_extra_info("server_addr")
-        except Exception as error:
+        except Exception:  # noqa: BLE001 - untrusted transport metadata must fail closed
             raise RemoteSourcePeerError(
                 f"Could not validate the connected peer for {validated.display_url}"
-            ) from error
-        if server_address is None:
-            return
-
-        if isinstance(server_address, tuple):
-            if len(server_address) < 2 or server_address[1] != validated.port:
-                raise RemoteSourcePeerError(
-                    f"Connected peer used an unexpected port for {validated.display_url}"
-                )
-            peer_value = server_address[0]
-        else:
-            peer_value = server_address
+            ) from None
+        if not isinstance(server_address, tuple) or len(server_address) < 2:
+            raise RemoteSourcePeerError(
+                f"Connected peer identity was unavailable for {validated.display_url}"
+            )
+        if server_address[1] != validated.port:
+            raise RemoteSourcePeerError(
+                f"Connected peer used an unexpected port for {validated.display_url}"
+            )
+        peer_value = server_address[0]
         if "%" in str(peer_value):
             raise RemoteSourcePeerError(
                 f"Connected peer was invalid for {validated.display_url}"
@@ -606,10 +610,19 @@ class RemoteSourceClient:
             raise RemoteSourcePeerError(
                 f"Connected peer was non-public for {validated.display_url}"
             )
-        if peer not in validated.addresses:
+        if peer != pinned_address:
             raise RemoteSourcePeerError(
-                f"Connected peer did not match validated DNS for {validated.display_url}"
+                f"Connected peer did not match the pinned address for "
+                f"{validated.display_url}"
             )
+
+    @staticmethod
+    def _address_order(address: IPAddress) -> tuple[int, bytes]:
+        return address.version, address.packed
+
+    @staticmethod
+    def _host_header(host: str) -> str:
+        return f"[{host}]" if ":" in host else host
 
     async def _send(
         self,
@@ -617,35 +630,58 @@ class RemoteSourceClient:
         validated: ValidatedRemoteURL,
         deadline: float,
     ) -> httpx.Response:
-        request = client.build_request(
-            "GET",
-            validated.url,
-            headers={
-                "Accept-Encoding": "identity",
-                "User-Agent": "StingrayExplorer/remote-source",
-            },
-        )
-        try:
-            response = await asyncio.wait_for(
-                client.send(request, stream=True),
-                timeout=self._remaining(deadline, validated.display_url),
+        last_failure_was_timeout = False
+        for pinned_address in sorted(validated.addresses, key=self._address_order):
+            # A numeric transport URL prevents a second DNS lookup.  Host remains
+            # the validated authority and sni_hostname makes httpcore perform TLS
+            # certificate verification against that original authority.
+            pinned_url = validated.url.copy_with(host=str(pinned_address))
+            client.cookies.clear()
+            request = client.build_request(
+                "GET",
+                pinned_url,
+                headers={
+                    "Accept-Encoding": "identity",
+                    "Host": self._host_header(validated.host),
+                    "User-Agent": "StingrayExplorer/remote-source",
+                },
+                extensions={"sni_hostname": validated.host},
             )
-        except (asyncio.TimeoutError, httpx.TimeoutException):
+            try:
+                response = await asyncio.wait_for(
+                    client.send(request, stream=True),
+                    timeout=self._remaining(deadline, validated.display_url),
+                )
+            except httpx.ConnectTimeout:
+                last_failure_was_timeout = True
+                continue
+            except httpx.ConnectError:
+                last_failure_was_timeout = False
+                continue
+            except (asyncio.TimeoutError, httpx.TimeoutException):
+                raise RemoteSourceTimeout(
+                    f"Remote request timed out for {validated.display_url}"
+                ) from None
+            except httpx.RequestError:
+                raise RemoteSourceError(
+                    f"Remote request failed for {validated.display_url}"
+                ) from None
+
+            try:
+                self._remaining(deadline, validated.display_url)
+                self._validate_peer(response, validated, pinned_address)
+            except Exception:
+                await response.aclose()
+                raise
+            return response
+
+        if last_failure_was_timeout:
             raise RemoteSourceTimeout(
                 f"Remote request timed out for {validated.display_url}"
             ) from None
-        except httpx.RequestError:
-            raise RemoteSourceError(
-                f"Remote request failed for {validated.display_url}"
-            ) from None
-
-        try:
-            self._remaining(deadline, validated.display_url)
-            self._validate_peer(response, validated)
-        except Exception:
-            await response.aclose()
-            raise
-        return response
+        raise RemoteSourceError(
+            f"Remote request failed for {validated.display_url}"
+        ) from None
 
     async def _open_response(
         self,
@@ -699,6 +735,7 @@ class RemoteSourceClient:
             transport=self._transport,
             timeout=self._timeouts.as_httpx_timeout(),
             follow_redirects=False,
+            limits=httpx.Limits(max_keepalive_connections=0),
             trust_env=False,
         ) as client:
             response, validated, redirect_count = await self._open_response(

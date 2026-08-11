@@ -181,7 +181,10 @@ async def test_canonical_explicit_https_port_is_allowed_and_redacted() -> None:
     assert body == b"ok"
     assert info.display_url == "https://example.com:443/file.fits"
     assert "super-secret" not in repr(info)
+    assert seen[0].url.host == PUBLIC_IP
+    assert seen[0].headers["host"] == "example.com"
     assert seen[0].headers["accept-encoding"] == "identity"
+    assert seen[0].extensions["sni_hostname"] == "example.com"
     assert seen[0].extensions["timeout"] == {
         "connect": 10.0,
         "read": 30.0,
@@ -287,12 +290,64 @@ async def test_actual_peer_must_be_public_and_match_validated_dns() -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_peer_extension_is_tolerated_when_runtime_cannot_expose_it() -> (
-    None
-):
-    source = client_for(lambda request: response(peer=None))
+async def test_dns_rebinding_cannot_change_numeric_connection_target() -> None:
+    attempted_peers: list[str] = []
+
+    def rebinding_transport(request: httpx.Request) -> httpx.Response:
+        # Model a second DNS lookup that has been poisoned after validation.
+        # A hostname request would be sent to loopback; a numeric request cannot
+        # be rebound and is sent to the already approved address.
+        peer = "127.0.0.1" if request.url.host == "example.com" else request.url.host
+        attempted_peers.append(peer)
+        return response(peer=peer)
+
+    source = client_for(
+        rebinding_transport,
+        resolver=StaticResolver((PUBLIC_IP,)),
+    )
     body, _ = await source.fetch_bytes("https://example.com/data", max_bytes=100)
+
     assert body == b"ok"
+    assert attempted_peers == [PUBLIC_IP]
+
+
+@pytest.mark.asyncio
+async def test_approved_addresses_are_tried_by_numeric_ip_without_new_dns() -> None:
+    attempted_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempted_urls.append(request.url.host)
+        if request.url.host == SECOND_PUBLIC_IP:
+            raise httpx.ConnectError("unavailable", request=request)
+        return response(peer=PUBLIC_IP)
+
+    source = client_for(
+        handler,
+        resolver=StaticResolver((PUBLIC_IP, SECOND_PUBLIC_IP)),
+    )
+    body, _ = await source.fetch_bytes("https://example.com/data", max_bytes=100)
+
+    assert body == b"ok"
+    assert attempted_urls == [SECOND_PUBLIC_IP, PUBLIC_IP]
+
+
+@pytest.mark.asyncio
+async def test_missing_peer_extension_fails_closed() -> None:
+    source = client_for(lambda request: response(peer=None))
+    with pytest.raises(RemoteSourcePeerError, match="identity was unavailable"):
+        await source.fetch_bytes("https://example.com/data", max_bytes=100)
+
+
+@pytest.mark.asyncio
+async def test_peer_extension_without_server_address_fails_closed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        result = response(peer=None)
+        result.extensions["network_stream"] = PeerStream(None)
+        return result
+
+    source = client_for(handler)
+    with pytest.raises(RemoteSourcePeerError, match="identity was unavailable"):
+        await source.fetch_bytes("https://example.com/data", max_bytes=100)
 
 
 @pytest.mark.parametrize(
@@ -357,7 +412,7 @@ async def test_every_redirect_is_re_resolved_and_peer_validated() -> None:
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "first.example":
+        if request.headers["host"] == "first.example":
             return response(
                 302,
                 headers={"Location": "https://second.example/final?credential=hidden"},
@@ -386,7 +441,7 @@ async def test_redirect_to_private_dns_target_is_rejected_before_second_request(
     requests: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request.url.host)
+        requests.append(request.headers["host"])
         return response(
             302,
             headers={"Location": "https://internal.example/admin"},
@@ -689,7 +744,9 @@ async def test_unicode_url_is_canonicalized_without_treating_utf8_as_controls() 
     )
     assert body == b"ok"
     assert resolver.calls == [("xn--bcher-kva.example", 443)]
-    assert seen[0].url.raw_host == b"xn--bcher-kva.example"
+    assert seen[0].url.host == PUBLIC_IP
+    assert seen[0].headers["host"] == "xn--bcher-kva.example"
+    assert seen[0].extensions["sni_hostname"] == "xn--bcher-kva.example"
     assert info.display_url.endswith("/\N{LATIN SMALL LETTER U WITH DIAERESIS}ber")
 
 
@@ -711,6 +768,7 @@ async def test_client_disables_environment_proxies_and_automatic_redirects(
     assert body == b"ok"
     assert constructor_options[0]["trust_env"] is False
     assert constructor_options[0]["follow_redirects"] is False
+    assert constructor_options[0]["limits"].max_keepalive_connections == 0
 
 
 def test_timeout_and_client_bounds_validate_configuration() -> None:
