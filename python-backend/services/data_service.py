@@ -3165,6 +3165,8 @@ class DataService(BaseService):
                     await asyncio.shield(worker)
                 except asyncio.CancelledError:
                     continue
+                except BaseException:
+                    break
             try:
                 worker.result()
             except BaseException:

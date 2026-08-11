@@ -1197,6 +1197,59 @@ def test_batch_stream_emits_each_file_before_the_slowest_worker_finishes(
     assert observed_sources["b"].stream.closed is True
 
 
+def test_batch_stream_cancellation_drains_worker_before_closing_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = [tmp_path / "a.evt", tmp_path / "b.evt"]
+    for path in paths:
+        _write_event_fits(path)
+    service = DataService(StateManager())
+    b_started = threading.Event()
+    cancellation_seen = threading.Event()
+    observed_sources: dict[str, GrantedReadFile] = {}
+
+    def fake_load(*args, **kwargs):
+        name = args[1]
+        observed_sources[name] = kwargs["_file_source"]
+        if name == "a":
+            return {"success": True, "data": {"n_events": 1}}
+        b_started.set()
+        while not kwargs["_cancellation_check"]():
+            time.sleep(0.005)
+        cancellation_seen.set()
+        return {"success": False, "message": "cancelled"}
+
+    monkeypatch.setattr(service, "load_event_list", fake_load)
+
+    async def cancel_consumer() -> None:
+        stream = service.load_batch_event_lists_stream(
+            [
+                {
+                    "file_path": str(paths[0]),
+                    "file_grant": _grant(paths[0]),
+                    "name": "a",
+                },
+                {
+                    "file_path": str(paths[1]),
+                    "file_grant": _grant(paths[1]),
+                    "name": "b",
+                },
+            ],
+            max_workers=2,
+        )
+        await anext(stream)
+        pending = asyncio.create_task(anext(stream))
+        assert await asyncio.to_thread(b_started.wait, 2.0)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert await asyncio.to_thread(cancellation_seen.wait, 2.0)
+
+    asyncio.run(cancel_consumer())
+    assert observed_sources["a"].stream.closed is True
+    assert observed_sources["b"].stream.closed is True
+
+
 def test_job_capability_budget_rejects_before_pinning_and_releases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
