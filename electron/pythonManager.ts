@@ -28,8 +28,10 @@ export class PythonManager {
   private slowStartWarnMs: number = 180000; // 3 minutes
   private progressLogIntervalMs: number = 15000; // emit a "still waiting" log every 15s
   private isRunning: boolean = false;
-  private externalBackend: boolean = false; // True if backend was started externally
   private logCallback: LogCallback | null = null;
+  // Shared only with Electron main and the child backend. The renderer never
+  // receives this credential; main adds it to trusted loopback requests.
+  private readonly backendSessionSecret: string = randomBytes(32).toString('hex');
   // Shared only with the spawned loopback backend. Renderer code receives
   // short-lived HMAC grants, never this secret, so it cannot substitute a
   // manually typed path for one selected in an owned native dialog.
@@ -62,13 +64,14 @@ export class PythonManager {
       return;
     }
 
-    // First check if backend is already running (started by dev.sh or externally)
+    // An external backend cannot prove that it shares this launch credential.
+    // Refuse it instead of silently attaching to an unauthenticated process.
     const alreadyRunning = await this.checkHealth();
     if (alreadyRunning) {
-      this.sendLog('info', 'Python backend is already running externally, connecting to it...');
-      this.isRunning = true;
-      this.externalBackend = true;
-      return;
+      throw new Error(
+        `A backend is already responding on 127.0.0.1:${this.port}, but Electron did not launch it and cannot authenticate it. ` +
+        'Stop the external backend, then restart Stingray Explorer.'
+      );
     }
 
     // Not running, start it ourselves
@@ -92,6 +95,7 @@ export class PythonManager {
         // handler it displaced - utils/log_stream.py does, and
         // tests/test_analysis_helpers.py keeps it that way.
         PYTHON_CONTEXT_AWARE_WARNINGS: '1',
+        STINGRAY_BACKEND_SESSION_SECRET: this.backendSessionSecret,
         STINGRAY_FILE_GRANT_SECRET: this.fileGrantSecret,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -177,66 +181,10 @@ export class PythonManager {
   }
 
   /**
-   * Request the backend to shutdown via API
-   */
-  private async requestShutdown(): Promise<boolean> {
-    return new Promise((resolve) => {
-      const req = http.request(
-        {
-          hostname: '127.0.0.1',
-          port: this.port,
-          path: '/api/shutdown',
-          method: 'POST',
-          timeout: 2000,
-        },
-        (res) => {
-          resolve(res.statusCode === 200);
-        }
-      );
-
-      req.on('error', () => {
-        resolve(false);
-      });
-
-      req.on('timeout', () => {
-        req.destroy();
-        resolve(false);
-      });
-
-      req.end();
-    });
-  }
-
-  /**
-   * Wait for the backend to stop
-   */
-  private async waitForStop(): Promise<void> {
-    for (let i = 0; i < 20; i++) {
-      const isRunning = await this.checkHealth();
-      if (!isRunning) {
-        return;
-      }
-      await this.sleep(250);
-    }
-  }
-
-  /**
    * Stop the Python backend process
    */
   async stop(): Promise<void> {
     this.sendLog('info', 'Stopping Python backend...');
-
-    // If it was external, request shutdown via API
-    if (this.externalBackend) {
-      const shutdownRequested = await this.requestShutdown();
-      if (shutdownRequested) {
-        await this.waitForStop();
-        this.sendLog('info', 'External backend stopped via API');
-      }
-      this.isRunning = false;
-      this.externalBackend = false;
-      return;
-    }
 
     // If we spawned it, kill the process
     if (!this.process) {
@@ -336,7 +284,7 @@ export class PythonManager {
       }
 
       try {
-        if (await this.checkHealth()) {
+        if (await this.checkAuthenticatedReady()) {
           const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
           this.sendLog('info', `Python backend is ready! (took ${elapsed}s)`);
           return;
@@ -396,6 +344,33 @@ export class PythonManager {
     });
   }
 
+  /** Confirm that the child received this launch's private session credential. */
+  private checkAuthenticatedReady(): Promise<boolean> {
+    return new Promise((resolve) => {
+      const req = http.request(
+        {
+          hostname: '127.0.0.1',
+          port: this.port,
+          path: '/api/status',
+          method: 'GET',
+          headers: { 'X-Stingray-Session': this.backendSessionSecret },
+          timeout: 1000,
+        },
+        (res) => {
+          res.resume();
+          resolve(res.statusCode === 200);
+        }
+      );
+
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => {
+        req.destroy();
+        resolve(false);
+      });
+      req.end();
+    });
+  }
+
   /**
    * Sleep for a specified number of milliseconds
    */
@@ -417,14 +392,16 @@ export class PythonManager {
     return this.isRunning;
   }
 
+  /** Credential available to Electron main for trusted backend requests only. */
+  getBackendSessionSecret(): string {
+    if (!this.process) {
+      throw new Error('Backend session authentication is unavailable before startup');
+    }
+    return this.backendSessionSecret;
+  }
+
   /** Session secret used by Electron main to sign exact native-dialog paths. */
   getFileGrantSecret(): string {
-    if (this.externalBackend) {
-      throw new Error(
-        'Native file access is unavailable while connected to an externally started backend. ' +
-        'Stop the external backend and restart Stingray Explorer so Electron can launch and secure it.'
-      );
-    }
     if (!this.process) {
       throw new Error(
         'Native file access is unavailable until the Electron-managed backend is running; try again after startup.'

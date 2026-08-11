@@ -263,7 +263,7 @@ export function useJobStream(): void {
 
     try {
       // Process events from the stream
-      for await (const event of jobApi.streamJobUpdates()) {
+      for await (const event of jobApi.streamJobUpdates(abortControllerRef.current.signal)) {
         // Check if we should stop
         if (abortControllerRef.current?.signal.aborted) {
           console.log('[JobStream] Connection aborted');

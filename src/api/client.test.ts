@@ -60,4 +60,37 @@ describe('apiClient validation errors', () => {
     expect(result.error).toBe('Observation epoch is required');
     expect(result.warnings).toEqual(['Approximate conversion was not performed.']);
   });
+
+  it('parses authenticated fetch streams without placing credentials in the URL', async () => {
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"type":"first"}\n\n'));
+        controller.enqueue(encoder.encode('data: {"type":"second"}\r\n\r\n'));
+        controller.close();
+      },
+    });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      body: stream,
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const events = [];
+    for await (const event of apiClient.stream<{ type: string }>('/api/jobs/stream')) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([{ type: 'first' }, { type: 'second' }]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://127.0.0.1:8765/api/jobs/stream',
+      expect.objectContaining({
+        method: 'GET',
+        headers: { Accept: 'text/event-stream' },
+      })
+    );
+    expect(String(fetchMock.mock.calls[0][0])).not.toContain('session');
+  });
 });

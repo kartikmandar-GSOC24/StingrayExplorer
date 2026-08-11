@@ -117,6 +117,51 @@ class ApiClient {
     return this.request<T>(endpoint, { method: 'DELETE' });
   }
 
+  /** Stream JSON SSE events through Electron's authenticated network session. */
+  async *stream<T>(endpoint: string, signal?: AbortSignal): AsyncGenerator<T, void, unknown> {
+    await this.getPort();
+    const response = await fetch(`${this.baseUrl}${endpoint}`, {
+      method: 'GET',
+      headers: { Accept: 'text/event-stream' },
+      signal,
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('No response body available for streaming');
+
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop() ?? '';
+        for (const event of events) {
+          const data = event
+            .split(/\r?\n/)
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart())
+            .join('\n');
+          if (data) yield JSON.parse(data) as T;
+        }
+        if (done) break;
+      }
+
+      const finalData = buffer
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart())
+        .join('\n');
+      if (finalData) yield JSON.parse(finalData) as T;
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
   async healthCheck(): Promise<boolean> {
     try {
       const response = await this.get<{ status: string }>('/health');

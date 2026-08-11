@@ -18,6 +18,10 @@ from services.correlation_service import (
     _shared_grid_lightcurves,
 )
 from services.state_manager import StateManager
+from tests.backend_auth import (
+    TEST_BACKEND_AUTH_HEADERS,
+    TEST_BACKEND_SESSION_SECRET,
+)
 from utils.performance_monitor import PerformanceMonitor
 
 DT = 0.05
@@ -423,12 +427,16 @@ def test_large_absolute_times_do_not_stretch_the_lag_axis(state_manager):
 async def test_correlation_routes_are_wired(loaded_state):
     from main import create_app
 
-    app = create_app()
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
     app.state.state_manager = loaded_state
     app.state.performance_monitor = PerformanceMonitor()
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=TEST_BACKEND_AUTH_HEADERS,
+    ) as client:
         auto = await client.post(
             "/api/correlation/auto-correlation",
             json={"event_list_name": "ev1", "dt": DT},
@@ -456,12 +464,16 @@ async def test_correlation_routes_are_wired(loaded_state):
 async def test_correlation_routes_soft_fail_with_http_200(loaded_state):
     from main import create_app
 
-    app = create_app()
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
     app.state.state_manager = loaded_state
     app.state.performance_monitor = PerformanceMonitor()
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=TEST_BACKEND_AUTH_HEADERS,
+    ) as client:
         response = await client.post(
             "/api/correlation/auto-correlation",
             json={"event_list_name": "missing", "dt": DT},

@@ -426,7 +426,7 @@ export const dataApi = {
     notes?: string;
   }): AsyncGenerator<UrlDownloadStreamEvent, void, unknown> {
     const port = await apiClient.getPort();
-    const url = `http://localhost:${port}/api/data/load-url-stream`;
+    const url = `http://127.0.0.1:${port}/api/data/load-url-stream`;
 
     const response = await fetch(url, {
       method: 'POST',
@@ -676,7 +676,7 @@ export const dataApi = {
     params: BatchLoadRequest
   ): AsyncGenerator<BatchStreamEvent, void, unknown> {
     const port = await apiClient.getPort();
-    const url = `http://localhost:${port}/api/data/load-batch-stream`;
+    const url = `http://127.0.0.1:${port}/api/data/load-batch-stream`;
 
     const response = await fetch(url, {
       method: 'POST',

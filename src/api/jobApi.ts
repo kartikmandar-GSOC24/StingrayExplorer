@@ -141,66 +141,8 @@ export const jobApi = {
    *
    * @yields JobStreamEvent - Events for job updates
    */
-  async *streamJobUpdates(): AsyncGenerator<JobStreamEvent, void, unknown> {
-    const port = await apiClient.getPort();
-    const url = `http://localhost:${port}/api/jobs/stream`;
-
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: { Accept: 'text/event-stream' },
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error('No response body available for streaming');
-    }
-
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-
-        // Parse SSE format: "data: {...}\n\n"
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() || ''; // Keep incomplete chunk
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const jsonStr = line.slice(6);
-            try {
-              const event = JSON.parse(jsonStr) as JobStreamEvent;
-              yield event;
-            } catch (parseError) {
-              console.error('[JobApi] Failed to parse SSE event:', parseError, jsonStr);
-            }
-          }
-        }
-      }
-
-      // Process any remaining data in the buffer
-      if (buffer.trim() && buffer.startsWith('data: ')) {
-        const jsonStr = buffer.slice(6).trim();
-        if (jsonStr) {
-          try {
-            const event = JSON.parse(jsonStr) as JobStreamEvent;
-            yield event;
-          } catch (parseError) {
-            console.error('[JobApi] Failed to parse final SSE event:', parseError, jsonStr);
-          }
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
+  async *streamJobUpdates(signal?: AbortSignal): AsyncGenerator<JobStreamEvent, void, unknown> {
+    yield* apiClient.stream<JobStreamEvent>('/api/jobs/stream', signal);
   },
 };
 

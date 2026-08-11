@@ -7,6 +7,7 @@ using the Stingray library.
 
 import logging
 import os
+import secrets
 import signal
 import socket
 import sys
@@ -47,6 +48,96 @@ MAX_REQUEST_BODY_BYTES = 8 * 1024**2
 MAX_SERIALIZED_VALIDATION_ERRORS = 50
 MAX_VALIDATION_MESSAGE_CHARS = 512
 MAX_VALIDATION_LOCATION_PARTS = 16
+BACKEND_SESSION_ENV = "STINGRAY_BACKEND_SESSION_SECRET"
+BACKEND_SESSION_HEADER = "x-stingray-session"
+MIN_BACKEND_SESSION_SECRET_BYTES = 32
+ALLOWED_RENDERER_ORIGINS = ("http://localhost:5173", "null")
+ALLOWED_CORS_METHODS = ("GET", "POST", "DELETE", "OPTIONS")
+ALLOWED_CORS_HEADERS = ("Accept", "Content-Type", "X-Stingray-Session")
+
+
+def _scope_header_values(scope: Scope, header_name: bytes) -> list[bytes]:
+    """Return every value for one ASGI header without hiding duplicates."""
+
+    return [
+        value for name, value in scope.get("headers", []) if name.lower() == header_name
+    ]
+
+
+class BackendSessionMiddleware:
+    """Authenticate every state-bearing loopback request before route execution."""
+
+    def __init__(self, app: ASGIApp, session_secret: str | None) -> None:
+        self.app = app
+        encoded = session_secret.encode("utf-8") if session_secret else b""
+        self.session_secret = (
+            encoded if len(encoded) >= MIN_BACKEND_SESSION_SECRET_BYTES else None
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        origin_values = _scope_header_values(scope, b"origin")
+        if len(origin_values) > 1:
+            await self._reject(scope, receive, send, 403, "Origin is not allowed")
+            return
+        if origin_values:
+            try:
+                origin = origin_values[0].decode("ascii")
+            except UnicodeDecodeError:
+                origin = ""
+            if origin not in ALLOWED_RENDERER_ORIGINS:
+                await self._reject(scope, receive, send, 403, "Origin is not allowed")
+                return
+
+        # A health probe is intentionally public, but contains no application state.
+        if scope.get("path") == "/health":
+            await self.app(scope, receive, send)
+            return
+
+        # Browser preflights cannot carry the per-launch credential. The outer
+        # CORSMiddleware validates the requested origin, method, and headers and
+        # terminates genuine preflights before they reach this middleware.
+        if scope.get("method") == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+
+        if self.session_secret is None:
+            await self._reject(
+                scope,
+                receive,
+                send,
+                503,
+                "Backend session authentication is not configured",
+            )
+            return
+
+        credential_values = _scope_header_values(
+            scope, BACKEND_SESSION_HEADER.encode("ascii")
+        )
+        authenticated = len(credential_values) == 1 and secrets.compare_digest(
+            credential_values[0], self.session_secret
+        )
+        if not authenticated:
+            await self._reject(
+                scope, receive, send, 401, "Backend session authentication required"
+            )
+            return
+
+        await self.app(scope, receive, send)
+
+    async def _reject(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        status_code: int,
+        detail: str,
+    ) -> None:
+        response = JSONResponse(status_code=status_code, content={"detail": detail})
+        await response(scope, receive, send)
 
 
 class RequestBodyLimitMiddleware:
@@ -215,8 +306,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     log_stream_manager.uninstall()
 
 
-def create_app() -> FastAPI:
+def create_app(*, session_secret: str | None = None) -> FastAPI:
     """Create and configure the FastAPI application."""
+    resolved_session_secret = (
+        session_secret
+        if session_secret is not None
+        else os.environ.get(BACKEND_SESSION_ENV)
+    )
     app = FastAPI(
         title="Stingray Explorer API",
         description="REST API for X-ray timing analysis using the Stingray library",
@@ -225,14 +321,17 @@ def create_app() -> FastAPI:
     )
 
     app.add_middleware(RequestBodyLimitMiddleware, max_body_size=MAX_REQUEST_BODY_BYTES)
+    app.add_middleware(BackendSessionMiddleware, session_secret=resolved_session_secret)
 
-    # Configure CORS for Electron renderer
+    # The renderer is either the fixed development origin or an authenticated
+    # packaged file origin (serialized by Chromium as "null"). CORS is only a
+    # browser response policy; BackendSessionMiddleware remains the auth boundary.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # In production, restrict to electron app
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=list(ALLOWED_RENDERER_ORIGINS),
+        allow_credentials=False,
+        allow_methods=list(ALLOWED_CORS_METHODS),
+        allow_headers=list(ALLOWED_CORS_HEADERS),
     )
 
     @app.exception_handler(RequestValidationError)
@@ -301,11 +400,7 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health_check():
         """Health check endpoint for Electron to verify backend is ready."""
-        return {
-            "status": "healthy",
-            "version": "1.0.0",
-            "state_manager": state_manager is not None,
-        }
+        return {"status": "healthy", "service": "stingray-explorer-backend"}
 
     @app.get("/api/status")
     async def get_status():

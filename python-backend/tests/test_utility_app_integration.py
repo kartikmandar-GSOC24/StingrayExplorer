@@ -14,6 +14,10 @@ from main import (
     create_app,
 )
 from services.state_manager import StateManager
+from tests.backend_auth import (
+    TEST_BACKEND_AUTH_HEADERS,
+    TEST_BACKEND_SESSION_SECRET,
+)
 
 
 class _ChunkedBody(httpx.AsyncByteStream):
@@ -40,12 +44,16 @@ def _strict_json(response: httpx.Response):
 
 @pytest.mark.asyncio
 async def test_registered_utility_routes_execute_representative_operations():
-    app = create_app()
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
     app.state.state_manager = StateManager()
     app.state.performance_monitor = None
     transport = httpx.ASGITransport(app=app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=TEST_BACKEND_AUTH_HEADERS,
+    ) as client:
         responses = {
             "statistics": await client.post(
                 "/api/utilities/statistics/gaussian",
@@ -84,12 +92,16 @@ async def test_registered_utility_routes_execute_representative_operations():
 
 @pytest.mark.asyncio
 async def test_nonfinite_request_validation_is_itself_strict_json():
-    app = create_app()
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
     app.state.state_manager = StateManager()
     app.state.performance_monitor = None
     transport = httpx.ASGITransport(app=app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=TEST_BACKEND_AUTH_HEADERS,
+    ) as client:
         response = await client.post(
             "/api/utilities/statistics/gaussian",
             content='{"probability":NaN,"sidedness":"one-sided"}',
@@ -107,7 +119,7 @@ async def test_nonfinite_request_validation_is_itself_strict_json():
 async def test_request_body_limit_rejects_declared_and_streamed_oversize_bodies(
     length_header,
 ):
-    app = create_app()
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
     transport = httpx.ASGITransport(app=app)
     oversized = MAX_REQUEST_BODY_BYTES + 1
     headers = {"content-type": "application/json"}
@@ -119,7 +131,11 @@ async def test_request_body_limit_rejects_declared_and_streamed_oversize_bodies(
         if length_header == "misleading":
             headers["content-length"] = "1"
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=TEST_BACKEND_AUTH_HEADERS,
+    ) as client:
         response = await client.post(
             "/api/utilities/statistics/gaussian",
             content=content,
@@ -152,12 +168,16 @@ async def test_request_body_limit_preserves_streaming_responses():
 
 @pytest.mark.asyncio
 async def test_validation_response_does_not_echo_large_rejected_input():
-    app = create_app()
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
     app.state.state_manager = StateManager()
     app.state.performance_monitor = None
     transport = httpx.ASGITransport(app=app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=TEST_BACKEND_AUTH_HEADERS,
+    ) as client:
         response = await client.post(
             "/api/utilities/statistics/gaussian",
             json={"probability": 0.5, "sidedness": "x" * 1_000_000},
@@ -172,13 +192,17 @@ async def test_validation_response_does_not_echo_large_rejected_input():
 
 @pytest.mark.asyncio
 async def test_validation_response_caps_the_number_of_serialized_errors():
-    app = create_app()
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
     app.state.state_manager = StateManager()
     app.state.performance_monitor = None
     transport = httpx.ASGITransport(app=app)
     invalid_values = [False] * (MAX_SERIALIZED_VALIDATION_ERRORS + 25)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=TEST_BACKEND_AUTH_HEADERS,
+    ) as client:
         response = await client.post(
             "/api/utilities/misc/rebin/linear",
             json={"x": invalid_values, "y": invalid_values, "dx_new": 1.0},
@@ -222,12 +246,16 @@ async def test_validation_response_caps_the_number_of_serialized_errors():
     ],
 )
 async def test_utility_request_models_reject_coercion_dependent_values(path, payload):
-    app = create_app()
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
     app.state.state_manager = StateManager()
     app.state.performance_monitor = None
     transport = httpx.ASGITransport(app=app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=TEST_BACKEND_AUTH_HEADERS,
+    ) as client:
         response = await client.post(path, json=payload)
 
     assert response.status_code == 422

@@ -12,6 +12,10 @@ import httpx
 import pytest
 
 from services.state_manager import StateManager
+from tests.backend_auth import (
+    TEST_BACKEND_AUTH_HEADERS,
+    TEST_BACKEND_SESSION_SECRET,
+)
 from utils.performance_monitor import PerformanceMonitor
 
 
@@ -28,13 +32,17 @@ async def test_lightcurve_create_does_not_block_event_loop(monkeypatch):
         lcs_mod.LightcurveService, "create_lightcurve_from_event_list", slow_create
     )
 
-    app = create_app()
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
     # ASGITransport does not run the lifespan; provide state manually.
     app.state.state_manager = StateManager()
     app.state.performance_monitor = PerformanceMonitor()
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=TEST_BACKEND_AUTH_HEADERS,
+    ) as client:
         slow_task = asyncio.create_task(
             client.post(
                 "/api/lightcurve/from-event-list",

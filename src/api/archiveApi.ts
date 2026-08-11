@@ -252,7 +252,7 @@ export const archiveApi = {
     save_path: string;
   }): AsyncGenerator<DownloadToDiskEvent, void, unknown> {
     const port = await apiClient.getPort();
-    const endpointUrl = `http://localhost:${port}/api/archive/download-to-disk`;
+    const endpointUrl = `http://127.0.0.1:${port}/api/archive/download-to-disk`;
 
     const response = await fetch(endpointUrl, {
       method: 'POST',

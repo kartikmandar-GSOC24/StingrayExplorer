@@ -28,7 +28,8 @@ interface StreamLogEntry {
  * - Integration with Zustand logStore
  */
 class LogStreamClient {
-  private eventSource: EventSource | null = null;
+  private abortController: AbortController | null = null;
+  private connected: boolean = false;
   private reconnectAttempts: number = 0;
   private maxReconnectAttempts: number = 10;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -41,66 +42,50 @@ class LogStreamClient {
    */
   async connect(): Promise<void> {
     // Avoid duplicate connections
-    if (this.eventSource || this.isConnecting) {
+    if (this.abortController || this.isConnecting) {
       console.log('[LogStreamClient] Already connected or connecting');
       return;
     }
 
     this.isConnecting = true;
+    const controller = new AbortController();
+    this.abortController = controller;
 
     try {
-      // Get current port from API client
-      const port = await apiClient.getPort();
-      const url = `http://127.0.0.1:${port}/api/logs/stream`;
-
-      console.log('[LogStreamClient] Connecting to:', url);
-
-      this.eventSource = new EventSource(url);
-
-      this.eventSource.onopen = (): void => {
-        console.log('[LogStreamClient] Connected to log stream');
-        this.reconnectAttempts = 0;
-        this.isConnecting = false;
-
-        // Add a log entry to indicate connection
-        useLogStore.getState().addLog({
-          level: 'info',
-          source: 'frontend',
-          message: 'Connected to Python log stream',
-        });
-      };
-
-      this.eventSource.onmessage = (event: MessageEvent<string>): void => {
-        try {
-          const data: StreamLogEntry = JSON.parse(event.data);
-
-          // Skip heartbeat events
-          if (data.type === 'heartbeat') {
-            return;
-          }
-
-          // Add log entry to store
-          if (data.type === 'log' && data.level && data.message) {
-            useLogStore.getState().addLog({
-              level: data.level,
-              source: data.source || 'python',
-              message: data.message,
-            });
-          }
-        } catch (error) {
-          console.error('[LogStreamClient] Failed to parse log event:', error);
+      console.log('[LogStreamClient] Connecting to authenticated log stream');
+      let opened = false;
+      for await (const data of apiClient.stream<StreamLogEntry>(
+        '/api/logs/stream',
+        controller.signal
+      )) {
+        if (!opened) {
+          opened = true;
+          this.connected = true;
+          this.reconnectAttempts = 0;
+          this.isConnecting = false;
+          useLogStore.getState().addLog({
+            level: 'info',
+            source: 'frontend',
+            message: 'Connected to Python log stream',
+          });
         }
-      };
-
-      this.eventSource.onerror = (): void => {
-        console.warn('[LogStreamClient] Connection error, will attempt reconnect');
-        this.isConnecting = false;
+        if (data.type === 'log' && data.level && data.message) {
+          useLogStore.getState().addLog({
+            level: data.level,
+            source: data.source || 'python',
+            message: data.message,
+          });
+        }
+      }
+      if (!controller.signal.aborted) {
+        console.warn('[LogStreamClient] Stream ended, will attempt reconnect');
         this.handleDisconnect();
-      };
+      }
     } catch (error) {
+      if (controller.signal.aborted) return;
       console.error('[LogStreamClient] Failed to connect:', error);
       this.isConnecting = false;
-      this.scheduleReconnect();
+      this.handleDisconnect();
     }
   }
 
@@ -115,10 +100,9 @@ class LogStreamClient {
       this.reconnectTimer = null;
     }
 
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
-    }
+    this.abortController?.abort();
+    this.abortController = null;
+    this.connected = false;
 
     this.reconnectAttempts = 0;
     this.isConnecting = false;
@@ -128,17 +112,16 @@ class LogStreamClient {
    * Check if currently connected to the log stream.
    */
   isConnected(): boolean {
-    return this.eventSource !== null && this.eventSource.readyState === EventSource.OPEN;
+    return this.connected;
   }
 
   /**
    * Handle disconnection and schedule reconnect.
    */
   private handleDisconnect(): void {
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
-    }
+    this.abortController?.abort();
+    this.abortController = null;
+    this.connected = false;
 
     this.scheduleReconnect();
   }

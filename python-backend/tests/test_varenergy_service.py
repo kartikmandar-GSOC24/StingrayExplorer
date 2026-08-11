@@ -14,6 +14,10 @@ import pytest
 from stingray import EventList
 
 from services.varenergy_service import VarEnergyService
+from tests.backend_auth import (
+    TEST_BACKEND_AUTH_HEADERS,
+    TEST_BACKEND_SESSION_SECRET,
+)
 
 ESPEC = dict(energy_min=0.5, energy_max=10.0, n_bands=5)
 FREQ = dict(freq_min=0.1, freq_max=1.0)
@@ -42,7 +46,9 @@ def modulated_event_list(
     return EventList(time=times, energy=energy, gti=[[0.0, length]])
 
 
-def sparse_event_list(seed: int = 3, n_events: int = 400, length: float = 64.0) -> EventList:
+def sparse_event_list(
+    seed: int = 3, n_events: int = 400, length: float = 64.0
+) -> EventList:
     """Pure-Poisson, low-count list: the legitimate all-NaN / low-count path."""
     rng = np.random.default_rng(seed)
     times = np.sort(rng.uniform(0.0, length, n_events))
@@ -125,9 +131,10 @@ def test_rms_spectrum_abs_norm_differs_from_frac(modulated_state):
         "ev_mod", bin_time=0.0625, segment_size=8.0, norm="abs", **FREQ, **ESPEC
     )
     assert absolute["success"], absolute
-    assert finite_values(absolute["data"]["spectrum"])[0] > 10 * finite_values(
-        frac["data"]["spectrum"]
-    )[0]
+    assert (
+        finite_values(absolute["data"]["spectrum"])[0]
+        > 10 * finite_values(frac["data"]["spectrum"])[0]
+    )
     assert absolute["data"]["norm"] == "abs"
 
 
@@ -315,7 +322,9 @@ def test_lag_spectrum_with_reference_band(modulated_state):
     )
     assert result["success"], result
     assert result["data"]["ref_band"] == [8.0, 10.0]
-    full = svc.lag_spectrum("ev_mod", bin_time=0.0625, segment_size=8.0, **FREQ, **ESPEC)
+    full = svc.lag_spectrum(
+        "ev_mod", bin_time=0.0625, segment_size=8.0, **FREQ, **ESPEC
+    )
     assert result["data"]["spectrum"] != full["data"]["spectrum"]
     # A narrow reference band makes stingray's error formula take the sqrt of a
     # negative number; the bare numpy text must not reach the UI unexplained.
@@ -339,9 +348,7 @@ def test_bare_numpy_warnings_are_wrapped_in_an_explanation():
     assert readable[1].startswith("Low count rate")
 
 
-@pytest.mark.parametrize(
-    "ref_min,ref_max", [(8.0, None), (None, 10.0)]
-)
+@pytest.mark.parametrize("ref_min,ref_max", [(8.0, None), (None, 10.0)])
 def test_lag_spectrum_rejects_half_a_reference_band(modulated_state, ref_min, ref_max):
     svc = VarEnergyService(modulated_state)
     result = svc.lag_spectrum(
@@ -389,7 +396,9 @@ def test_excess_variance_workaround_returns_finite_values(modulated_state):
         energy_spec=(0.5, 10.0, 5, "lin"),
         bin_time=0.0625,
     )
-    assert np.all(np.isnan(raw.spectrum)), "upstream bug disappeared; drop the workaround"
+    assert np.all(np.isnan(raw.spectrum)), (
+        "upstream bug disappeared; drop the workaround"
+    )
 
     svc = VarEnergyService(modulated_state)
     result = svc.excess_variance_spectrum("ev_mod", bin_time=0.0625, **ESPEC)
@@ -913,13 +922,17 @@ async def test_rms_spectrum_endpoint_end_to_end():
     from services.state_manager import StateManager
     from utils.performance_monitor import PerformanceMonitor
 
-    app = create_app()
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
     app.state.state_manager = StateManager()
     app.state.performance_monitor = PerformanceMonitor()
     app.state.state_manager.add_event_data("ev_mod", modulated_event_list())
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        headers=TEST_BACKEND_AUTH_HEADERS,
+    ) as client:
         response = await client.post(
             "/api/varenergy/rms-spectrum",
             json={

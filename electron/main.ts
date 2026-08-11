@@ -1,8 +1,14 @@
 import { app, BrowserWindow, dialog, shell, ipcMain } from 'electron';
 import path from 'path';
+import { pathToFileURL } from 'url';
 import { PythonManager, LogLevel, LogSource, LogMessage } from './pythonManager';
 import { setupIpcHandlers } from './ipcHandlers';
 import { createAppMenu } from './menu';
+import {
+  isTrustedRendererLocation,
+  shouldAuthenticateBackendRequest,
+  withBackendSessionHeader,
+} from './backendSessionPolicy';
 
 let mainWindow: BrowserWindow | null = null;
 let pythonManager: PythonManager | null = null;
@@ -33,6 +39,9 @@ function sendLog(level: LogLevel, message: string, source: LogSource = 'electron
 }
 
 async function createWindow(): Promise<void> {
+  const rendererEntryUrl = isDev
+    ? 'http://localhost:5173'
+    : pathToFileURL(path.join(__dirname, '../dist/index.html')).toString();
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -74,6 +83,45 @@ async function createWindow(): Promise<void> {
     shell.openExternal(url);
     return { action: 'deny' };
   });
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!isTrustedRendererLocation(url, rendererEntryUrl)) event.preventDefault();
+  });
+
+  // Authenticate only requests issued by this trusted top-level application
+  // document to the exact Electron-managed backend. Renderer JavaScript never
+  // receives the per-launch credential, and child/navigated pages are excluded.
+  const trustedWindow = mainWindow;
+  trustedWindow.webContents.session.webRequest.onBeforeSendHeaders(
+    { urls: ['http://127.0.0.1/*'] },
+    (details, callback) => {
+      const manager = pythonManager;
+      const authenticate =
+        manager !== null &&
+        shouldAuthenticateBackendRequest({
+          requestUrl: details.url,
+          method: details.method,
+          backendPort: manager.getPort(),
+          requestWebContentsId: details.webContentsId,
+          trustedWebContentsId: trustedWindow.webContents.id,
+          isMainFrame:
+            details.frame?.frameTreeNodeId ===
+            trustedWindow.webContents.mainFrame.frameTreeNodeId,
+          frameUrl: details.frame?.url ?? '',
+          rendererEntryUrl,
+        });
+      let secret: string | undefined;
+      if (authenticate) {
+        try {
+          secret = manager.getBackendSessionSecret();
+        } catch {
+          secret = undefined;
+        }
+      }
+      callback({
+        requestHeaders: withBackendSessionHeader(details.requestHeaders, secret),
+      });
+    }
+  );
 
   // Add right-click context menu for copy/paste
   mainWindow.webContents.on('context-menu', (_event, params) => {
@@ -120,7 +168,7 @@ async function createWindow(): Promise<void> {
 
   // Load the app
   if (isDev) {
-    await mainWindow.loadURL('http://localhost:5173');
+    await mainWindow.loadURL(rendererEntryUrl);
   } else {
     await mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
   }

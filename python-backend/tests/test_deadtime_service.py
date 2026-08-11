@@ -6,6 +6,10 @@ import pytest
 from stingray import EventList
 
 from services.deadtime_service import DeadtimeService
+from tests.backend_auth import (
+    TEST_BACKEND_AUTH_HEADERS,
+    TEST_BACKEND_SESSION_SECRET,
+)
 from utils.performance_monitor import PerformanceMonitor
 
 
@@ -103,9 +107,7 @@ def test_pds_correction_background_rate_counts_towards_the_physical_limit(
 ):
     # 312.5 c/s source is fine at td=1 ms (0.31), but +800 c/s background is not.
     svc = DeadtimeService(deadtime_state)
-    ok = svc.calculate_pds_correction(
-        "ev1", dt=0.01, segment_size=8.0, dead_time=0.001
-    )
+    ok = svc.calculate_pds_correction("ev1", dt=0.01, segment_size=8.0, dead_time=0.001)
     assert ok["success"], ok
     bad = svc.calculate_pds_correction(
         "ev1", dt=0.01, segment_size=8.0, dead_time=0.001, background_rate=800.0
@@ -189,9 +191,7 @@ def test_fad_correction_missing_event_list_soft_fails(loaded_state):
 def test_fad_correction_rejects_disjoint_event_lists(loaded_state):
     rng = np.random.default_rng(8)
     far = np.sort(rng.uniform(1000.0, 1064.0, 5000))
-    loaded_state.add_event_data(
-        "ev_far", EventList(time=far, gti=[[1000.0, 1064.0]])
-    )
+    loaded_state.add_event_data("ev_far", EventList(time=far, gti=[[1000.0, 1064.0]]))
     svc = DeadtimeService(loaded_state)
     result = svc.calculate_fad_correction("ev1", "ev_far", dt=0.01, segment_size=8.0)
     assert not result["success"]
@@ -239,9 +239,7 @@ def test_fad_correction_rejects_zero_exposure_event_list(loaded_state):
     )
     svc = DeadtimeService(loaded_state)
 
-    result = svc.calculate_fad_correction(
-        "ev1", "ev_no_gti", dt=0.01, segment_size=8.0
-    )
+    result = svc.calculate_fad_correction("ev1", "ev_no_gti", dt=0.01, segment_size=8.0)
     assert not result["success"]
     assert result["data"] is None
     assert "no good-time exposure" in result["message"]
@@ -258,9 +256,7 @@ def test_fad_correction_handles_nan_fad_delta_without_crashing(loaded_state):
     # allow_nan=False)` unguarded and turns a success:true result into an
     # unhandled 500 at the JSON-encoding layer.
     svc = DeadtimeService(loaded_state)
-    result = svc.calculate_fad_correction(
-        "ev1", "ev1", dt=1.0 / 512, segment_size=2.0
-    )
+    result = svc.calculate_fad_correction("ev1", "ev1", dt=1.0 / 512, segment_size=2.0)
 
     assert result["success"], result
     json.dumps(result, allow_nan=False)  # must not raise
@@ -269,8 +265,7 @@ def test_fad_correction_handles_nan_fad_delta_without_crashing(loaded_state):
     assert data["fad_delta"] is None
     assert data["n_segments"] == 32  # 64 s / 2 s segments, above MIN_FAD_SEGMENTS
     assert any(
-        "fad_delta" in w and "could not be computed" in w
-        for w in data["warnings"]
+        "fad_delta" in w and "could not be computed" in w for w in data["warnings"]
     )
 
 
@@ -278,12 +273,14 @@ def _client(state):
     """httpx client over the real app, wired to a pre-populated StateManager."""
     from main import create_app
 
-    app = create_app()
+    app = create_app(session_secret=TEST_BACKEND_SESSION_SECRET)
     # ASGITransport does not run the lifespan; provide state manually.
     app.state.state_manager = state
     app.state.performance_monitor = PerformanceMonitor()
     return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers=TEST_BACKEND_AUTH_HEADERS,
     )
 
 
@@ -306,8 +303,14 @@ async def test_pds_correction_route_matches_the_request_contract(loaded_state):
     assert body["success"], body
     data = body["data"]
     assert set(
-        ["freq", "power_uncorrected", "power_corrected", "rate", "n_segments",
-         "warnings"]
+        [
+            "freq",
+            "power_uncorrected",
+            "power_corrected",
+            "rate",
+            "n_segments",
+            "warnings",
+        ]
     ) <= set(data)
     assert data["n_segments"] == 8  # 64 s / 8 s segments
 
@@ -329,7 +332,7 @@ async def test_fad_correction_route_matches_the_request_contract(loaded_state):
     body = response.json()
     assert body["success"], body
     data = body["data"]
-    assert set(
-        ["freq", "pds1", "pds2", "ptot", "cs", "n_segments", "warnings"]
-    ) <= set(data)
+    assert set(["freq", "pds1", "pds2", "ptot", "cs", "n_segments", "warnings"]) <= set(
+        data
+    )
     assert data["n_segments"] == 32
