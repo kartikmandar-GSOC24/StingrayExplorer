@@ -416,6 +416,36 @@ class _CapturingExecutor:
         return None
 
 
+class _GatedRunningExecutor:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.future = Future()
+        self.job = None
+
+    def submit(self, target, job) -> Future:
+        self.job = job
+        assert self.future.set_running_or_notify_cancel() is True
+        self.started.set()
+        assert self.release.wait(2.0)
+        return self.future
+
+    def shutdown(self, *args, **kwargs) -> None:
+        return None
+
+
+class _RejectingExecutor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def submit(self, target, job) -> Future:
+        self.calls += 1
+        raise RuntimeError("executor rejected submission")
+
+    def shutdown(self, *args, **kwargs) -> None:
+        return None
+
+
 def _manager_with_captured_executor(
     state: StateManager,
 ) -> tuple[JobManager, _CapturingExecutor]:
@@ -424,6 +454,90 @@ def _manager_with_captured_executor(
     executor = _CapturingExecutor()
     manager._executor = executor
     return manager, executor
+
+
+def test_schedule_keeps_running_cancelled_job_owned_until_callback(
+    tmp_path: Path,
+) -> None:
+    selected = tmp_path / "selected.hdf5"
+    _write_hdf5(selected, [1.0, 2.0])
+    manager = JobManager(StateManager(), DataService(StateManager()), max_workers=1)
+    manager._executor.shutdown(wait=False, cancel_futures=True)
+    executor = _GatedRunningExecutor()
+    manager._executor = executor
+
+    submitted: list[Job] = []
+
+    def submit() -> None:
+        submitted.append(
+            manager.submit_load_job(
+                str(selected),
+                "events",
+                fmt="hdf5",
+                file_grant=_grant(selected),
+            )
+        )
+
+    thread = threading.Thread(target=submit)
+    thread.start()
+    assert executor.started.wait(2.0)
+    job = executor.job
+    assert job is not None
+    source = manager._resources[job.id].private["file_source"]
+    assert manager._futures[job.id] is job_manager_module._SUBMITTING
+    assert job.status.value == "pending"
+
+    assert manager.cancel_job(job.id) is True
+    assert manager.clear_completed_jobs() == 0
+    assert manager.get_job(job.id) is job
+    assert source.stream.closed is False
+
+    executor.release.set()
+    thread.join(timeout=2.0)
+    assert not thread.is_alive()
+    assert submitted == [job]
+    assert job.status.value == "cancelled"
+    assert executor.future.cancel() is False
+    executor.future.set_result(None)
+
+    assert source.stream.closed is True
+    assert job.id not in manager._resources
+    assert job.id not in manager._futures
+    assert manager._reserved_jobs == 0
+    assert manager._retained_capabilities == 0
+    event_types = [update["type"] for update in manager._update_queue.queue]
+    assert event_types.count("job_created") == 1
+    assert "job_completed" not in event_types
+    assert "job_failed" not in event_types
+
+
+def test_schedule_rolls_back_resources_when_executor_submit_fails(
+    tmp_path: Path,
+) -> None:
+    selected = tmp_path / "selected.hdf5"
+    _write_hdf5(selected, [1.0, 2.0])
+    state = StateManager()
+    manager = JobManager(state, DataService(state), max_workers=1)
+    manager._executor.shutdown(wait=False, cancel_futures=True)
+    executor = _RejectingExecutor()
+    manager._executor = executor
+
+    with pytest.raises(RuntimeError, match="rejected"):
+        manager.submit_load_job(
+            str(selected),
+            "events",
+            fmt="hdf5",
+            file_grant=_grant(selected),
+        )
+
+    assert executor.calls == 1
+    assert manager._jobs == {}
+    assert manager._resources == {}
+    assert manager._futures == {}
+    assert manager._created_job_ids == set()
+    assert manager._reserved_jobs == 0
+    assert manager._retained_capabilities == 0
+    assert manager._update_queue.empty()
 
 
 def test_queued_job_pins_before_return_redacts_and_cleans_after_success(

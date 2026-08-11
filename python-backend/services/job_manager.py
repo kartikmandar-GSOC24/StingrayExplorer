@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 MAX_COMPLETED_JOBS = 100
 MAX_ACTIVE_JOBS = 32
 MAX_RETAINED_CAPABILITIES = 256
+_SUBMITTING = object()
 
 
 @dataclass
@@ -92,7 +93,7 @@ class JobManager:
         )
 
         # Futures for tracking running jobs
-        self._futures: Dict[str, Future] = {}
+        self._futures: Dict[str, Future | object] = {}
         self._resources: Dict[str, _JobResources] = {}
         self._created_job_ids: set[str] = set()
         self._capacity_lock = threading.Lock()
@@ -121,7 +122,7 @@ class JobManager:
             finished_ids = [
                 job_id
                 for job_id, future in self._futures.items()
-                if future.cancelled() or future.done()
+                if isinstance(future, Future) and (future.cancelled() or future.done())
             ]
             resources = [self._resources.pop(job_id, None) for job_id in finished_ids]
         for resource in resources:
@@ -190,15 +191,19 @@ class JobManager:
             if job.status not in (JobStatus.PENDING, JobStatus.RUNNING):
                 return False
 
+            future = self._futures.get(job_id)
+            submitting = future is _SUBMITTING
+
             # Mark the public state first: Future.cancel() invokes completion
             # callbacks synchronously and must not transiently publish failure.
-            self._broadcast_created_once_locked(job)
+            if not submitting:
+                self._broadcast_created_once_locked(job)
             job.cancel()
-            self._broadcast_update("job_cancelled", job)
+            if not submitting:
+                self._broadcast_update("job_cancelled", job)
 
-            future = self._futures.get(job_id)
             cancelled_before_start = bool(
-                future and not future.done() and future.cancel()
+                isinstance(future, Future) and not future.done() and future.cancel()
             )
             logger.info(f"Cancelled job {job_id}")
             if cancelled_before_start:
@@ -218,7 +223,9 @@ class JobManager:
             to_remove = []
             for job_id, job in self._jobs.items():
                 future = self._futures.get(job_id)
-                if job.is_finished and (future is None or future.done()):
+                if job.is_finished and (
+                    future is None or (isinstance(future, Future) and future.done())
+                ):
                     to_remove.append(job_id)
 
             for job_id in to_remove:
@@ -238,7 +245,9 @@ class JobManager:
             finished_jobs = []
             for job_id, job in self._jobs.items():
                 future = self._futures.get(job_id)
-                if job.is_finished and (future is None or future.done()):
+                if job.is_finished and (
+                    future is None or (isinstance(future, Future) and future.done())
+                ):
                     finished_jobs.append((job_id, job))
 
             if len(finished_jobs) <= MAX_COMPLETED_JOBS:
@@ -441,6 +450,7 @@ class JobManager:
         with self._lock:
             self._jobs[job.id] = job
             self._resources[job.id] = resources
+            self._futures[job.id] = _SUBMITTING
             self._cleanup_old_jobs()
         try:
             future = self._executor.submit(target, job)
@@ -448,15 +458,22 @@ class JobManager:
             with self._lock:
                 self._jobs.pop(job.id, None)
                 self._resources.pop(job.id, None)
+                if self._futures.get(job.id) is _SUBMITTING:
+                    self._futures.pop(job.id, None)
                 self._created_job_ids.discard(job.id)
             resources.close()
             raise
         with self._lock:
             self._futures[job.id] = future
+            future.add_done_callback(
+                lambda completed: self._on_job_complete(job.id, completed)
+            )
+            was_cancelled = job.status == JobStatus.CANCELLED
             self._broadcast_created_once_locked(job)
-        future.add_done_callback(
-            lambda completed: self._on_job_complete(job.id, completed)
-        )
+            if was_cancelled:
+                self._broadcast_update("job_cancelled", job)
+        if was_cancelled:
+            future.cancel()
         return job
 
     def _private_resources(self, job_id: str) -> Dict[str, Any]:
