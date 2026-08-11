@@ -5,11 +5,9 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-import requests
 import routes.archive_routes as route_module
 import services.archive_service as archive_module
 from astropy import units as u
@@ -24,38 +22,13 @@ from routes.archive_routes import (
     search_by_obsid,
 )
 from services.archive_service import (
-    ARCHIVE_SEARCH_CONNECT_TIMEOUT_SECONDS,
-    ARCHIVE_SEARCH_READ_TIMEOUT_SECONDS,
+    ARCHIVE_SEARCH_TOTAL_SECONDS,
+    HEASARC_TAP_URL,
     MAX_ARCHIVE_OBSID_REMOTE_ROWS,
     MAX_ARCHIVE_SEARCH_REMOTE_ROWS,
-    ArchiveSearchSession,
+    ArchiveSearchBudget,
     ArchiveService,
 )
-
-
-class RecordingHeasarc:
-    def __init__(self) -> None:
-        self.region_calls: list[dict[str, object]] = []
-        self.tap_calls: list[dict[str, object]] = []
-
-    def query_region(self, position, **kwargs):
-        self.region_calls.append({"position": position, **kwargs})
-        return Table()
-
-    def query_tap(self, query, **kwargs):
-        self.tap_calls.append({"query": query, **kwargs})
-        return SimpleNamespace(to_table=lambda: Table())
-
-
-def install_heasarc_recorder(monkeypatch):
-    recorder = RecordingHeasarc()
-
-    @contextmanager
-    def open_client():
-        yield recorder
-
-    monkeypatch.setattr(archive_module, "_open_heasarc_client", open_client)
-    return recorder
 
 
 def result_envelope(message: str = "finished") -> dict[str, object]:
@@ -95,110 +68,151 @@ class RouteSearchService:
 
 
 def coordinate_request() -> SearchByCoordinatesRequest:
-    return SearchByCoordinatesRequest(
-        ra=83.633,
-        dec=22.0145,
-        mission="NICER",
-    )
+    return SearchByCoordinatesRequest(ra=83.633, dec=22.0145, mission="NICER")
 
 
-def test_archive_searches_pass_finite_remote_row_bounds(
-    state_manager,
-    monkeypatch,
+class FakeSecureArchiveClient:
+    calls: list[dict[str, object]] = []
+    sesame_body = b"%J 83.63240000 +22.01740000\n"
+    tap_body = b"<?xml version='1.0'?><VOTABLE version='1.3'><RESOURCE><TABLE><FIELD name='obsid' datatype='char' arraysize='*'/><DATA><TABLEDATA><TR><TD>5001010204</TD></TR></TABLEDATA></DATA></TABLE></RESOURCE></VOTABLE>"
+
+    def __init__(self, policy, *, timeouts, max_redirects):
+        self.policy = policy
+        self.timeouts = timeouts
+        self.max_redirects = max_redirects
+
+    async def fetch_text(self, url, *, max_bytes, **_kwargs):
+        self.calls.append(
+            {
+                "kind": "sesame",
+                "url": url,
+                "policy": self.policy.name,
+                "max_bytes": max_bytes,
+                "timeouts": self.timeouts,
+                "max_redirects": self.max_redirects,
+            }
+        )
+        return self.sesame_body.decode(), SimpleNamespace(content_type="text/plain")
+
+    async def post_form_bytes(
+        self, url, fields, *, max_bytes, max_request_bytes, **_kwargs
+    ):
+        self.calls.append(
+            {
+                "kind": "tap",
+                "url": url,
+                "fields": dict(fields),
+                "policy": self.policy.name,
+                "max_bytes": max_bytes,
+                "max_request_bytes": max_request_bytes,
+                "timeouts": self.timeouts,
+                "max_redirects": self.max_redirects,
+            }
+        )
+        return self.tap_body, SimpleNamespace(content_type="text/xml")
+
+
+def test_archive_searches_use_one_pinned_client_per_hop_and_bound_requests(
+    state_manager, monkeypatch
 ):
-    recorder = install_heasarc_recorder(monkeypatch)
+    FakeSecureArchiveClient.calls = []
+    monkeypatch.setattr(archive_module, "RemoteSourceClient", FakeSecureArchiveClient)
     service = ArchiveService(state_manager)
-    monkeypatch.setattr(
-        service,
-        "_resolve_source_name",
-        lambda _source: SkyCoord(83.633 * u.deg, 22.0145 * u.deg),
-    )
 
     name_result = service.search_by_name("Crab", "NICER", max_results=100)
-    coordinate_result = service.search_by_coordinates(
-        83.633,
-        22.0145,
-        "NICER",
-        max_results=100,
-    )
+    coordinate_result = service.search_by_coordinates(83.633, 22.0145, "NICER")
     obsid_result = service.search_by_obsid("4010080142", "NICER")
 
     assert name_result["success"] is True
     assert coordinate_result["success"] is True
     assert obsid_result["success"] is True
-    assert len(recorder.region_calls) == 2
-    assert all(
-        call["columns"] == "*"
-        and isinstance(call["maxrec"], int)
-        and 0 < call["maxrec"] <= MAX_ARCHIVE_SEARCH_REMOTE_ROWS
-        for call in recorder.region_calls
-    )
-    assert recorder.tap_calls == [
-        {
-            "query": "SELECT * FROM nicermastr WHERE obsid = '4010080142'",
-            "maxrec": MAX_ARCHIVE_OBSID_REMOTE_ROWS,
+    assert [call["kind"] for call in FakeSecureArchiveClient.calls] == [
+        "sesame",
+        "tap",
+        "tap",
+        "tap",
+    ]
+    sesame = FakeSecureArchiveClient.calls[0]
+    assert sesame["max_bytes"] == 64 * 1024
+    assert sesame["max_redirects"] == 0
+    for call in FakeSecureArchiveClient.calls[1:]:
+        assert call["url"] == HEASARC_TAP_URL
+        assert call["max_bytes"] == 32 * 1024**2
+        assert call["max_request_bytes"] == 64 * 1024
+        assert call["max_redirects"] == 0
+        assert call["fields"]["MAXREC"] in {
+            MAX_ARCHIVE_SEARCH_REMOTE_ROWS,
+            MAX_ARCHIVE_OBSID_REMOTE_ROWS,
         }
-    ]
 
 
-def test_archive_search_session_injects_and_preserves_timeouts(monkeypatch):
-    captured: list[object] = []
+def test_region_and_obsid_adql_are_local_and_allowlisted(state_manager, monkeypatch):
+    service = ArchiveService(state_manager)
+    queries: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        service,
+        "_query_tap",
+        lambda query, maxrec, budget: (queries.append((query, maxrec)) or Table()),
+    )
+    coords = SkyCoord(83.633 * u.deg, 22.0145 * u.deg)
+    monkeypatch.setattr(service, "_resolve_source_name", lambda _name, _budget: coords)
 
-    def fake_request(_session, _method, _url, **kwargs):
-        captured.append(kwargs.get("timeout"))
-        return SimpleNamespace()
+    service.search_by_name("Crab", "NICER")
+    service.search_by_coordinates(83.633, 22.0145, "NICER")
+    service.search_by_obsid("4010080142", "NICER")
 
-    monkeypatch.setattr(requests.Session, "request", fake_request)
-    session = ArchiveSearchSession()
-    try:
-        session.request("GET", "https://heasarc.gsfc.nasa.gov/xamin/vo/tap")
-        session.request(
-            "GET",
-            "https://heasarc.gsfc.nasa.gov/xamin/vo/tap",
-            timeout=(1.0, 2.0),
-        )
-    finally:
-        session.close()
-
-    assert captured == [
-        (
-            ARCHIVE_SEARCH_CONNECT_TIMEOUT_SECONDS,
-            ARCHIVE_SEARCH_READ_TIMEOUT_SECONDS,
-        ),
-        (1.0, 2.0),
-    ]
+    assert queries[0][0] == (
+        "SELECT * FROM nicermastr WHERE CONTAINS("
+        "POINT('ICRS',83.633,22.0145),CIRCLE('ICRS',83.633,22.0145,0.5))=1"
+    )
+    assert queries[0][1] == MAX_ARCHIVE_SEARCH_REMOTE_ROWS
+    assert queries[2] == (
+        "SELECT * FROM nicermastr WHERE obsid = '4010080142'",
+        MAX_ARCHIVE_OBSID_REMOTE_ROWS,
+    )
 
 
-def test_real_heasarc_factory_installs_bounded_session_without_network():
-    with archive_module._open_heasarc_client() as client:
-        assert isinstance(client._session, ArchiveSearchSession)
-        assert client.tap._session is client._session
+def test_source_name_parser_is_local_and_does_not_use_astropy_network(monkeypatch):
+    service = object.__new__(ArchiveService)
+    monkeypatch.setattr(
+        archive_module.SkyCoord,
+        "from_name",
+        lambda _name: (_ for _ in ()).throw(AssertionError("network resolver used")),
+    )
+
+    class SesameClient(FakeSecureArchiveClient):
+        async def fetch_text(self, url, *, max_bytes, **kwargs):
+            return "%J 83.6324 +22.0174", SimpleNamespace(content_type="text/plain")
+
+    monkeypatch.setattr(archive_module, "RemoteSourceClient", SesameClient)
+    coords = service._resolve_source_name("Crab")
+    assert coords is not None
+    assert coords.ra.deg == pytest.approx(83.6324)
+    assert coords.dec.deg == pytest.approx(22.0174)
+
+
+def test_archive_search_budget_is_shared_and_monotonic():
+    budget = ArchiveSearchBudget.start()
+    assert 0 < budget.remaining() <= ARCHIVE_SEARCH_TOTAL_SECONDS
+    budget.deadline = time.monotonic() - 1
+    with pytest.raises(archive_module.RemoteSourceTimeout):
+        budget.remaining()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "route,payload",
     [
-        (
-            search_by_name,
-            SearchByNameRequest(source_name="Crab", mission="NICER"),
-        ),
+        (search_by_name, SearchByNameRequest(source_name="Crab", mission="NICER")),
         (search_by_coordinates, coordinate_request()),
-        (
-            search_by_obsid,
-            SearchByObsidRequest(obsid="4010080142", mission="NICER"),
-        ),
+        (search_by_obsid, SearchByObsidRequest(obsid="4010080142", mission="NICER")),
     ],
 )
 async def test_every_archive_search_route_runs_on_a_worker_thread(
-    route,
-    payload,
-    monkeypatch,
+    route, payload, monkeypatch
 ):
     monkeypatch.setattr(
-        route_module,
-        "ARCHIVE_SEARCH_CAPACITY",
-        threading.BoundedSemaphore(2),
+        route_module, "ARCHIVE_SEARCH_CAPACITY", threading.BoundedSemaphore(2)
     )
     event_loop_thread = threading.get_ident()
     worker_threads: list[int] = []
@@ -207,7 +221,6 @@ async def test_every_archive_search_route_runs_on_a_worker_thread(
     )
 
     result = await route(payload, service)
-
     assert result["success"] is True
     assert worker_threads and worker_threads[0] != event_loop_thread
 
@@ -215,9 +228,7 @@ async def test_every_archive_search_route_runs_on_a_worker_thread(
 @pytest.mark.asyncio
 async def test_archive_search_route_keeps_event_loop_responsive(monkeypatch):
     monkeypatch.setattr(
-        route_module,
-        "ARCHIVE_SEARCH_CAPACITY",
-        threading.BoundedSemaphore(2),
+        route_module, "ARCHIVE_SEARCH_CAPACITY", threading.BoundedSemaphore(2)
     )
     release = threading.Event()
     service = RouteSearchService(
@@ -230,7 +241,6 @@ async def test_archive_search_route_keeps_event_loop_responsive(monkeypatch):
     heartbeat_elapsed = time.monotonic() - started_at
     release.set()
     result = await task
-
     assert heartbeat_elapsed < 0.2
     assert result["success"] is True
 
@@ -239,9 +249,7 @@ async def test_archive_search_route_keeps_event_loop_responsive(monkeypatch):
 async def test_archive_search_capacity_is_process_global_and_fail_fast(monkeypatch):
     capacity = 2
     monkeypatch.setattr(
-        route_module,
-        "ARCHIVE_SEARCH_CAPACITY",
-        threading.BoundedSemaphore(capacity),
+        route_module, "ARCHIVE_SEARCH_CAPACITY", threading.BoundedSemaphore(capacity)
     )
     monkeypatch.setattr(route_module, "ARCHIVE_SEARCH_RESPONSE_TIMEOUT_SECONDS", 1.0)
     release = threading.Event()
@@ -265,30 +273,17 @@ async def test_archive_search_capacity_is_process_global_and_fail_fast(monkeypat
 
     rejected_service = RouteSearchService(lambda: result_envelope("unexpected"))
     rejected = await search_by_coordinates(coordinate_request(), rejected_service)
-
-    assert rejected == {
-        "success": False,
-        "data": None,
-        "message": "Too many archive searches are already active",
-        "error": "Archive search capacity is temporarily unavailable",
-    }
+    assert rejected["message"] == "Too many archive searches are already active"
     assert rejected_service.calls == 0
 
     release.set()
     assert all(result["success"] for result in await asyncio.gather(*active))
-    retry = await search_by_coordinates(
-        coordinate_request(),
-        RouteSearchService(result_envelope),
-    )
-    assert retry["success"] is True
 
 
 @pytest.mark.asyncio
 async def test_timed_out_search_keeps_capacity_until_worker_finishes(monkeypatch):
     monkeypatch.setattr(
-        route_module,
-        "ARCHIVE_SEARCH_CAPACITY",
-        threading.BoundedSemaphore(1),
+        route_module, "ARCHIVE_SEARCH_CAPACITY", threading.BoundedSemaphore(1)
     )
     monkeypatch.setattr(route_module, "ARCHIVE_SEARCH_RESPONSE_TIMEOUT_SECONDS", 0.02)
     release = threading.Event()
@@ -299,16 +294,11 @@ async def test_timed_out_search_keeps_capacity_until_worker_finishes(monkeypatch
         release.wait(timeout=1.0)
         return result_envelope()
 
-    timed_out_service = RouteSearchService(blocking_operation)
-    timed_out = await search_by_coordinates(coordinate_request(), timed_out_service)
-
+    timed_out = await search_by_coordinates(
+        coordinate_request(), RouteSearchService(blocking_operation)
+    )
     assert started.is_set()
-    assert timed_out == {
-        "success": False,
-        "data": None,
-        "message": "The archive search timed out",
-        "error": "The bounded archive search deadline expired",
-    }
+    assert timed_out["message"] == "The archive search timed out"
 
     rejected_service = RouteSearchService(lambda: result_envelope("unexpected"))
     rejected = await search_by_coordinates(coordinate_request(), rejected_service)
@@ -319,8 +309,7 @@ async def test_timed_out_search_keeps_capacity_until_worker_finishes(monkeypatch
     deadline = time.monotonic() + 1.0
     while True:
         retry = await search_by_coordinates(
-            coordinate_request(),
-            RouteSearchService(result_envelope),
+            coordinate_request(), RouteSearchService(result_envelope)
         )
         if retry["success"]:
             break

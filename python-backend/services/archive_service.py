@@ -8,6 +8,7 @@ and download data with progress tracking.
 import asyncio
 import hashlib
 import inspect
+import io
 import math
 import os
 import queue
@@ -20,12 +21,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote_to_bytes, urlsplit
 
-import requests
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 
 from .base_service import BaseService
 from .remote_source import (
+    CDS_SESAME_POLICY,
+    HEASARC_TAP_POLICY,
     HEASARC_ARCHIVE_POLICY,
     RemoteSourceCancelled,
     RemoteSourceClient,
@@ -68,35 +70,46 @@ MAX_ARCHIVE_SEARCH_REMOTE_ROWS = 5_000
 MAX_ARCHIVE_OBSID_REMOTE_ROWS = 10
 ARCHIVE_SEARCH_CONNECT_TIMEOUT_SECONDS = 10.0
 ARCHIVE_SEARCH_READ_TIMEOUT_SECONDS = 30.0
+ARCHIVE_SEARCH_TOTAL_SECONDS = 30.0
+MAX_ARCHIVE_SEARCH_REQUEST_BYTES = 64 * 1024
+MAX_ARCHIVE_SEARCH_RESPONSE_BYTES = 32 * 1024**2
+CDS_SESAME_URL = "https://cds.unistra.fr/cgi-bin/nph-sesame/SNV"
+HEASARC_TAP_URL = "https://heasarc.gsfc.nasa.gov/xamin/vo/tap/sync"
+_ALLOWED_TAP_MEDIA_TYPES = frozenset(
+    {"text/xml", "application/xml", "application/x-votable+xml"}
+)
+_ALLOWED_SESAME_MEDIA_TYPES = frozenset({"text/plain"})
 ARCHIVE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 ARCHIVE_PROPOSAL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 CancellationCheck = Callable[[], bool | None | Awaitable[bool | None]]
 
 
-class ArchiveSearchSession(requests.Session):
-    """Apply finite connect/read timeouts to astroquery's TAP requests."""
+@dataclass
+class ArchiveSearchBudget:
+    """One monotonic deadline shared by name resolution and TAP."""
 
-    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
-        if kwargs.get("timeout") is None:
-            kwargs["timeout"] = (
-                ARCHIVE_SEARCH_CONNECT_TIMEOUT_SECONDS,
-                ARCHIVE_SEARCH_READ_TIMEOUT_SECONDS,
-            )
-        return super().request(method, url, **kwargs)
+    deadline: float
+
+    @classmethod
+    def start(cls) -> "ArchiveSearchBudget":
+        return cls(time.monotonic() + ARCHIVE_SEARCH_TOTAL_SECONDS)
+
+    def remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise RemoteSourceTimeout("The archive search timed out")
+        return remaining
 
 
-@contextmanager
-def _open_heasarc_client() -> Generator[Any, None, None]:
-    """Create one isolated HEASARC client with a bounded HTTP session."""
-    from astroquery.heasarc.core import HeasarcClass
-
-    client = HeasarcClass()
-    session = ArchiveSearchSession()
-    client._set_session(session)
-    try:
-        yield client
-    finally:
-        session.close()
+def _search_timeouts(budget: ArchiveSearchBudget) -> RemoteTimeouts:
+    remaining = budget.remaining()
+    return RemoteTimeouts(
+        connect=min(ARCHIVE_SEARCH_CONNECT_TIMEOUT_SECONDS, remaining),
+        read=min(ARCHIVE_SEARCH_READ_TIMEOUT_SECONDS, remaining),
+        write=min(ARCHIVE_SEARCH_CONNECT_TIMEOUT_SECONDS, remaining),
+        pool=min(5.0, remaining),
+        total=remaining,
+    )
 
 
 class ArchiveDownloadBusyError(RuntimeError):
@@ -372,18 +385,98 @@ class ArchiveService(BaseService):
             message=f"Found {len(catalogs)} supported catalogs",
         )
 
-    def _resolve_source_name(self, source_name: str) -> Optional[SkyCoord]:
-        """
-        Resolve a source name to coordinates using SIMBAD/NED.
+    def _remote_client(self, policy, budget: ArchiveSearchBudget) -> RemoteSourceClient:
+        return RemoteSourceClient(
+            policy,
+            timeouts=_search_timeouts(budget),
+            max_redirects=0,
+        )
 
-        Args:
-            source_name: Astronomical source name (e.g., "Crab", "Cyg X-1")
+    @staticmethod
+    def _response_media_type(info: Any, allowed: frozenset[str]) -> bool:
+        media_type = getattr(info, "content_type", None)
+        if not isinstance(media_type, str):
+            return False
+        return media_type.split(";", 1)[0].strip().lower() in allowed
 
-        Returns:
-            SkyCoord object or None if resolution fails
-        """
+    def _resolve_source_name(
+        self, source_name: str, budget: ArchiveSearchBudget | None = None
+    ) -> Optional[SkyCoord]:
+        """Resolve a source name through the pinned HTTPS CDS Sesame endpoint."""
+        search_budget = budget or ArchiveSearchBudget.start()
         try:
-            return SkyCoord.from_name(source_name)
+            quoted_name = quote(source_name, safe="")
+            body, info = asyncio.run(
+                self._remote_client(CDS_SESAME_POLICY, search_budget).fetch_text(
+                    f"{CDS_SESAME_URL}?{quoted_name}",
+                    max_bytes=64 * 1024,
+                )
+            )
+            search_budget.remaining()
+            if not self._response_media_type(info, _ALLOWED_SESAME_MEDIA_TYPES):
+                return None
+            match = re.search(r"%J\s*([0-9.]+)\s*([+\-.0-9]+)", body)
+            if match is None:
+                return None
+            return SkyCoord(
+                float(match.group(1)),
+                float(match.group(2)),
+                unit=u.deg,
+                frame="icrs",
+            )
+        except (RemoteSourceError, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _region_query(catalog: str, coords: SkyCoord, radius: float) -> str:
+        ra = float(coords.icrs.ra.deg)
+        dec = float(coords.icrs.dec.deg)
+        if not math.isfinite(radius) or radius <= 0 or radius > 10:
+            raise ValueError("Search radius is outside the supported range")
+        return (
+            f"SELECT * FROM {catalog} WHERE CONTAINS("
+            f"POINT('ICRS',{ra:.12g},{dec:.12g}),"
+            f"CIRCLE('ICRS',{ra:.12g},{dec:.12g},{radius:.12g}))=1"
+        )
+
+    def _query_tap(
+        self,
+        adql: str,
+        maxrec: int,
+        budget: ArchiveSearchBudget,
+    ) -> Any | None:
+        """Fetch and parse one bounded VOTable without network-capable DAL APIs."""
+        if not isinstance(maxrec, int) or maxrec <= 0:
+            raise ValueError("maxrec must be positive")
+        try:
+            body, info = asyncio.run(
+                self._remote_client(HEASARC_TAP_POLICY, budget).post_form_bytes(
+                    HEASARC_TAP_URL,
+                    {
+                        "REQUEST": "doQuery",
+                        "LANG": "ADQL",
+                        "MAXREC": maxrec,
+                        "QUERY": adql,
+                    },
+                    max_bytes=MAX_ARCHIVE_SEARCH_RESPONSE_BYTES,
+                    max_request_bytes=MAX_ARCHIVE_SEARCH_REQUEST_BYTES,
+                )
+            )
+            if not self._response_media_type(info, _ALLOWED_TAP_MEDIA_TYPES):
+                return None
+            budget.remaining()
+            from astropy.io.votable import parse
+            from pyvo.dal import TAPResults
+
+            votable = parse(io.BytesIO(body))
+            budget.remaining()
+            results = TAPResults(votable, url=HEASARC_TAP_URL)
+            results.check_overflow_warning(maxrec)
+            table = results.to_table()
+            budget.remaining()
+            if table is None or len(table) > maxrec:
+                return None
+            return table
         except Exception:
             return None
 
@@ -749,7 +842,8 @@ class ArchiveService(BaseService):
             catalog_name = catalog_info["catalog"]
 
             # Resolve source name to coordinates
-            coords = self._resolve_source_name(source_name)
+            budget = ArchiveSearchBudget.start()
+            coords = self._resolve_source_name(source_name, budget)
             if coords is None:
                 return self.create_result(
                     success=False,
@@ -758,22 +852,17 @@ class ArchiveService(BaseService):
                     error="Name resolution failed via SIMBAD/NED",
                 )
 
-            # Query HEASARC
-            try:
-                with _open_heasarc_client() as heasarc:
-                    table = heasarc.query_region(
-                        coords,
-                        catalog=catalog_name,
-                        radius=radius * u.deg,
-                        columns="*",
-                        maxrec=MAX_ARCHIVE_SEARCH_REMOTE_ROWS,
-                    )
-            except Exception as e:
+            table = self._query_tap(
+                self._region_query(catalog_name, coords, radius),
+                MAX_ARCHIVE_SEARCH_REMOTE_ROWS,
+                budget,
+            )
+            if table is None:
                 return self.create_result(
                     success=False,
                     data=None,
-                    message=f"HEASARC query failed: {str(e)}",
-                    error=str(e),
+                    message="The archive search could not be completed safely",
+                    error="Archive search response was invalid or unavailable",
                 )
 
             # Apply post-query filters
@@ -849,22 +938,18 @@ class ArchiveService(BaseService):
             # Create coordinates
             coords = SkyCoord(ra=ra * u.deg, dec=dec * u.deg)
 
-            # Query HEASARC
-            try:
-                with _open_heasarc_client() as heasarc:
-                    table = heasarc.query_region(
-                        coords,
-                        catalog=catalog_name,
-                        radius=radius * u.deg,
-                        columns="*",
-                        maxrec=MAX_ARCHIVE_SEARCH_REMOTE_ROWS,
-                    )
-            except Exception as e:
+            budget = ArchiveSearchBudget.start()
+            table = self._query_tap(
+                self._region_query(catalog_name, coords, radius),
+                MAX_ARCHIVE_SEARCH_REMOTE_ROWS,
+                budget,
+            )
+            if table is None:
                 return self.create_result(
                     success=False,
                     data=None,
-                    message=f"HEASARC query failed: {str(e)}",
-                    error=str(e),
+                    message="The archive search could not be completed safely",
+                    error="Archive search response was invalid or unavailable",
                 )
 
             # Apply post-query filters
@@ -942,19 +1027,14 @@ class ArchiveService(BaseService):
             safe_obsid = obsid.strip().replace("'", "''")
             adql = f"SELECT * FROM {catalog_name} WHERE obsid = '{safe_obsid}'"
 
-            try:
-                with _open_heasarc_client() as heasarc:
-                    tap_result = heasarc.query_tap(
-                        adql,
-                        maxrec=MAX_ARCHIVE_OBSID_REMOTE_ROWS,
-                    )
-                    table = tap_result.to_table()
-            except Exception as e:
+            budget = ArchiveSearchBudget.start()
+            table = self._query_tap(adql, MAX_ARCHIVE_OBSID_REMOTE_ROWS, budget)
+            if table is None:
                 return self.create_result(
                     success=False,
                     data=None,
-                    message=f"HEASARC ObsID query failed: {str(e)}",
-                    error=str(e),
+                    message="The archive search could not be completed safely",
+                    error="Archive search response was invalid or unavailable",
                 )
 
             if table is None or len(table) == 0:

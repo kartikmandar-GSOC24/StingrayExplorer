@@ -9,8 +9,10 @@ import httpx
 import pytest
 import services.remote_source as remote_source_module
 from services.remote_source import (
+    CDS_SESAME_POLICY,
     GENERAL_HTTPS_POLICY,
     HEASARC_ARCHIVE_POLICY,
+    HEASARC_TAP_POLICY,
     RemoteSourceCancelled,
     RemoteSourceClient,
     RemoteSourceError,
@@ -191,6 +193,86 @@ async def test_canonical_explicit_https_port_is_allowed_and_redacted() -> None:
         "write": 10.0,
         "pool": 5.0,
     }
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://heasarc.gsfc.nasa.gov/xamin/vo/tap/sync/extra",
+        "https://heasarc.gsfc.nasa.gov/xamin/vo/tap/%73ync",
+        "https://attacker.example/xamin/vo/tap/sync",
+    ],
+)
+@pytest.mark.asyncio
+async def test_archive_search_policies_require_exact_host_and_path(url: str) -> None:
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return response()
+
+    source = client_for(handler, policy=HEASARC_TAP_POLICY)
+    with pytest.raises(RemoteSourcePolicyError):
+        await source.post_form_bytes(url, {"QUERY": "SELECT 1"}, max_bytes=100)
+    assert called is False
+
+    cds = client_for(handler, policy=CDS_SESAME_POLICY)
+    with pytest.raises(RemoteSourcePolicyError):
+        await cds.fetch_text(
+            "https://cds.unistra.fr/cgi-bin/nph-sesame/SNV/extra?Crab",
+            max_bytes=100,
+        )
+
+
+@pytest.mark.asyncio
+async def test_form_post_is_bounded_pinned_and_does_not_follow_redirects() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return response(
+            302,
+            headers={"Location": "https://heasarc.gsfc.nasa.gov/xamin/vo/tap/sync"},
+            peer=PUBLIC_IP,
+        )
+
+    source = client_for(handler, policy=HEASARC_TAP_POLICY)
+    with pytest.raises(RemoteSourceRedirectError, match="not allowed"):
+        await source.post_form_bytes(
+            "https://heasarc.gsfc.nasa.gov/xamin/vo/tap/sync",
+            {"REQUEST": "doQuery", "LANG": "ADQL", "MAXREC": 10, "QUERY": "SELECT 1"},
+            max_bytes=100,
+        )
+
+    assert len(seen) == 1
+    assert seen[0].method == "POST"
+    assert seen[0].url.host == PUBLIC_IP
+    assert seen[0].headers["host"] == "heasarc.gsfc.nasa.gov"
+    assert seen[0].headers["content-type"] == "application/x-www-form-urlencoded"
+    assert seen[0].content == b"REQUEST=doQuery&LANG=ADQL&MAXREC=10&QUERY=SELECT+1"
+
+
+@pytest.mark.asyncio
+async def test_form_request_size_is_checked_before_dns_or_transport() -> None:
+    resolver = StaticResolver()
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return response()
+
+    source = client_for(handler, policy=HEASARC_TAP_POLICY, resolver=resolver)
+    with pytest.raises(RemoteSourceSizeError):
+        await source.post_form_bytes(
+            "https://heasarc.gsfc.nasa.gov/xamin/vo/tap/sync",
+            {"QUERY": "x" * 100},
+            max_bytes=100,
+            max_request_bytes=10,
+        )
+    assert resolver.calls == []
+    assert called is False
 
 
 @pytest.mark.parametrize(

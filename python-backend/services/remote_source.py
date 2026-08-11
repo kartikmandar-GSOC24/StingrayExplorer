@@ -15,11 +15,11 @@ import math
 import re
 import socket
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import unquote, unquote_to_bytes, urljoin, urlsplit
+from urllib.parse import urlencode, unquote, unquote_to_bytes, urljoin, urlsplit
 
 import httpx
 
@@ -86,6 +86,11 @@ class RemoteSourcePolicy:
     name: str
     required_host: str | None = None
     required_path_prefix: str | None = None
+    required_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.required_path_prefix is not None and self.required_path is not None:
+            raise ValueError("a remote policy cannot require both a path and a prefix")
 
 
 GENERAL_HTTPS_POLICY = RemoteSourcePolicy(name="general HTTPS")
@@ -93,6 +98,16 @@ HEASARC_ARCHIVE_POLICY = RemoteSourcePolicy(
     name="HEASARC archive",
     required_host="heasarc.gsfc.nasa.gov",
     required_path_prefix="/FTP/",
+)
+HEASARC_TAP_POLICY = RemoteSourcePolicy(
+    name="HEASARC TAP",
+    required_host="heasarc.gsfc.nasa.gov",
+    required_path="/xamin/vo/tap/sync",
+)
+CDS_SESAME_POLICY = RemoteSourcePolicy(
+    name="CDS Sesame",
+    required_host="cds.unistra.fr",
+    required_path="/cgi-bin/nph-sesame/SNV",
 )
 
 
@@ -308,6 +323,12 @@ def _parse_url(
         path_segments = decoded_path.split("/")
         if any(segment in {".", ".."} for segment in path_segments):
             raise RemoteSourcePolicyError("Remote URL path traversal is not allowed")
+    if policy.required_path is not None and (
+        parts.path != policy.required_path or decoded_path != policy.required_path
+    ):
+        raise RemoteSourcePolicyError(
+            f"Remote URL is outside the {policy.name} path boundary"
+        )
 
     try:
         request_url = httpx.URL(value)
@@ -629,6 +650,10 @@ class RemoteSourceClient:
         client: httpx.AsyncClient,
         validated: ValidatedRemoteURL,
         deadline: float,
+        *,
+        method: str = "GET",
+        content: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> httpx.Response:
         last_failure_was_timeout = False
         for pinned_address in sorted(validated.addresses, key=self._address_order):
@@ -638,13 +663,15 @@ class RemoteSourceClient:
             pinned_url = validated.url.copy_with(host=str(pinned_address))
             client.cookies.clear()
             request = client.build_request(
-                "GET",
+                method,
                 pinned_url,
                 headers={
                     "Accept-Encoding": "identity",
                     "Host": self._host_header(validated.host),
                     "User-Agent": "StingrayExplorer/remote-source",
+                    **(dict(headers) if headers is not None else {}),
                 },
+                content=content,
                 extensions={"sni_hostname": validated.host},
             )
             try:
@@ -688,18 +715,34 @@ class RemoteSourceClient:
         client: httpx.AsyncClient,
         value: str,
         deadline: float,
+        *,
+        method: str = "GET",
+        content: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+        allow_redirects: bool = True,
     ) -> tuple[httpx.Response, ValidatedRemoteURL, int]:
         current = value
         redirect_count = 0
 
         while True:
             validated = await self._validate_url(current, deadline)
-            response = await self._send(client, validated, deadline)
+            response = await self._send(
+                client,
+                validated,
+                deadline,
+                method=method,
+                content=content,
+                headers=headers,
+            )
             if response.status_code not in _REDIRECT_STATUSES:
                 return response, validated, redirect_count
 
             location = response.headers.get("location")
             await response.aclose()
+            if not allow_redirects:
+                raise RemoteSourceRedirectError(
+                    f"Remote redirect is not allowed for {validated.display_url}"
+                )
             if location is None:
                 raise RemoteSourceRedirectError(
                     f"Remote redirect was missing Location for {validated.display_url}"
@@ -714,12 +757,16 @@ class RemoteSourceClient:
             current = urljoin(str(validated.url), location)
 
     @asynccontextmanager
-    async def stream(
+    async def _stream(
         self,
         url: str,
         *,
         max_bytes: int,
         cancellation_check: CancellationCheck | None = None,
+        method: str = "GET",
+        content: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+        allow_redirects: bool = True,
     ) -> AsyncIterator[RemoteByteStream]:
         """Open a validated response and expose a capped raw-byte stream."""
         if (
@@ -739,7 +786,13 @@ class RemoteSourceClient:
             trust_env=False,
         ) as client:
             response, validated, redirect_count = await self._open_response(
-                client, url, deadline
+                client,
+                url,
+                deadline,
+                method=method,
+                content=content,
+                headers=headers,
+                allow_redirects=allow_redirects,
             )
             try:
                 if not 200 <= response.status_code < 300:
@@ -779,6 +832,22 @@ class RemoteSourceClient:
             finally:
                 await response.aclose()
 
+    @asynccontextmanager
+    async def stream(
+        self,
+        url: str,
+        *,
+        max_bytes: int,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> AsyncIterator[RemoteByteStream]:
+        """Open a validated GET response and expose a capped raw-byte stream."""
+        async with self._stream(
+            url,
+            max_bytes=max_bytes,
+            cancellation_check=cancellation_check,
+        ) as remote_stream:
+            yield remote_stream
+
     async def fetch_bytes(
         self,
         url: str,
@@ -815,3 +884,51 @@ class RemoteSourceClient:
             raise RemoteSourceError(
                 f"Remote text response was not valid {encoding} for {info.display_url}"
             ) from error
+
+    async def post_form_bytes(
+        self,
+        url: str,
+        fields: Mapping[str, str | int],
+        *,
+        max_bytes: int,
+        max_request_bytes: int = 64 * 1024,
+        accept: str = "application/x-votable+xml, text/xml, application/xml",
+        cancellation_check: CancellationCheck | None = None,
+    ) -> tuple[bytes, RemoteResponseInfo]:
+        """POST one bounded form body without following or replaying redirects."""
+        if not isinstance(fields, Mapping):
+            raise TypeError("fields must be a mapping")
+        try:
+            encoded_fields = {
+                key: str(value)
+                for key, value in fields.items()
+                if isinstance(key, str) and isinstance(value, (str, int))
+            }
+            if len(encoded_fields) != len(fields):
+                raise ValueError
+            body = urlencode(encoded_fields, doseq=False).encode("ascii")
+        except (TypeError, ValueError, UnicodeEncodeError) as error:
+            raise RemoteSourcePolicyError("Remote form fields are invalid") from error
+        if (
+            not isinstance(max_request_bytes, int)
+            or isinstance(max_request_bytes, bool)
+            or max_request_bytes <= 0
+        ):
+            raise ValueError("max_request_bytes must be a positive integer")
+        if len(body) > max_request_bytes:
+            raise RemoteSourceSizeError("Remote form request exceeds its byte limit")
+
+        async with self._stream(
+            url,
+            max_bytes=max_bytes,
+            cancellation_check=cancellation_check,
+            method="POST",
+            content=body,
+            headers={
+                "Accept": accept,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            allow_redirects=False,
+        ) as remote_stream:
+            chunks = [chunk async for chunk in remote_stream.aiter_bytes()]
+            return b"".join(chunks), remote_stream.info
