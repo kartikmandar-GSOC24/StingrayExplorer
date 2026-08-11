@@ -305,10 +305,8 @@ const HeasarcBrowserPanel: React.FC<HeasarcBrowserPanelProps> = ({ onDataLoaded 
     setFileBrowser((prev) => ({ ...prev, open: false }));
   };
 
-  // Handle download complete - file was saved to disk
-  const handleDownloadComplete = (filePath: string): void => {
-    console.log('File downloaded to:', filePath);
-    // Could optionally switch to the Local tab or pre-fill the file path
+  // Refresh loaded data after a backend-verified archive download completes.
+  const handleDownloadComplete = (): void => {
     onDataLoaded?.();
   };
 

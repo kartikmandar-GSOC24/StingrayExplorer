@@ -4,18 +4,6 @@
 
 export interface ElectronAPI {
   // File System Operations
-  openFile: (options?: {
-    title?: string;
-    filters?: { name: string; extensions: string[] }[];
-    multiple?: boolean;
-  }) => Promise<string[] | null>;
-
-  saveFile: (options?: {
-    title?: string;
-    defaultPath?: string;
-    filters?: { name: string; extensions: string[] }[];
-  }) => Promise<string | null>;
-
   openGrantedFile: (options?: {
     title?: string;
     filters?: { name: string; extensions: string[] }[];
@@ -27,10 +15,6 @@ export interface ElectronAPI {
     defaultPath?: string;
     filters?: { name: string; extensions: string[] }[];
   }) => Promise<{ path: string; grant: string } | null>;
-
-  openDirectory: () => Promise<string | null>;
-
-  fileExists: (filePath: string) => Promise<boolean>;
 
   // Python Backend Communication
   getBackendPort: () => Promise<number>;
@@ -67,8 +51,6 @@ export interface ElectronAPI {
 
   // Shell Operations
   openExternal: (url: string) => Promise<void>;
-
-  showItemInFolder: (path: string) => void;
 
   // Clipboard Operations
   copyToClipboard: (text: string) => void;

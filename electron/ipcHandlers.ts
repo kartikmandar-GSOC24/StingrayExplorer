@@ -7,8 +7,6 @@ import {
   BrowserWindow,
   type OpenDialogOptions,
 } from 'electron';
-import fs from 'fs/promises';
-import path from 'path';
 import { PythonManager, type NativeFileGrant } from './pythonManager';
 
 type PythonManagerGetter = () => PythonManager | null;
@@ -33,72 +31,6 @@ export function setupIpcHandlers(
   // ============================================
   // File Dialog Handlers
   // ============================================
-
-  ipcMain.handle(
-    'dialog:openFile',
-    (
-      event,
-      options?: {
-        title?: string;
-        filters?: { name: string; extensions: string[] }[];
-        multiple?: boolean;
-      }
-    ) => {
-      const parentWindow = BrowserWindow.fromWebContents(event.sender);
-
-      const dialogOptions = {
-        title: options?.title || 'Open File',
-        filters: options?.filters || [
-          { name: 'FITS Files', extensions: ['fits', 'fit', 'fts'] },
-          { name: 'HDF5 Files', extensions: ['hdf5', 'h5', 'hdf'] },
-          { name: 'Text Files', extensions: ['txt', 'csv', 'dat', 'ascii'] },
-          { name: 'All Files', extensions: ['*'] },
-        ],
-        properties: options?.multiple ? (['openFile', 'multiSelections'] as ('openFile' | 'multiSelections')[]) : (['openFile'] as ('openFile')[]),
-      };
-
-      const result = parentWindow
-        ? dialog.showOpenDialogSync(parentWindow, dialogOptions)
-        : dialog.showOpenDialogSync(dialogOptions);
-
-      if (!result || result.length === 0) {
-        return null;
-      }
-
-      return result;
-    }
-  );
-
-  ipcMain.handle(
-    'dialog:saveFile',
-    (
-      event,
-      options?: {
-        title?: string;
-        defaultPath?: string;
-        filters?: { name: string; extensions: string[] }[];
-      }
-    ) => {
-      const parentWindow = BrowserWindow.fromWebContents(event.sender);
-
-      const dialogOptions = {
-        title: options?.title || 'Save File',
-        defaultPath: options?.defaultPath,
-        filters: options?.filters || [
-          { name: 'FITS Files', extensions: ['fits'] },
-          { name: 'HDF5 Files', extensions: ['hdf5'] },
-          { name: 'CSV Files', extensions: ['csv'] },
-          { name: 'All Files', extensions: ['*'] },
-        ],
-      };
-
-      const result = parentWindow
-        ? dialog.showSaveDialogSync(parentWindow, dialogOptions)
-        : dialog.showSaveDialogSync(dialogOptions);
-
-      return result || null;
-    }
-  );
 
   // Utility pages use signed variants of the native dialogs. The signature is
   // checked by FastAPI and binds each request to this exact path and access
@@ -163,38 +95,6 @@ export function setupIpcHandlers(
       return requirePythonManager(getPythonManager()).issueFileGrant(selected, 'write');
     }
   );
-
-  ipcMain.handle('dialog:openDirectory', (event) => {
-    const parentWindow = BrowserWindow.fromWebContents(event.sender);
-
-    const dialogOptions = {
-      title: 'Select Directory',
-      properties: ['openDirectory'] as ('openDirectory')[],
-    };
-
-    const result = parentWindow
-      ? dialog.showOpenDialogSync(parentWindow, dialogOptions)
-      : dialog.showOpenDialogSync(dialogOptions);
-
-    if (!result || result.length === 0) {
-      return null;
-    }
-
-    return result[0];
-  });
-
-  // ============================================
-  // File System Handlers
-  // ============================================
-
-  ipcMain.handle('file:exists', async (_event, filePath: string) => {
-    try {
-      await fs.access(filePath);
-      return true;
-    } catch {
-      return false;
-    }
-  });
 
   // ============================================
   // Python Backend Handlers
@@ -279,10 +179,6 @@ export function setupIpcHandlers(
 
   ipcMain.handle('shell:openExternal', async (_event, url: string) => {
     await shell.openExternal(url);
-  });
-
-  ipcMain.on('shell:showItemInFolder', (_event, filePath: string) => {
-    shell.showItemInFolder(path.normalize(filePath));
   });
 
   // ============================================

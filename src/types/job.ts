@@ -12,6 +12,30 @@ export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancel
  */
 export type JobType = 'load_event_list' | 'load_batch' | 'load_from_url';
 
+export type JobEventInputFormat = 'ogip' | 'fits' | 'hdf5' | 'ascii.ecsv';
+
+export interface PublicBatchJobSuccess {
+  name: string;
+}
+
+export interface PublicBatchJobFailure {
+  name: string;
+  error: string;
+}
+
+/** Public, redacted scientific/load summary. It intentionally has no paths or request params. */
+export interface PublicJobResult {
+  event_count?: number;
+  time_start?: number;
+  time_end?: number;
+  warnings?: string[];
+  successful?: PublicBatchJobSuccess[];
+  failed?: PublicBatchJobFailure[];
+  success_count?: number;
+  failure_count?: number;
+  total_files?: number;
+}
+
 /**
  * Represents a background job in the queue.
  */
@@ -36,10 +60,8 @@ export interface Job {
   started_at: string | null;
   /** ISO timestamp when job completed/failed/cancelled */
   completed_at: string | null;
-  /** Job-specific parameters */
-  params: Record<string, unknown>;
-  /** Result data on successful completion */
-  result: Record<string, unknown> | null;
+  /** Redacted scientific/load summary on successful completion. */
+  result: PublicJobResult | null;
   /** Error message on failure */
   error: string | null;
   /** Human-readable name for the job (shown in UI) */
@@ -108,11 +130,19 @@ export interface NameConflictResult {
 /**
  * Request parameters for submitting a single file load job.
  */
-export interface SubmitLoadJobParams {
+type OptionalRmfGrant =
+  | { rmf_file: string; rmf_grant: string }
+  | { rmf_file?: never; rmf_grant?: never };
+
+type OptionalSharedRmfGrant =
+  | { shared_rmf_file: string; shared_rmf_grant: string }
+  | { shared_rmf_file?: never; shared_rmf_grant?: never };
+
+export type SubmitLoadJobParams = OptionalRmfGrant & {
   file_path: string;
+  file_grant: string;
   name: string;
-  fmt?: string;
-  rmf_file?: string;
+  fmt?: JobEventInputFormat;
   additional_columns?: string[];
   high_precision?: boolean;
   skip_checks?: boolean;
@@ -123,16 +153,16 @@ export interface SubmitLoadJobParams {
   time_range_end?: number;
   event_start_index?: number;
   event_count?: number;
-}
+};
 
 /**
  * File configuration for batch loading.
  */
-export interface BatchFileConfig {
+export type BatchFileConfig = OptionalRmfGrant & {
   file_path: string;
+  file_grant: string;
   name: string;
-  fmt?: string;
-  rmf_file?: string;
+  fmt?: JobEventInputFormat;
   additional_columns?: string[];
   high_precision?: boolean;
   skip_checks?: boolean;
@@ -143,16 +173,15 @@ export interface BatchFileConfig {
   event_start_index?: number;
   event_count?: number;
   notes?: string;
-}
+};
 
 /**
  * Request parameters for submitting a batch load job.
  */
-export interface SubmitBatchJobParams {
+export type SubmitBatchJobParams = OptionalSharedRmfGrant & {
   files: BatchFileConfig[];
   use_same_settings?: boolean;
-  shared_fmt?: string;
-  shared_rmf_file?: string;
+  shared_fmt?: JobEventInputFormat;
   shared_additional_columns?: string[];
   shared_high_precision?: boolean;
   shared_skip_checks?: boolean;
@@ -162,18 +191,17 @@ export interface SubmitBatchJobParams {
   shared_time_range_end?: number;
   shared_event_start_index?: number;
   shared_event_count?: number;
-}
+};
 
 /**
  * Request parameters for submitting a URL load job.
  */
-export interface SubmitUrlJobParams {
+export type SubmitUrlJobParams = OptionalRmfGrant & {
   url: string;
   name: string;
-  fmt?: string;
-  rmf_file?: string;
+  fmt?: JobEventInputFormat;
   additional_columns?: string[];
   high_precision?: boolean;
   skip_checks?: boolean;
   notes?: string;
-}
+};

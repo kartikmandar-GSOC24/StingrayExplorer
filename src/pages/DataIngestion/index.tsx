@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Box,
   Typography,
@@ -76,9 +76,12 @@ import {
   SingleFileConfig,
   BatchSizeResult,
   ValidationIssue,
+  type EventInputFormat,
 } from '@/api/dataApi';
+import { ioApi, type UtilityExportFormat } from '@/api/ioApi';
 import { jobApi } from '@/api/jobApi';
 import type { BatchFileConfig } from '@/types/job';
+import type { GrantedFileSelection } from '@/components/utilities/GrantedFileField';
 import HeasarcBrowserPanel from './HeasarcBrowserPanel';
 import { apiClient } from '@/api/client';
 import { useUIStore } from '@/store/uiStore';
@@ -95,29 +98,108 @@ interface AlertState {
 // localStorage persistence for last loaded files
 const LAST_LOADED_FILES_KEY = 'lastLoadedFiles';
 
-interface LastLoadedFilesData {
+export interface LastLoadedFilesData {
   files: string[];
   fileNames: Record<string, string>;
   timestamp: number;
 }
 
-const saveLastLoadedFiles = (files: string[], names: Record<string, string>): void => {
+const EVENT_FILE_FILTERS = [
+  {
+    name: 'FITS / OGIP Event Files',
+    extensions: ['fits', 'fit', 'fts', 'evt', 'gz', 'fits.gz', 'fit.gz', 'fts.gz', 'evt.gz'],
+  },
+  { name: 'HDF5 Event Files', extensions: ['hdf5', 'h5'] },
+  { name: 'ECSV Event Files', extensions: ['ecsv'] },
+];
+
+const RMF_FILE_FILTERS = [
+  { name: 'Response Matrix Files', extensions: ['rmf', 'rsp'] },
+  { name: 'FITS Files', extensions: ['fits', 'fit'] },
+];
+
+type PerFileUiConfig = Omit<
+  Partial<SingleFileConfig>,
+  'file_path' | 'file_grant' | 'name' | 'rmf_file' | 'rmf_grant'
+>;
+
+type LegacySaveFormat = Extract<UtilityExportFormat, 'hdf5' | 'ecsv'>;
+
+export const saveLastLoadedFiles = (
+  files: GrantedFileSelection[],
+  names: Record<string, string>
+): void => {
   const data: LastLoadedFilesData = {
-    files,
+    files: files.map((file) => file.path),
     fileNames: names,
     timestamp: Date.now(),
   };
   localStorage.setItem(LAST_LOADED_FILES_KEY, JSON.stringify(data));
 };
 
-const getLastLoadedFiles = (): LastLoadedFilesData | null => {
+export const getLastLoadedFiles = (): LastLoadedFilesData | null => {
   const saved = localStorage.getItem(LAST_LOADED_FILES_KEY);
   if (!saved) return null;
   try {
-    return JSON.parse(saved) as LastLoadedFilesData;
+    const parsed: unknown = JSON.parse(saved);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    if (!Array.isArray(record.files)) return null;
+    const files = record.files.filter(
+      (file): file is string =>
+        typeof file === 'string' && file.length > 0 && file.length <= 4096 && !/[\0\r\n]/.test(file)
+    );
+    const rawNames =
+      record.fileNames && typeof record.fileNames === 'object' && !Array.isArray(record.fileNames)
+        ? (record.fileNames as Record<string, unknown>)
+        : {};
+    const fileNames = Object.fromEntries(
+      files.flatMap((file) => {
+        const name = rawNames[file];
+        return typeof name === 'string' && name.length <= 256 ? [[file, name]] : [];
+      })
+    );
+    return {
+      files,
+      fileNames,
+      timestamp:
+        typeof record.timestamp === 'number' && Number.isFinite(record.timestamp)
+          ? record.timestamp
+          : 0,
+    };
   } catch {
     return null;
   }
+};
+
+export const detectFormatFromExtension = (filePath: string): EventInputFormat => {
+  const ext = filePath.toLowerCase().split('.').pop();
+  if (ext === 'hdf5' || ext === 'h5') return 'hdf5';
+  if (ext === 'ecsv') return 'ascii.ecsv';
+  return 'ogip';
+};
+
+export const validateRemoteSourceUrl = (value: string): string | null => {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:'
+      ? null
+      : 'Only HTTPS URLs are supported for remote event files.';
+  } catch {
+    return 'Please enter a valid HTTPS URL.';
+  }
+};
+
+export const mergeGrantedSelections = (
+  current: GrantedFileSelection[],
+  incoming: GrantedFileSelection[]
+): { merged: GrantedFileSelection[]; added: GrantedFileSelection[] } => {
+  const incomingByPath = new Map(incoming.map((selection) => [selection.path, selection]));
+  const uniqueIncoming = [...incomingByPath.values()];
+  const currentPaths = new Set(current.map((selection) => selection.path));
+  const merged = current.map((selection) => incomingByPath.get(selection.path) ?? selection);
+  const added = uniqueIncoming.filter((selection) => !currentPaths.has(selection.path));
+  return { merged: [...merged, ...added], added };
 };
 
 const DataIngestionPage: React.FC = () => {
@@ -128,18 +210,22 @@ const DataIngestionPage: React.FC = () => {
   const { jobs } = useJobStore();
 
   // Form state - Local File (batch mode)
-  const [selectedFiles, setSelectedFiles] = useState<string[]>([]);
+  const [selectedFiles, setSelectedFiles] = useState<GrantedFileSelection[]>([]);
   const [fileNames, setFileNames] = useState<Record<string, string>>({});
-  const [fileFormat, setFileFormat] = useState<string>('ogip');
+  const [fileFormat, setFileFormat] = useState<EventInputFormat>('ogip');
   const [isLoading, setIsLoading] = useState<boolean>(false);
 
   // Batch file settings mode
   const [useSameSettings, setUseSameSettings] = useState<boolean>(true);
-  const [perFileConfigs, setPerFileConfigs] = useState<Record<string, Partial<SingleFileConfig>>>({});
+  const [perFileConfigs, setPerFileConfigs] = useState<Record<string, PerFileUiConfig>>({});
+  const [perFileRmfSelections, setPerFileRmfSelections] = useState<
+    Record<string, GrantedFileSelection | undefined>
+  >({});
   const [expandedFileSettings, setExpandedFileSettings] = useState<Record<string, boolean>>({});
 
   // Batch size info
   const [batchSizeInfo, setBatchSizeInfo] = useState<BatchSizeResult | null>(null);
+  const [batchSizeSelectionPaths, setBatchSizeSelectionPaths] = useState<string[]>([]);
   const [isCheckingBatchSize, setIsCheckingBatchSize] = useState<boolean>(false);
 
   // Batch loading progress - kept for potential future use but not used with job queue
@@ -152,7 +238,7 @@ const DataIngestionPage: React.FC = () => {
 
   // Advanced options state
   const [showAdvancedOptions, setShowAdvancedOptions] = useState<boolean>(false);
-  const [rmfFile, setRmfFile] = useState<string>('');
+  const [rmfSelection, setRmfSelection] = useState<GrantedFileSelection | null>(null);
   const [additionalColumns, setAdditionalColumns] = useState<string>('');
   const [fileSizeInfo, setFileSizeInfo] = useState<FileSizeInfo | null>(null);
   const [isCheckingFileSize, setIsCheckingFileSize] = useState<boolean>(false);
@@ -181,7 +267,7 @@ const DataIngestionPage: React.FC = () => {
   // Form state - URL Loading
   const [urlInput, setUrlInput] = useState<string>('');
   const [urlEventListName, setUrlEventListName] = useState<string>('');
-  const [urlFormat, setUrlFormat] = useState<string>('ogip');
+  const [urlFormat, setUrlFormat] = useState<EventInputFormat>('ogip');
   const [isLoadingUrl, setIsLoadingUrl] = useState<boolean>(false);
   // Note: urlDownloadProgress removed - job queue handles progress in sidebar
 
@@ -210,10 +296,15 @@ const DataIngestionPage: React.FC = () => {
   // Save format dialog state
   const [saveFormatDialogOpen, setSaveFormatDialogOpen] = useState<boolean>(false);
   const [saveEventListName, setSaveEventListName] = useState<string>('');
-  const [selectedSaveFormat, setSelectedSaveFormat] = useState<string>('hdf5');
+  const [selectedSaveFormat, setSelectedSaveFormat] = useState<LegacySaveFormat>('hdf5');
+  const [availableSaveFormats, setAvailableSaveFormats] = useState<LegacySaveFormat[]>([]);
+  const [hdf5UnavailableReason, setHdf5UnavailableReason] = useState<string | null>(null);
+  const [saveFormatsLoadingName, setSaveFormatsLoadingName] = useState<string | null>(null);
+  const saveFormatsRequestIdRef = useRef(0);
 
   // Last loaded files state (for restore functionality)
   const [hasLastLoadedFiles, setHasLastLoadedFiles] = useState<boolean>(false);
+  const [lastLoadedHints, setLastLoadedHints] = useState<string[]>([]);
 
   // Fetch loaded event lists on mount and after operations
   const fetchEventLists = useCallback(async (): Promise<void> => {
@@ -255,6 +346,7 @@ const DataIngestionPage: React.FC = () => {
   useEffect(() => {
     const lastLoaded = getLastLoadedFiles();
     setHasLastLoadedFiles(lastLoaded !== null && lastLoaded.files.length > 0);
+    setLastLoadedHints(lastLoaded?.files ?? []);
   }, []);
 
   // Show alert helper - sends all alerts to the global notification center
@@ -283,22 +375,15 @@ const DataIngestionPage: React.FC = () => {
     setAlert({ open: false, message: '', severity: 'info' });
   };
 
-  // Auto-detect file format from extension
-  const detectFormatFromExtension = (filePath: string): string => {
-    const ext = filePath.toLowerCase().split('.').pop();
-    if (ext === 'hdf5' || ext === 'h5') return 'hdf5';
-    if (ext === 'ecsv') return 'ascii.ecsv';
-    if (ext === 'pkl' || ext === 'pickle') return 'pickle';
-    // Default to ogip for .fits, .evt, .fit, .fts, .gz, etc.
-    return 'ogip';
-  };
-
   // Check file size when file is selected (single file)
-  const checkFileSize = async (filePath: string): Promise<void> => {
+  const checkFileSize = async (file: GrantedFileSelection): Promise<void> => {
     setIsCheckingFileSize(true);
     try {
       await apiClient.getPort();
-      const response = await dataApi.checkFileSize(filePath);
+      const response = await dataApi.checkFileSize({
+        file_path: file.path,
+        file_grant: file.grant,
+      });
       if (response.success && response.data) {
         setFileSizeInfo(response.data);
         // Auto-enable lazy loading if recommended for large files
@@ -315,23 +400,30 @@ const DataIngestionPage: React.FC = () => {
   };
 
   // Check batch file sizes when multiple files are selected
-  const checkBatchFileSize = async (filePaths: string[]): Promise<void> => {
-    if (filePaths.length === 0) return;
+  const checkBatchFileSize = async (files: GrantedFileSelection[]): Promise<void> => {
+    if (files.length === 0) return;
 
     setIsCheckingBatchSize(true);
     try {
       await apiClient.getPort();
-      const response = await dataApi.checkBatchFileSize(filePaths);
+      const response = await dataApi.checkBatchFileSize(
+        files.map((file) => ({ file_path: file.path, file_grant: file.grant }))
+      );
       if (response.success && response.data) {
         setBatchSizeInfo(response.data);
+        setBatchSizeSelectionPaths(files.map((file) => file.path));
         // Auto-enable lazy loading if recommended
         if (response.data.recommend_partial_loading && !useTrueLazyLoading) {
           setUseTrueLazyLoading(true);
         }
+      } else {
+        setBatchSizeInfo(null);
+        setBatchSizeSelectionPaths([]);
       }
     } catch (error) {
       console.error('Failed to check batch file sizes:', error);
       setBatchSizeInfo(null);
+      setBatchSizeSelectionPaths([]);
     } finally {
       setIsCheckingBatchSize(false);
     }
@@ -349,7 +441,8 @@ const DataIngestionPage: React.FC = () => {
       await apiClient.getPort();
       // Use first file for metadata preview
       const response = await dataApi.getFileMetadata({
-        file_path: selectedFiles[0],
+        file_path: selectedFiles[0].path,
+        file_grant: selectedFiles[0].grant,
         fmt: fileFormat,
       });
       if (response.success && response.data) {
@@ -378,194 +471,40 @@ const DataIngestionPage: React.FC = () => {
     }
   };
 
-  // Handle file selection via Electron dialog (supports multiple files)
-  const handleBrowseFiles = async (): Promise<void> => {
-    if (!window.electronAPI) {
-      showAlert('File dialog not available (Electron API not found)', 'error');
-      return;
-    }
-
-    const files = await window.electronAPI.openFile({
-      title: 'Select Event List Files',
-      filters: [
-        { name: 'All Files', extensions: ['*'] },
-        { name: 'FITS Files', extensions: ['fits', 'fit', 'fts', 'evt', 'fits.gz', 'fit.gz', 'fts.gz', 'evt.gz', 'gz'] },
-        { name: 'HDF5 Files', extensions: ['hdf5', 'h5'] },
-        { name: 'Text Files', extensions: ['txt', 'csv', 'dat', 'ecsv'] },
-      ],
-      multiple: true, // Enable multi-select
-    });
-
-    if (files && files.length > 0) {
-      // Batch result cleared (job queue handles results) // Clear previous batch result
-
-      // APPEND mode: merge with existing selection (filter duplicates)
-      const existingSet = new Set(selectedFiles);
-      const newFiles = files.filter((f) => !existingSet.has(f));
-      const mergedFiles = [...selectedFiles, ...newFiles];
-      setSelectedFiles(mergedFiles);
-
-      // Auto-detect format from first new file's extension (only update if adding new files)
-      if (newFiles.length > 0 && selectedFiles.length === 0) {
-        const detectedFormat = detectFormatFromExtension(newFiles[0]);
-        setFileFormat(detectedFormat);
-      }
-
-      // Merge names: keep existing names, generate for new files only
-      const mergedNames = { ...fileNames };
-      newFiles.forEach((f) => {
-        const baseName = f.split('/').pop()?.split('.')[0] || 'event_list';
-        // Ensure unique names by checking against all existing and new names
-        let uniqueName = baseName;
-        let counter = 1;
-        while (Object.values(mergedNames).includes(uniqueName)) {
-          uniqueName = `${baseName}_${counter}`;
-          counter++;
-        }
-        mergedNames[f] = uniqueName;
-      });
-      setFileNames(mergedNames);
-
-      // Merge per-file configs: keep existing, initialize new ones
-      const mergedConfigs = { ...perFileConfigs };
-      newFiles.forEach((f) => {
-        const fileDetectedFormat = detectFormatFromExtension(f);
-        mergedConfigs[f] = {
-          fmt: fileDetectedFormat,
-          high_precision: false,
-          skip_checks: false,
-          use_partial_loading: false,
-          partial_mode: 'time_range',
-          time_range_start: 0,
-          time_range_end: 100,
-          event_start_index: 0,
-          event_count: 10000,
-          notes: '',
-        };
-      });
-      setPerFileConfigs(mergedConfigs);
-
-      // Check batch file sizes for merged selection
-      if (mergedFiles.length > 1) {
-        checkBatchFileSize(mergedFiles);
-        setFileSizeInfo(null); // Clear single file info
-      } else if (mergedFiles.length === 1) {
-        // Single file - use existing single file check
-        checkFileSize(mergedFiles[0]);
-        setBatchSizeInfo(null);
-      }
-    }
-  };
-
-  // Remove a file from the selection
-  const handleRemoveFile = (filePath: string): void => {
-    const newFiles = selectedFiles.filter((f) => f !== filePath);
-    setSelectedFiles(newFiles);
-
-    // Update file names
-    const newNames = { ...fileNames };
-    delete newNames[filePath];
-    setFileNames(newNames);
-
-    // Update per-file configs
-    const newConfigs = { ...perFileConfigs };
-    delete newConfigs[filePath];
-    setPerFileConfigs(newConfigs);
-
-    // Re-check sizes
-    if (newFiles.length > 1) {
-      checkBatchFileSize(newFiles);
-      setFileSizeInfo(null);
-    } else if (newFiles.length === 1) {
-      checkFileSize(newFiles[0]);
-      setBatchSizeInfo(null);
-    } else {
-      setFileSizeInfo(null);
-      setBatchSizeInfo(null);
-    }
-  };
-
-  // Clear all selected files
-  const handleClearSelection = (): void => {
-    setSelectedFiles([]);
-    setFileNames({});
-    setPerFileConfigs({});
-    setBatchSizeInfo(null);
-    setFileSizeInfo(null);
-    // Batch result cleared (job queue handles results)
-    setExpandedFileSettings({});
-  };
-
-  // Restore last loaded files from localStorage
-  const handleRestoreLastFiles = async (): Promise<void> => {
-    const lastLoaded = getLastLoadedFiles();
-    if (!lastLoaded || lastLoaded.files.length === 0) {
-      showAlert('No previously loaded files found', 'info');
-      return;
-    }
-
-    if (!window.electronAPI) {
-      showAlert('Electron API not available', 'error');
-      return;
-    }
-
-    // Validate files still exist
-    const existingFiles: string[] = [];
-    const missingFiles: string[] = [];
-
-    for (const filePath of lastLoaded.files) {
-      const exists = await window.electronAPI.fileExists(filePath);
-      if (exists) {
-        existingFiles.push(filePath);
-      } else {
-        missingFiles.push(filePath);
-      }
-    }
-
-    if (existingFiles.length === 0) {
-      showAlert('None of the previously loaded files exist anymore', 'warning');
-      return;
-    }
-
-    // Batch result cleared (job queue handles results)
-
-    // Merge with current selection (same logic as browse)
-    const existingSet = new Set(selectedFiles);
-    const newFiles = existingFiles.filter((f) => !existingSet.has(f));
-    const mergedFiles = [...selectedFiles, ...newFiles];
+  const addGrantedFiles = (
+    files: GrantedFileSelection[],
+    preferredNames: Record<string, string> = {}
+  ): void => {
+    const { merged: mergedFiles, added: newFiles } = mergeGrantedSelections(
+      selectedFiles,
+      files
+    );
     setSelectedFiles(mergedFiles);
 
-    // Restore names from localStorage for existing files, generate for others
+    if (newFiles.length > 0 && selectedFiles.length === 0) {
+      setFileFormat(detectFormatFromExtension(newFiles[0].path));
+    }
+
     const mergedNames = { ...fileNames };
-    newFiles.forEach((f) => {
-      if (lastLoaded.fileNames[f]) {
-        // Use saved name, but ensure uniqueness
-        let uniqueName = lastLoaded.fileNames[f];
-        let counter = 1;
-        while (Object.values(mergedNames).includes(uniqueName)) {
-          uniqueName = `${lastLoaded.fileNames[f]}_${counter}`;
-          counter++;
-        }
-        mergedNames[f] = uniqueName;
-      } else {
-        const baseName = f.split('/').pop()?.split('.')[0] || 'event_list';
-        let uniqueName = baseName;
-        let counter = 1;
-        while (Object.values(mergedNames).includes(uniqueName)) {
-          uniqueName = `${baseName}_${counter}`;
-          counter++;
-        }
-        mergedNames[f] = uniqueName;
+    newFiles.forEach((file) => {
+      const filename = file.path.split(/[\\/]/).pop() || 'event_list';
+      const fallbackName = filename.split('.')[0] || 'event_list';
+      const preferredName = preferredNames[file.path]?.trim();
+      const baseName = preferredName || fallbackName;
+      let uniqueName = baseName;
+      let counter = 1;
+      while (Object.values(mergedNames).includes(uniqueName)) {
+        uniqueName = `${baseName}_${counter}`;
+        counter++;
       }
+      mergedNames[file.path] = uniqueName;
     });
     setFileNames(mergedNames);
 
-    // Initialize per-file configs for new files
     const mergedConfigs = { ...perFileConfigs };
-    newFiles.forEach((f) => {
-      const fileDetectedFormat = detectFormatFromExtension(f);
-      mergedConfigs[f] = {
-        fmt: fileDetectedFormat,
+    newFiles.forEach((file) => {
+      mergedConfigs[file.path] = {
+        fmt: detectFormatFromExtension(file.path),
         high_precision: false,
         skip_checks: false,
         use_partial_loading: false,
@@ -579,29 +518,113 @@ const DataIngestionPage: React.FC = () => {
     });
     setPerFileConfigs(mergedConfigs);
 
-    // Auto-detect format if this is the first selection
-    if (selectedFiles.length === 0 && newFiles.length > 0) {
-      const detectedFormat = detectFormatFromExtension(newFiles[0]);
-      setFileFormat(detectedFormat);
-    }
-
-    // Check batch file sizes for merged selection
     if (mergedFiles.length > 1) {
-      checkBatchFileSize(mergedFiles);
+      void checkBatchFileSize(mergedFiles);
       setFileSizeInfo(null);
     } else if (mergedFiles.length === 1) {
-      checkFileSize(mergedFiles[0]);
+      void checkFileSize(mergedFiles[0]);
       setBatchSizeInfo(null);
+      setBatchSizeSelectionPaths([]);
+    }
+  };
+
+  // Handle file selection via Electron dialog (supports multiple files).
+  const handleBrowseFiles = async (): Promise<void> => {
+    if (!window.electronAPI?.openGrantedFile) {
+      showAlert('Granted file dialog not available (Electron API not found)', 'error');
+      return;
     }
 
-    // Show appropriate message
-    if (missingFiles.length > 0) {
-      showAlert(
-        `Selected ${existingFiles.length} files. ${missingFiles.length} file(s) no longer exist.`,
-        'warning'
-      );
+    try {
+      const files = await window.electronAPI.openGrantedFile({
+        title: 'Select Event List Files',
+        filters: EVENT_FILE_FILTERS,
+        multiple: true,
+      });
+      if (files?.length) addGrantedFiles(files);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      showAlert(`Could not open the granted file dialog: ${detail}`, 'error');
+    }
+  };
+
+  // Remove a file from the selection
+  const handleRemoveFile = (filePath: string): void => {
+    const newFiles = selectedFiles.filter((file) => file.path !== filePath);
+    setSelectedFiles(newFiles);
+
+    // Update file names
+    const newNames = { ...fileNames };
+    delete newNames[filePath];
+    setFileNames(newNames);
+
+    // Update per-file configs
+    const newConfigs = { ...perFileConfigs };
+    delete newConfigs[filePath];
+    setPerFileConfigs(newConfigs);
+
+    setPerFileRmfSelections((previous) => {
+      const updated = { ...previous };
+      delete updated[filePath];
+      return updated;
+    });
+
+    // Re-check sizes
+    if (newFiles.length > 1) {
+      checkBatchFileSize(newFiles);
+      setFileSizeInfo(null);
+    } else if (newFiles.length === 1) {
+      checkFileSize(newFiles[0]);
+      setBatchSizeInfo(null);
+      setBatchSizeSelectionPaths([]);
     } else {
-      showAlert(`Selected ${existingFiles.length} previously loaded file${existingFiles.length > 1 ? 's' : ''}`, 'success');
+      setFileSizeInfo(null);
+      setBatchSizeInfo(null);
+      setBatchSizeSelectionPaths([]);
+    }
+  };
+
+  // Clear all selected files
+  const handleClearSelection = (): void => {
+    setSelectedFiles([]);
+    setFileNames({});
+    setPerFileConfigs({});
+    setPerFileRmfSelections({});
+    setBatchSizeInfo(null);
+    setBatchSizeSelectionPaths([]);
+    setFileSizeInfo(null);
+    // Batch result cleared (job queue handles results)
+    setExpandedFileSettings({});
+  };
+
+  // Historical paths are display hints only. A fresh native selection creates new grants.
+  const handleRestoreLastFiles = async (): Promise<void> => {
+    const lastLoaded = getLastLoadedFiles();
+    if (!lastLoaded || lastLoaded.files.length === 0) {
+      showAlert('No previously loaded files found', 'info');
+      return;
+    }
+
+    if (!window.electronAPI?.openGrantedFile) {
+      showAlert('Granted file dialog not available (Electron API not found)', 'error');
+      return;
+    }
+
+    try {
+      const files = await window.electronAPI.openGrantedFile({
+        title: 'Reselect previously loaded Event List files',
+        filters: EVENT_FILE_FILTERS,
+        multiple: true,
+      });
+      if (!files?.length) return;
+      addGrantedFiles(files, lastLoaded.fileNames);
+      showAlert(
+        `Granted ${files.length} freshly selected file${files.length === 1 ? '' : 's'}.`,
+        'success'
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      showAlert(`Could not reselect previous files: ${detail}`, 'error');
     }
   };
 
@@ -616,7 +639,7 @@ const DataIngestionPage: React.FC = () => {
   // Update per-file config
   const handlePerFileConfigChange = (
     filePath: string,
-    updates: Partial<SingleFileConfig>
+    updates: PerFileUiConfig
   ): void => {
     setPerFileConfigs((prev) => ({
       ...prev,
@@ -637,45 +660,46 @@ const DataIngestionPage: React.FC = () => {
 
   // Handle RMF file selection
   const handleBrowseRmfFile = async (): Promise<void> => {
-    if (!window.electronAPI) {
-      showAlert('File dialog not available (Electron API not found)', 'error');
+    if (!window.electronAPI?.openGrantedFile) {
+      showAlert('Granted file dialog not available (Electron API not found)', 'error');
       return;
     }
 
-    const files = await window.electronAPI.openFile({
-      title: 'Select RMF (Response Matrix) File',
-      filters: [
-        { name: 'RMF Files', extensions: ['rmf', 'rsp'] },
-        { name: 'FITS Files', extensions: ['fits', 'fit'] },
-        { name: 'All Files', extensions: ['*'] },
-      ],
-      multiple: false,
-    });
-
-    if (files && files.length > 0) {
-      setRmfFile(files[0]);
+    try {
+      const files = await window.electronAPI.openGrantedFile({
+        title: 'Select RMF (Response Matrix) File',
+        filters: RMF_FILE_FILTERS,
+        multiple: false,
+      });
+      if (files?.length) setRmfSelection(files[0]);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      showAlert(`Could not open the granted RMF dialog: ${detail}`, 'error');
     }
   };
 
   // Handle per-file RMF file browsing
   const handleBrowsePerFileRmf = async (filePath: string): Promise<void> => {
-    if (!window.electronAPI) {
-      showAlert('File dialog not available (Electron API not found)', 'error');
+    if (!window.electronAPI?.openGrantedFile) {
+      showAlert('Granted file dialog not available (Electron API not found)', 'error');
       return;
     }
 
-    const files = await window.electronAPI.openFile({
-      title: 'Select RMF (Response Matrix) File',
-      filters: [
-        { name: 'RMF Files', extensions: ['rmf', 'rsp'] },
-        { name: 'FITS Files', extensions: ['fits', 'fit'] },
-        { name: 'All Files', extensions: ['*'] },
-      ],
-      multiple: false,
-    });
-
-    if (files && files.length > 0) {
-      handlePerFileConfigChange(filePath, { rmf_file: files[0] });
+    try {
+      const files = await window.electronAPI.openGrantedFile({
+        title: 'Select RMF (Response Matrix) File',
+        filters: RMF_FILE_FILTERS,
+        multiple: false,
+      });
+      if (files?.length) {
+        setPerFileRmfSelections((previous) => ({
+          ...previous,
+          [filePath]: files[0],
+        }));
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      showAlert(`Could not open the granted RMF dialog: ${detail}`, 'error');
     }
   };
 
@@ -688,7 +712,7 @@ const DataIngestionPage: React.FC = () => {
 
     // Validate names
     const names = Object.values(fileNames);
-    const emptyNames = selectedFiles.filter((f) => !fileNames[f]?.trim());
+    const emptyNames = selectedFiles.filter((file) => !fileNames[file.path]?.trim());
     if (emptyNames.length > 0) {
       showAlert('Please provide names for all selected files', 'warning');
       return;
@@ -715,11 +739,12 @@ const DataIngestionPage: React.FC = () => {
 
       // Single file: submit a single load job
       if (selectedFiles.length === 1) {
-        const response = await jobApi.submitLoadJob({
-          file_path: selectedFiles[0],
-          name: fileNames[selectedFiles[0]].trim(),
+        const source = selectedFiles[0];
+        const jobParams = {
+          file_path: source.path,
+          file_grant: source.grant,
+          name: fileNames[source.path].trim(),
           fmt: fileFormat,
-          rmf_file: rmfFile || undefined,
           additional_columns: additionalColumnsArray,
           high_precision: highPrecision,
           skip_checks: skipChecks,
@@ -730,7 +755,16 @@ const DataIngestionPage: React.FC = () => {
           time_range_end: useTrueLazyLoading && trueLazyMode === 'time_range' ? timeRangeEnd : undefined,
           event_start_index: useTrueLazyLoading && trueLazyMode === 'event_count' ? eventCountStart : undefined,
           event_count: useTrueLazyLoading && trueLazyMode === 'event_count' ? eventCount : undefined,
-        });
+        };
+        const response = await jobApi.submitLoadJob(
+          rmfSelection
+            ? {
+                ...jobParams,
+                rmf_file: rmfSelection.path,
+                rmf_grant: rmfSelection.grant,
+              }
+            : jobParams
+        );
 
         if (response.success && response.data) {
           showAlert(
@@ -741,19 +775,23 @@ const DataIngestionPage: React.FC = () => {
           // Save files to localStorage before clearing form
           saveLastLoadedFiles(selectedFiles, fileNames);
           setHasLastLoadedFiles(true);
+          setLastLoadedHints(selectedFiles.map((file) => file.path));
           resetForm();
         } else {
           showAlert(response.message || 'Failed to submit load job', 'error', 'Job Submit Failed');
         }
       } else {
         // Multiple files: submit a batch load job
-        const fileConfigs: BatchFileConfig[] = selectedFiles.map((f) => {
-          const perFile = perFileConfigs[f] || {};
-          return {
-            file_path: f,
-            name: fileNames[f].trim(),
+        const fileConfigs: BatchFileConfig[] = selectedFiles.map((file) => {
+          const perFile = perFileConfigs[file.path] || {};
+          const perFileRmf = useSameSettings
+            ? undefined
+            : perFileRmfSelections[file.path];
+          const fileConfig = {
+            file_path: file.path,
+            file_grant: file.grant,
+            name: fileNames[file.path].trim(),
             fmt: useSameSettings ? fileFormat : (perFile.fmt || 'ogip'),
-            rmf_file: useSameSettings ? (rmfFile || undefined) : perFile.rmf_file,
             additional_columns: useSameSettings ? additionalColumnsArray : perFile.additional_columns,
             high_precision: useSameSettings ? highPrecision : (perFile.high_precision || false),
             skip_checks: useSameSettings ? skipChecks : (perFile.skip_checks || false),
@@ -765,13 +803,19 @@ const DataIngestionPage: React.FC = () => {
             event_count: useSameSettings ? eventCount : perFile.event_count,
             notes: useSameSettings ? (eventNotes.trim() || undefined) : (perFile.notes?.trim() || undefined),
           };
+          return perFileRmf
+            ? {
+                ...fileConfig,
+                rmf_file: perFileRmf.path,
+                rmf_grant: perFileRmf.grant,
+              }
+            : fileConfig;
         });
 
-        const response = await jobApi.submitBatchJob({
+        const batchParams = {
           files: fileConfigs,
           use_same_settings: useSameSettings,
           shared_fmt: fileFormat,
-          shared_rmf_file: rmfFile || undefined,
           shared_additional_columns: additionalColumnsArray,
           shared_high_precision: highPrecision,
           shared_skip_checks: skipChecks,
@@ -781,7 +825,16 @@ const DataIngestionPage: React.FC = () => {
           shared_time_range_end: useTrueLazyLoading ? timeRangeEnd : undefined,
           shared_event_start_index: useTrueLazyLoading ? eventCountStart : undefined,
           shared_event_count: useTrueLazyLoading ? eventCount : undefined,
-        });
+        };
+        const response = await jobApi.submitBatchJob(
+          useSameSettings && rmfSelection
+            ? {
+                ...batchParams,
+                shared_rmf_file: rmfSelection.path,
+                shared_rmf_grant: rmfSelection.grant,
+              }
+            : batchParams
+        );
 
         if (response.success && response.data) {
           showAlert(
@@ -792,6 +845,7 @@ const DataIngestionPage: React.FC = () => {
           // Save files to localStorage and clear form
           saveLastLoadedFiles(selectedFiles, fileNames);
           setHasLastLoadedFiles(true);
+          setLastLoadedHints(selectedFiles.map((file) => file.path));
           resetForm();
         } else {
           showAlert(response.message || 'Failed to submit batch job', 'error', 'Batch Job Submit Failed');
@@ -810,12 +864,14 @@ const DataIngestionPage: React.FC = () => {
     setSelectedFiles([]);
     setFileNames({});
     setPerFileConfigs({});
+    setPerFileRmfSelections({});
     setExpandedFileSettings({});
-    setRmfFile('');
+    setRmfSelection(null);
     setAdditionalColumns('');
     setEventNotes('');
     setFileSizeInfo(null);
     setBatchSizeInfo(null);
+    setBatchSizeSelectionPaths([]);
     setFileMetadata(null);
     setUseTrueLazyLoading(false);
     setHighPrecision(false);
@@ -845,65 +901,97 @@ const DataIngestionPage: React.FC = () => {
     }
   };
 
-  // Handle opening the save format dialog
-  const handleSaveEventList = (name: string): void => {
-    setSaveEventListName(name);
-    setSelectedSaveFormat('hdf5'); // Reset to default
-    setSaveFormatDialogOpen(true);
+  // Discover verified export capabilities before opening the format dialog.
+  const handleSaveEventList = async (name: string): Promise<void> => {
+    const requestId = ++saveFormatsRequestIdRef.current;
+    setSaveFormatsLoadingName(name);
+    try {
+      const response = await ioApi.listExportableObjects();
+      if (requestId !== saveFormatsRequestIdRef.current) return;
+
+      const eventList = response.data?.objects.find(
+        (object) => object.object_type === 'event_list' && object.name === name
+      );
+      const formats = (eventList?.formats ?? []).filter(
+        (format): format is LegacySaveFormat =>
+          (format === 'hdf5' || format === 'ecsv') &&
+          Boolean(response.data?.format_allowlist.includes(format)) &&
+          Boolean(response.data?.capability_matrix?.event_list?.[format]?.supported)
+      );
+      if (!response.success || !eventList?.exportable || formats.length === 0) {
+        showAlert(
+          eventList?.reason || response.message || 'No verified export format is available.',
+          'error',
+          'Export Unavailable'
+        );
+        return;
+      }
+
+      setSaveEventListName(name);
+      setAvailableSaveFormats(formats);
+      setHdf5UnavailableReason(
+        formats.includes('hdf5')
+          ? null
+          : response.data?.capability_matrix?.event_list?.hdf5?.notes ||
+              response.data?.excluded_formats.hdf5 ||
+              'HDF5 is unavailable in this runtime.'
+      );
+      setSelectedSaveFormat(formats.includes('hdf5') ? 'hdf5' : formats[0]);
+      setSaveFormatDialogOpen(true);
+    } catch (error) {
+      if (requestId !== saveFormatsRequestIdRef.current) return;
+      const detail = error instanceof Error ? error.message : String(error);
+      showAlert(`Could not determine export capabilities: ${detail}`, 'error');
+    } finally {
+      if (requestId === saveFormatsRequestIdRef.current) {
+        setSaveFormatsLoadingName(null);
+      }
+    }
   };
 
-  // Handle the actual save after format is selected
+  // Export through a native write grant after a verified format is selected.
   const handleConfirmSave = async (): Promise<void> => {
     setSaveFormatDialogOpen(false);
 
-    if (!window.electronAPI) {
-      showAlert('Save dialog not available (Electron API not found)', 'error');
+    if (!window.electronAPI?.saveGrantedFile) {
+      showAlert('Granted save dialog not available (Electron API not found)', 'error');
       return;
     }
 
-    // Determine file extension based on selected format
-    const extensionMap: Record<string, string> = {
-      'hdf5': 'hdf5',
-      'ascii.ecsv': 'ecsv',
-      'pickle': 'pkl',
+    const filterMap: Record<LegacySaveFormat, { name: string; extensions: string[] }> = {
+      hdf5: { name: 'HDF5 Files', extensions: ['hdf5'] },
+      ecsv: { name: 'ECSV Files', extensions: ['ecsv'] },
     };
-    const ext = extensionMap[selectedSaveFormat] || 'hdf5';
-
-    // Determine file filter based on selected format
-    const filterMap: Record<string, { name: string; extensions: string[] }> = {
-      'hdf5': { name: 'HDF5 Files', extensions: ['hdf5', 'h5'] },
-      'ascii.ecsv': { name: 'ASCII ECSV Files', extensions: ['ecsv'] },
-      'pickle': { name: 'Pickle Files', extensions: ['pkl'] },
-    };
-    const filter = filterMap[selectedSaveFormat] || filterMap['hdf5'];
-
-    const filePath = await window.electronAPI.saveFile({
-      title: `Save Event List: ${saveEventListName}`,
-      defaultPath: `${saveEventListName}.${ext}`,
-      filters: [filter],
-    });
-
-    if (!filePath) {
-      return; // User cancelled
-    }
+    const filter = filterMap[selectedSaveFormat];
 
     try {
-      await apiClient.getPort();
+      const destination = await window.electronAPI.saveGrantedFile({
+        title: `Export Event List: ${saveEventListName}`,
+        defaultPath: `${saveEventListName}.${selectedSaveFormat}`,
+        filters: [filter],
+      });
+      if (!destination) return;
 
-      const response = await dataApi.saveEventList({
-        name: saveEventListName,
-        file_path: filePath,
-        fmt: selectedSaveFormat,
+      const response = await ioApi.exportObject({
+        object_type: 'event_list',
+        object_name: saveEventListName,
+        format: selectedSaveFormat,
+        destination_path: destination.path,
+        destination_grant: destination.grant,
       });
 
       if (response.success) {
-        showAlert(`Event List '${saveEventListName}' saved to ${filePath}`, 'success', 'Data Saved');
+        showAlert(
+          `Event List '${saveEventListName}' exported to ${destination.path}`,
+          'success',
+          'Data Exported'
+        );
       } else {
-        showAlert(response.message || 'Failed to save Event List', 'error', 'Save Failed');
+        showAlert(response.message || 'Failed to export Event List', 'error', 'Export Failed');
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      showAlert(`Error: ${errorMessage}`, 'error', 'Save Error');
+      showAlert(`Error: ${errorMessage}`, 'error', 'Export Error');
     }
   };
 
@@ -942,11 +1030,9 @@ const DataIngestionPage: React.FC = () => {
       return;
     }
 
-    // Basic URL validation
-    try {
-      new URL(urlInput.trim());
-    } catch {
-      showAlert('Please enter a valid URL', 'warning');
+    const urlValidationError = validateRemoteSourceUrl(urlInput.trim());
+    if (urlValidationError) {
+      showAlert(urlValidationError, 'warning');
       return;
     }
 
@@ -1116,7 +1202,7 @@ const DataIngestionPage: React.FC = () => {
               </Box>
 
               <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
-                Load FITS, HDF5, or text event list files from your computer (supports multiple files)
+                Load FITS/OGIP, HDF5, or ECSV event lists through the native file picker.
               </Typography>
 
               {/* File Selection */}
@@ -1131,18 +1217,28 @@ const DataIngestionPage: React.FC = () => {
                     Browse Files
                   </Button>
                   {hasLastLoadedFiles && (
-                    <Tooltip title="Select previously loaded files">
+                    <Tooltip title="Historical paths are hints only; choose the files again to renew access">
                       <Button
                         variant="outlined"
                         color="secondary"
+                        aria-label="Reselect Last Files"
                         startIcon={<HistoryIcon />}
                         onClick={handleRestoreLastFiles}
                       >
-                        Last Files
+                        Reselect Last Files
                       </Button>
                     </Tooltip>
                   )}
                 </Box>
+                {hasLastLoadedFiles && lastLoadedHints.length > 0 && (
+                  <Typography
+                    variant="caption"
+                    color="text.secondary"
+                    sx={{ display: 'block', overflowWrap: 'anywhere' }}
+                  >
+                    Previous path hints (fresh native selection required): {lastLoadedHints.join(', ')}
+                  </Typography>
+                )}
 
                 {/* Selected Files List */}
                 {selectedFiles.length > 0 && (
@@ -1293,9 +1389,13 @@ const DataIngestionPage: React.FC = () => {
                     {/* File List */}
                     <Paper variant="outlined" sx={{ maxHeight: 300, overflow: 'auto' }}>
                       <List dense disablePadding>
-                        {selectedFiles.map((filePath, index) => {
-                          const fileName = filePath.split('/').pop() || filePath;
-                          const sizeInfo = batchSizeInfo?.files.find((f) => f.file_path === filePath);
+                        {selectedFiles.map((selection, index) => {
+                          const filePath = selection.path;
+                          const fileName = filePath.split(/[\\/]/).pop() || filePath;
+                          const sizeInfoIndex = batchSizeSelectionPaths.indexOf(filePath);
+                          const sizeInfo = sizeInfoIndex >= 0
+                            ? batchSizeInfo?.files[sizeInfoIndex]
+                            : undefined;
                           const isExpanded = expandedFileSettings[filePath];
 
                           return (
@@ -1362,11 +1462,14 @@ const DataIngestionPage: React.FC = () => {
                                           <Select
                                             value={perFileConfigs[filePath]?.fmt || 'ogip'}
                                             label="Format"
-                                            onChange={(e) => handlePerFileConfigChange(filePath, { fmt: e.target.value })}
+                                            onChange={(e) => handlePerFileConfigChange(filePath, {
+                                              fmt: e.target.value as EventInputFormat,
+                                            })}
                                           >
                                             <MenuItem value="ogip">OGIP</MenuItem>
                                             <MenuItem value="hdf5">HDF5</MenuItem>
                                             <MenuItem value="fits">FITS</MenuItem>
+                                            <MenuItem value="ascii.ecsv">ASCII ECSV</MenuItem>
                                           </Select>
                                         </FormControl>
                                       </Grid>
@@ -1379,10 +1482,9 @@ const DataIngestionPage: React.FC = () => {
                                         <Box sx={{ display: 'flex', gap: 0.5, alignItems: 'center' }}>
                                           <TextField
                                             size="small"
-                                            value={perFileConfigs[filePath]?.rmf_file || ''}
-                                            onChange={(e) => handlePerFileConfigChange(filePath, { rmf_file: e.target.value })}
+                                            value={perFileRmfSelections[filePath]?.path || ''}
                                             fullWidth
-                                            placeholder="Path to RMF file"
+                                            placeholder="Choose an RMF file"
                                             InputProps={{ readOnly: true }}
                                             inputProps={{ style: { fontSize: '0.75rem' } }}
                                           />
@@ -1394,10 +1496,13 @@ const DataIngestionPage: React.FC = () => {
                                           >
                                             Browse
                                           </Button>
-                                          {perFileConfigs[filePath]?.rmf_file && (
+                                          {perFileRmfSelections[filePath] && (
                                             <IconButton
                                               size="small"
-                                              onClick={() => handlePerFileConfigChange(filePath, { rmf_file: undefined })}
+                                              onClick={() => setPerFileRmfSelections((previous) => ({
+                                                ...previous,
+                                                [filePath]: undefined,
+                                              }))}
                                             >
                                               <CloseIcon sx={{ fontSize: '0.875rem' }} />
                                             </IconButton>
@@ -1588,7 +1693,7 @@ const DataIngestionPage: React.FC = () => {
                   <Select
                     value={fileFormat}
                     label="File Format"
-                    onChange={(e) => setFileFormat(e.target.value)}
+                    onChange={(e) => setFileFormat(e.target.value as EventInputFormat)}
                   >
                     <MenuItem value="ogip">OGIP/FITS (recommended)</MenuItem>
                     <MenuItem value="hdf5">HDF5</MenuItem>
@@ -1620,8 +1725,7 @@ const DataIngestionPage: React.FC = () => {
                   </Typography>
                   <Box sx={{ display: 'flex', gap: 1, mb: 2 }}>
                     <TextField
-                      value={rmfFile}
-                      onChange={(e) => setRmfFile(e.target.value)}
+                      value={rmfSelection?.path || ''}
                       fullWidth
                       size="small"
                       placeholder="Optional: Path to RMF file"
@@ -1637,8 +1741,8 @@ const DataIngestionPage: React.FC = () => {
                     >
                       Browse
                     </Button>
-                    {rmfFile && (
-                      <IconButton size="small" onClick={() => setRmfFile('')}>
+                    {rmfSelection && (
+                      <IconButton size="small" onClick={() => setRmfSelection(null)}>
                         <CloseIcon fontSize="small" />
                       </IconButton>
                     )}
@@ -1999,7 +2103,7 @@ const DataIngestionPage: React.FC = () => {
                 <Select
                   value={urlFormat}
                   label="File Format"
-                  onChange={(e) => setUrlFormat(e.target.value)}
+                  onChange={(e) => setUrlFormat(e.target.value as EventInputFormat)}
                 >
                   <MenuItem value="ogip">OGIP/FITS (recommended)</MenuItem>
                   <MenuItem value="hdf5">HDF5</MenuItem>
@@ -2167,14 +2271,19 @@ const DataIngestionPage: React.FC = () => {
                         <VisibilityIcon />
                       </IconButton>
                     </Tooltip>
-                    <Tooltip title="Save to disk (HDF5, ECSV, or Pickle)">
+                    <Tooltip title="Export to a native-selected destination">
                       <IconButton
                         edge="end"
                         sx={{ mr: 0.5 }}
-                        onClick={() => handleSaveEventList(eventList.name)}
+                        onClick={() => void handleSaveEventList(eventList.name)}
+                        disabled={saveFormatsLoadingName === eventList.name}
                         color="primary"
                       >
-                        <SaveIcon />
+                        {saveFormatsLoadingName === eventList.name ? (
+                          <CircularProgress size={20} />
+                        ) : (
+                          <SaveIcon />
+                        )}
                       </IconButton>
                     </Tooltip>
                     <Tooltip title="Delete">
@@ -3033,57 +3142,51 @@ const DataIngestionPage: React.FC = () => {
         </DialogTitle>
         <DialogContent>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-            Select the format for saving &quot;{saveEventListName}&quot;:
+            Select a runtime-supported, reopen-verified format for &quot;{saveEventListName}&quot;:
           </Typography>
+          {hdf5UnavailableReason && (
+            <Alert severity="info" sx={{ mb: 2 }}>
+              HDF5 unavailable: {hdf5UnavailableReason}
+            </Alert>
+          )}
           <FormControl component="fieldset">
             <RadioGroup
               value={selectedSaveFormat}
-              onChange={(e) => setSelectedSaveFormat(e.target.value)}
+              onChange={(e) => setSelectedSaveFormat(e.target.value as LegacySaveFormat)}
             >
-              <FormControlLabel
-                value="hdf5"
-                control={<Radio />}
-                label={
-                  <Box>
-                    <Typography variant="body1" fontWeight="medium">
-                      HDF5 (Recommended)
-                    </Typography>
-                    <Typography variant="caption" color="text.secondary">
-                      Binary format. Preserves all metadata (GTI, MJDREF, etc.). Fast I/O, compact size.
-                    </Typography>
-                  </Box>
-                }
-              />
-              <FormControlLabel
-                value="ascii.ecsv"
-                control={<Radio />}
-                label={
-                  <Box>
-                    <Typography variant="body1" fontWeight="medium">
-                      ASCII ECSV
-                    </Typography>
-                    <Typography variant="caption" color="text.secondary">
-                      Human-readable text format. Good for sharing and inspection. Larger file size.
-                    </Typography>
-                  </Box>
-                }
-                sx={{ mt: 1 }}
-              />
-              <FormControlLabel
-                value="pickle"
-                control={<Radio />}
-                label={
-                  <Box>
-                    <Typography variant="body1" fontWeight="medium">
-                      Pickle
-                    </Typography>
-                    <Typography variant="caption" color="text.secondary">
-                      Python-only format. Not recommended for long-term storage or sharing.
-                    </Typography>
-                  </Box>
-                }
-                sx={{ mt: 1 }}
-              />
+              {availableSaveFormats.includes('hdf5') && (
+                <FormControlLabel
+                  value="hdf5"
+                  control={<Radio />}
+                  label={
+                    <Box>
+                      <Typography variant="body1" fontWeight="medium">
+                        HDF5 (Recommended)
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        Versioned Stingray Explorer schema with scientific round-trip verification.
+                      </Typography>
+                    </Box>
+                  }
+                />
+              )}
+              {availableSaveFormats.includes('ecsv') && (
+                <FormControlLabel
+                  value="ecsv"
+                  control={<Radio />}
+                  label={
+                    <Box>
+                      <Typography variant="body1" fontWeight="medium">
+                        ASCII ECSV
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary">
+                        Human-readable table with metadata and reopen verification.
+                      </Typography>
+                    </Box>
+                  }
+                  sx={{ mt: 1 }}
+                />
+              )}
             </RadioGroup>
           </FormControl>
         </DialogContent>

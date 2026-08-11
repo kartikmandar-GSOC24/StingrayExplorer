@@ -139,7 +139,6 @@ export interface LoadingRecommendation {
 }
 
 export interface FileMetadata {
-  file_path: string;
   file_size_mb: number;
   file_size_gb: number;
   risk_level: 'safe' | 'caution' | 'risky' | 'critical';
@@ -156,12 +155,25 @@ export interface FileMetadata {
   recommended_loading: LoadingRecommendation;
 }
 
-// Batch loading types
-export interface SingleFileConfig {
+export type EventInputFormat = 'ogip' | 'fits' | 'hdf5' | 'ascii.ecsv';
+
+export interface GrantedEventFile {
   file_path: string;
+  file_grant: string;
+}
+
+type OptionalRmfGrant =
+  | { rmf_file: string; rmf_grant: string }
+  | { rmf_file?: never; rmf_grant?: never };
+
+type OptionalSharedRmfGrant =
+  | { shared_rmf_file: string; shared_rmf_grant: string }
+  | { shared_rmf_file?: never; shared_rmf_grant?: never };
+
+// Batch loading types
+export type SingleFileConfig = GrantedEventFile & OptionalRmfGrant & {
   name: string;
-  fmt?: string;
-  rmf_file?: string;
+  fmt?: EventInputFormat;
   additional_columns?: string[];
   high_precision?: boolean;
   skip_checks?: boolean;
@@ -172,14 +184,13 @@ export interface SingleFileConfig {
   event_start_index?: number;
   event_count?: number;
   notes?: string;
-}
+};
 
-export interface BatchLoadRequest {
+export type BatchLoadRequest = OptionalSharedRmfGrant & {
   files: SingleFileConfig[];
   use_same_settings: boolean;
   // Shared settings (used when use_same_settings=true)
-  shared_fmt?: string;
-  shared_rmf_file?: string;
+  shared_fmt?: EventInputFormat;
   shared_additional_columns?: string[];
   shared_high_precision?: boolean;
   shared_skip_checks?: boolean;
@@ -189,18 +200,36 @@ export interface BatchLoadRequest {
   shared_time_range_end?: number;
   shared_event_start_index?: number;
   shared_event_count?: number;
-}
+};
+
+export type LoadEventListParams = GrantedEventFile &
+  OptionalRmfGrant & {
+    name: string;
+    fmt?: EventInputFormat;
+    additional_columns?: string[];
+    high_precision?: boolean;
+    skip_checks?: boolean;
+    notes?: string;
+  };
+
+export type LoadEventListFromUrlParams = OptionalRmfGrant & {
+  url: string;
+  name: string;
+  fmt?: EventInputFormat;
+  additional_columns?: string[];
+  high_precision?: boolean;
+  skip_checks?: boolean;
+  notes?: string;
+};
 
 export interface BatchLoadSuccessItem {
   name: string;
-  file_path: string;
   data: EventListSummary | null;
   message?: string;
 }
 
 export interface BatchLoadFailedItem {
   name: string;
-  file_path: string;
   error: string;
 }
 
@@ -220,7 +249,6 @@ export interface BatchLoadResult {
 }
 
 export interface BatchFileSizeInfo {
-  file_path: string;
   file_name: string;
   size_mb: number;
   estimated_ram_mb: number;
@@ -248,7 +276,6 @@ export interface BatchSizeResult {
 export interface BatchStreamEventFileComplete {
   type: 'file_complete';
   name: string;
-  file_path: string;
   success: boolean;
   completed: number;
   total: number;
@@ -358,21 +385,14 @@ export const dataApi = {
   /**
    * Load an EventList from a file
    */
-  async loadEventList(params: {
-    file_path: string;
-    name: string;
-    fmt?: string;
-    rmf_file?: string;
-    additional_columns?: string[];
-    high_precision?: boolean;
-    skip_checks?: boolean;
-    notes?: string;
-  }): Promise<ApiResponse<EventListSummary>> {
+  async loadEventList(params: LoadEventListParams): Promise<ApiResponse<EventListSummary>> {
     return apiClient.post('/api/data/load', {
       file_path: params.file_path,
+      file_grant: params.file_grant,
       name: params.name,
       fmt: params.fmt || 'ogip',
       rmf_file: params.rmf_file,
+      rmf_grant: params.rmf_grant,
       additional_columns: params.additional_columns,
       high_precision: params.high_precision || false,
       skip_checks: params.skip_checks || false,
@@ -383,21 +403,15 @@ export const dataApi = {
   /**
    * Load an EventList from a URL
    */
-  async loadEventListFromUrl(params: {
-    url: string;
-    name: string;
-    fmt?: string;
-    rmf_file?: string;
-    additional_columns?: string[];
-    high_precision?: boolean;
-    skip_checks?: boolean;
-    notes?: string;
-  }): Promise<ApiResponse<EventListSummary>> {
+  async loadEventListFromUrl(
+    params: LoadEventListFromUrlParams
+  ): Promise<ApiResponse<EventListSummary>> {
     return apiClient.post('/api/data/load-url', {
       url: params.url,
       name: params.name,
       fmt: params.fmt || 'ogip',
       rmf_file: params.rmf_file,
+      rmf_grant: params.rmf_grant,
       additional_columns: params.additional_columns,
       high_precision: params.high_precision || false,
       skip_checks: params.skip_checks || false,
@@ -415,16 +429,10 @@ export const dataApi = {
    * @param params - URL loading parameters
    * @yields UrlDownloadStreamEvent - Progress, processing, complete, or error events
    */
-  async *loadEventListFromUrlSSE(params: {
-    url: string;
-    name: string;
-    fmt?: string;
-    rmf_file?: string;
-    additional_columns?: string[];
-    high_precision?: boolean;
-    skip_checks?: boolean;
-    notes?: string;
-  }): AsyncGenerator<UrlDownloadStreamEvent, void, unknown> {
+  async *loadEventListFromUrlSSE(
+    params: LoadEventListFromUrlParams,
+    signal?: AbortSignal
+  ): AsyncGenerator<UrlDownloadStreamEvent, void, unknown> {
     const port = await apiClient.getPort();
     const url = `http://127.0.0.1:${port}/api/data/load-url-stream`;
 
@@ -436,11 +444,13 @@ export const dataApi = {
         name: params.name,
         fmt: params.fmt || 'ogip',
         rmf_file: params.rmf_file,
+        rmf_grant: params.rmf_grant,
         additional_columns: params.additional_columns,
         high_precision: params.high_precision || false,
         skip_checks: params.skip_checks || false,
         notes: params.notes,
       }),
+      signal,
     });
 
     if (!response.ok) {
@@ -497,21 +507,6 @@ export const dataApi = {
   },
 
   /**
-   * Save an EventList to disk
-   */
-  async saveEventList(params: {
-    name: string;
-    file_path: string;
-    fmt?: string;
-  }): Promise<ApiResponse<{ file_path: string }>> {
-    return apiClient.post('/api/data/save', {
-      name: params.name,
-      file_path: params.file_path,
-      fmt: params.fmt || 'hdf5',
-    });
-  },
-
-  /**
    * Delete an EventList from state
    */
   async deleteEventList(name: string): Promise<ApiResponse<{ name: string }>> {
@@ -535,8 +530,8 @@ export const dataApi = {
   /**
    * Check file size and get loading recommendations
    */
-  async checkFileSize(file_path: string): Promise<ApiResponse<FileSizeInfo>> {
-    return apiClient.post('/api/data/check-size', { file_path });
+  async checkFileSize(file: GrantedEventFile): Promise<ApiResponse<FileSizeInfo>> {
+    return apiClient.post('/api/data/check-size', file);
   },
 
   /**
@@ -568,14 +563,16 @@ export const dataApi = {
    */
   async loadEventListByTimeRange(params: {
     file_path: string;
+    file_grant: string;
     name: string;
     start_time: number;
     end_time: number;
-    fmt?: string;
+    fmt?: EventInputFormat;
     notes?: string;
   }): Promise<ApiResponse<EventListLazyLoadedSummary>> {
     return apiClient.post('/api/data/load-by-time-range', {
       file_path: params.file_path,
+      file_grant: params.file_grant,
       name: params.name,
       start_time: params.start_time,
       end_time: params.end_time,
@@ -590,14 +587,16 @@ export const dataApi = {
    */
   async loadEventListByEventCount(params: {
     file_path: string;
+    file_grant: string;
     name: string;
     start_index?: number;
     count?: number;
-    fmt?: string;
+    fmt?: EventInputFormat;
     notes?: string;
   }): Promise<ApiResponse<EventListLazyLoadedSummary>> {
     return apiClient.post('/api/data/load-by-event-count', {
       file_path: params.file_path,
+      file_grant: params.file_grant,
       name: params.name,
       start_index: params.start_index ?? 0,
       count: params.count ?? 10000,
@@ -612,10 +611,12 @@ export const dataApi = {
    */
   async getFileMetadata(params: {
     file_path: string;
-    fmt?: string;
+    file_grant: string;
+    fmt?: EventInputFormat;
   }): Promise<ApiResponse<FileMetadata>> {
     return apiClient.post('/api/data/metadata', {
       file_path: params.file_path,
+      file_grant: params.file_grant,
       fmt: params.fmt || 'ogip',
     });
   },
@@ -629,10 +630,8 @@ export const dataApi = {
    * Check sizes of multiple files and estimate total memory usage.
    * Returns per-file and total memory estimates with risk levels.
    */
-  async checkBatchFileSize(
-    file_paths: string[]
-  ): Promise<ApiResponse<BatchSizeResult>> {
-    return apiClient.post('/api/data/check-batch-size', { file_paths });
+  async checkBatchFileSize(files: GrantedEventFile[]): Promise<ApiResponse<BatchSizeResult>> {
+    return apiClient.post('/api/data/check-batch-size', { files });
   },
 
   /**
@@ -650,6 +649,7 @@ export const dataApi = {
       use_same_settings: params.use_same_settings,
       shared_fmt: params.shared_fmt || 'ogip',
       shared_rmf_file: params.shared_rmf_file,
+      shared_rmf_grant: params.shared_rmf_grant,
       shared_additional_columns: params.shared_additional_columns,
       shared_high_precision: params.shared_high_precision || false,
       shared_skip_checks: params.shared_skip_checks || false,
@@ -673,7 +673,8 @@ export const dataApi = {
    * @yields BatchStreamEvent - Events for each file completion and final summary
    */
   async *loadBatchEventListsSSE(
-    params: BatchLoadRequest
+    params: BatchLoadRequest,
+    signal?: AbortSignal
   ): AsyncGenerator<BatchStreamEvent, void, unknown> {
     const port = await apiClient.getPort();
     const url = `http://127.0.0.1:${port}/api/data/load-batch-stream`;
@@ -686,6 +687,7 @@ export const dataApi = {
         use_same_settings: params.use_same_settings,
         shared_fmt: params.shared_fmt || 'ogip',
         shared_rmf_file: params.shared_rmf_file,
+        shared_rmf_grant: params.shared_rmf_grant,
         shared_additional_columns: params.shared_additional_columns,
         shared_high_precision: params.shared_high_precision || false,
         shared_skip_checks: params.shared_skip_checks || false,
@@ -696,6 +698,7 @@ export const dataApi = {
         shared_event_start_index: params.shared_event_start_index,
         shared_event_count: params.shared_event_count,
       }),
+      signal,
     });
 
     if (!response.ok) {

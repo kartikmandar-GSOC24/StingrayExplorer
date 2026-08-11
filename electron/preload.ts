@@ -9,24 +9,6 @@ const electronAPI = {
   // File System Operations
   // ============================================
 
-  /**
-   * Open a file dialog and return selected file paths
-   */
-  openFile: (options?: {
-    title?: string;
-    filters?: { name: string; extensions: string[] }[];
-    multiple?: boolean;
-  }): Promise<string[] | null> => ipcRenderer.invoke('dialog:openFile', options),
-
-  /**
-   * Open a save dialog and return the selected path
-   */
-  saveFile: (options?: {
-    title?: string;
-    defaultPath?: string;
-    filters?: { name: string; extensions: string[] }[];
-  }): Promise<string | null> => ipcRenderer.invoke('dialog:saveFile', options),
-
   /** Open native-selected files with short-lived backend-verifiable grants. */
   openGrantedFile: (options?: {
     title?: string;
@@ -42,16 +24,6 @@ const electronAPI = {
     filters?: { name: string; extensions: string[] }[];
   }): Promise<{ path: string; grant: string } | null> =>
     ipcRenderer.invoke('dialog:saveGrantedFile', options),
-
-  /**
-   * Open a directory selection dialog
-   */
-  openDirectory: (): Promise<string | null> => ipcRenderer.invoke('dialog:openDirectory'),
-
-  /**
-   * Check if a file exists
-   */
-  fileExists: (filePath: string): Promise<boolean> => ipcRenderer.invoke('file:exists', filePath),
 
   // ============================================
   // Python Backend Communication
@@ -160,11 +132,6 @@ const electronAPI = {
    * Open a URL in the default browser
    */
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke('shell:openExternal', url),
-
-  /**
-   * Show an item in the file manager
-   */
-  showItemInFolder: (path: string): void => ipcRenderer.send('shell:showItemInFolder', path),
 
   // ============================================
   // Clipboard Operations

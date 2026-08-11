@@ -22,9 +22,11 @@ export const jobApi = {
   async submitLoadJob(params: SubmitLoadJobParams): Promise<ApiResponse<Job>> {
     return apiClient.post('/api/jobs/submit-load', {
       file_path: params.file_path,
+      file_grant: params.file_grant,
       name: params.name,
       fmt: params.fmt || 'ogip',
       rmf_file: params.rmf_file,
+      rmf_grant: params.rmf_grant,
       additional_columns: params.additional_columns,
       high_precision: params.high_precision || false,
       skip_checks: params.skip_checks || false,
@@ -50,6 +52,7 @@ export const jobApi = {
       use_same_settings: params.use_same_settings ?? true,
       shared_fmt: params.shared_fmt || 'ogip',
       shared_rmf_file: params.shared_rmf_file,
+      shared_rmf_grant: params.shared_rmf_grant,
       shared_additional_columns: params.shared_additional_columns,
       shared_high_precision: params.shared_high_precision || false,
       shared_skip_checks: params.shared_skip_checks || false,
@@ -74,6 +77,7 @@ export const jobApi = {
       name: params.name,
       fmt: params.fmt || 'ogip',
       rmf_file: params.rmf_file,
+      rmf_grant: params.rmf_grant,
       additional_columns: params.additional_columns,
       high_precision: params.high_precision || false,
       skip_checks: params.skip_checks || false,

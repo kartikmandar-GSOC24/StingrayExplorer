@@ -17,40 +17,6 @@ import { jobApi } from '@/api/jobApi';
 import { EVENT_LISTS_QUERY_KEY } from '@/hooks/useEventLists';
 import type { Job, JobStreamEvent } from '@/types/job';
 
-/**
- * Interface for a failed file in a batch job result.
- */
-interface BatchFailedFile {
-  name: string;
-  file_path: string;
-  error: string;
-}
-
-/**
- * Interface for a successful file in a batch job result.
- */
-interface BatchSuccessfulFile {
-  name: string;
-  file_path: string;
-  data?: {
-    n_events?: number;
-    gti_warnings?: string[];
-    stingray_warnings?: string[];
-    validation_issues?: string[];
-  };
-}
-
-/**
- * Interface for batch job result structure.
- */
-interface BatchJobResult {
-  successful?: BatchSuccessfulFile[];
-  failed?: BatchFailedFile[];
-  success_count?: number;
-  failure_count?: number;
-  total_files?: number;
-}
-
 /** Reconnection delay in milliseconds */
 const RECONNECT_DELAY = 5000;
 
@@ -60,7 +26,7 @@ const MAX_RECONNECT_ATTEMPTS = 10;
 /**
  * Build a detailed notification message from a completed job.
  */
-function buildCompletionMessage(job: Job): string {
+export function buildCompletionMessage(job: Job): string {
   const result = job.result || {};
   const parts: string[] = [];
 
@@ -94,24 +60,17 @@ function buildCompletionMessage(job: Job): string {
 }
 
 /**
- * Extract filename from a file path for display in notifications.
- */
-function getFilename(filePath: string): string {
-  return filePath.split('/').pop() || filePath;
-}
-
-/**
  * Handle batch job warnings and failures by creating individual notifications.
  *
  * For batch jobs that complete with partial failures:
  * - Creates an error notification for each failed file with its specific error
  * - Optionally could surface GTI/stingray warnings from successful files
  */
-function handleBatchWarnings(
+export function handleBatchWarnings(
   job: Job,
   addNotification: (notification: { type: NotificationType; title: string; message: string }) => void
 ): void {
-  const result = job.result as BatchJobResult | null;
+  const result = job.result;
 
   if (!result) {
     return;
@@ -122,38 +81,14 @@ function handleBatchWarnings(
   // Create individual error notifications for each failed file
   if (Array.isArray(failed) && failed.length > 0) {
     for (const failedFile of failed) {
-      const filename = getFilename(failedFile.file_path);
       addNotification({
         type: 'error',
-        title: `Failed: ${filename}`,
+        title: `Failed: ${failedFile.name}`,
         message: failedFile.error || 'Unknown error occurred',
       });
     }
   }
 
-  // Optionally surface significant warnings from successful files
-  // This is commented out by default to avoid notification overload,
-  // but can be enabled if users want to see all warnings
-  /*
-  const successful = result.successful;
-  if (Array.isArray(successful)) {
-    for (const successFile of successful) {
-      const warnings = [
-        ...(successFile.data?.gti_warnings || []),
-        ...(successFile.data?.stingray_warnings || []),
-      ];
-
-      if (warnings.length > 0) {
-        const filename = getFilename(successFile.file_path);
-        addNotification({
-          type: 'warning',
-          title: `Warnings: ${filename}`,
-          message: `${warnings.length} warning(s): ${warnings[0]}${warnings.length > 1 ? '...' : ''}`,
-        });
-      }
-    }
-  }
-  */
 }
 
 /**
