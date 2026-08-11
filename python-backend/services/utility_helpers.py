@@ -33,7 +33,13 @@ MAX_RMF_BYTES = 512 * 1024**2
 
 DERIVED_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$")
 FILE_GRANT_SECRET_ENV = "STINGRAY_FILE_GRANT_SECRET"
+FILE_GRANT_VERSION = "v2"
+FILE_GRANT_TTL_SECONDS = 10 * 60
 FILE_GRANT_MAX_FUTURE_SECONDS = 15 * 60
+MIN_FILE_GRANT_SECRET_BYTES = 32
+MAX_FILE_GRANT_TOKEN_CHARS = 512
+MAX_FILE_GRANT_EXPIRY_DIGITS = 20
+MAX_FILE_GRANT_IDENTITY_DIGITS = 40
 MAX_JSON_SAFE_WARNING_GROUPS = 32
 SECURE_DIR_FD_OPERATIONS_SUPPORTED = all(
     operation in os.supports_dir_fd
@@ -57,6 +63,23 @@ class GrantedWriteDestination:
     path: Path
     parent_descriptor: int
     filename: str
+
+
+@dataclass(frozen=True)
+class IssuedFileGrant:
+    """One short-lived grant issued by the Python filesystem runtime."""
+
+    path: Path
+    grant: str
+    expires_at: int
+
+
+@dataclass(frozen=True)
+class _ParsedFileGrant:
+    expires_at: int
+    device: int
+    inode: int
+    digest: str
 
 
 @contextmanager
@@ -400,6 +423,107 @@ def _canonical_path(file_path: str, *, must_exist: bool) -> Path:
     return parent / candidate.name
 
 
+def validated_file_grant_secret(secret: str | None) -> bytes | None:
+    """Return a sufficiently strong UTF-8 grant secret, or ``None``."""
+    if not isinstance(secret, str):
+        return None
+    encoded = secret.encode("utf-8")
+    return encoded if len(encoded) >= MIN_FILE_GRANT_SECRET_BYTES else None
+
+
+def _configured_file_grant_secret(secret: str | None = None) -> bytes:
+    configured = secret if secret is not None else os.environ.get(FILE_GRANT_SECRET_ENV)
+    encoded = validated_file_grant_secret(configured)
+    if encoded is None:
+        raise PermissionError(
+            "Native file grants are unavailable because the backend was not "
+            "launched by Electron with a strong per-launch secret"
+        )
+    return encoded
+
+
+def _parse_file_grant(grant: str) -> _ParsedFileGrant:
+    try:
+        if not isinstance(grant, str) or len(grant) > MAX_FILE_GRANT_TOKEN_CHARS:
+            raise ValueError
+        parts = grant.split(".")
+        if len(parts) != 5 or parts[0] != FILE_GRANT_VERSION:
+            raise ValueError
+        expires_text, device_text, inode_text, digest = parts[1:]
+        numeric_fields = (
+            (expires_text, MAX_FILE_GRANT_EXPIRY_DIGITS),
+            (device_text, MAX_FILE_GRANT_IDENTITY_DIGITS),
+            (inode_text, MAX_FILE_GRANT_IDENTITY_DIGITS),
+        )
+        if any(
+            not value
+            or len(value) > maximum
+            or any(character not in "0123456789" for character in value)
+            for value, maximum in numeric_fields
+        ):
+            raise ValueError
+        if len(digest) != hashlib.sha256().digest_size * 2:
+            raise ValueError
+        # Enforce the canonical lowercase representation emitted by the issuer.
+        if any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError
+        return _ParsedFileGrant(
+            expires_at=int(expires_text),
+            device=int(device_text),
+            inode=int(inode_text),
+            digest=digest,
+        )
+    except (AttributeError, TypeError, ValueError, IndexError) as exc:
+        raise PermissionError("The native file selection grant is malformed") from exc
+
+
+def _file_grant_message(
+    *,
+    access: str,
+    expires_at: int,
+    path: Path,
+    device: int,
+    inode: int,
+) -> bytes:
+    return (
+        f"{FILE_GRANT_VERSION}\0{access}\0{expires_at}\0{path}\0{device}\0{inode}"
+    ).encode()
+
+
+def issue_file_grant(
+    file_path: str,
+    *,
+    access: str,
+    secret: str | None = None,
+) -> IssuedFileGrant:
+    """Issue a v2 grant using Python's own canonical path and file identity."""
+    if access not in {"read", "write"}:
+        raise ValueError("Invalid file-grant access mode")
+    secret_bytes = _configured_file_grant_secret(secret)
+    resolved = _canonical_path(file_path, must_exist=access == "read")
+    identity_path = resolved if access == "read" else resolved.parent
+    identity = identity_path.stat()
+    if access == "read" and not stat.S_ISREG(identity.st_mode):
+        raise ValueError("The selected input path is not a regular file")
+    if access == "write" and not stat.S_ISDIR(identity.st_mode):
+        raise ValueError("The selected destination directory does not exist")
+
+    expires_at = int(time.time()) + FILE_GRANT_TTL_SECONDS
+    message = _file_grant_message(
+        access=access,
+        expires_at=expires_at,
+        path=resolved,
+        device=identity.st_dev,
+        inode=identity.st_ino,
+    )
+    digest = hmac.new(secret_bytes, message, hashlib.sha256).hexdigest()
+    grant = (
+        f"{FILE_GRANT_VERSION}.{expires_at}.{identity.st_dev}."
+        f"{identity.st_ino}.{digest}"
+    )
+    return IssuedFileGrant(path=resolved, grant=grant, expires_at=expires_at)
+
+
 def verify_file_grant(
     file_path: str,
     grant: str,
@@ -407,43 +531,35 @@ def verify_file_grant(
     access: str,
     must_exist: bool,
 ) -> Path:
-    """Verify an Electron-issued HMAC grant for exactly one selected path.
+    """Verify a Python-issued HMAC grant for exactly one selected path.
 
     The renderer receives the selected absolute path and a short-lived token,
-    but never receives the session secret shared by Electron main and FastAPI.
-    It therefore cannot substitute an adjacent or manually typed path.
+    but never receives the issuer/signing secret shared by Electron main and
+    FastAPI. It therefore cannot substitute an adjacent or manually typed path.
     """
     if access not in {"read", "write"}:
         raise ValueError("Invalid file-grant access mode")
-    secret = os.environ.get(FILE_GRANT_SECRET_ENV, "")
-    if not secret:
-        raise PermissionError(
-            "Native file grants are unavailable because the backend was not launched by Electron"
-        )
-    try:
-        parts = grant.split(".")
-        expires = int(parts[0])
-        if len(parts) != 4:
-            raise ValueError
-        granted_device = int(parts[1])
-        granted_inode = int(parts[2])
-        supplied_digest = parts[3]
-    except (AttributeError, TypeError, ValueError, IndexError) as exc:
-        raise PermissionError("The native file selection grant is malformed") from exc
+    secret = _configured_file_grant_secret()
+    parsed = _parse_file_grant(grant)
 
     now = int(time.time())
-    if expires < now:
+    if parsed.expires_at < now:
         raise PermissionError(
             "The native file selection grant has expired; select the file again"
         )
-    if expires > now + FILE_GRANT_MAX_FUTURE_SECONDS:
+    if parsed.expires_at > now + FILE_GRANT_MAX_FUTURE_SECONDS:
         raise PermissionError("The native file selection grant expiry is invalid")
 
     resolved = _canonical_path(file_path, must_exist=must_exist)
-    identity_suffix = f"\0{granted_device}\0{granted_inode}"
-    message = f"{access}\0{expires}\0{resolved}{identity_suffix}".encode()
-    expected = hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(supplied_digest, expected):
+    message = _file_grant_message(
+        access=access,
+        expires_at=parsed.expires_at,
+        path=resolved,
+        device=parsed.device,
+        inode=parsed.inode,
+    )
+    expected = hmac.new(secret, message, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(parsed.digest, expected):
         raise PermissionError("The path does not match the native file selection grant")
     identity_path = resolved if access == "read" else resolved.parent
     current = identity_path.stat()
@@ -459,7 +575,7 @@ def verify_file_grant(
         changed_message = (
             "The selected destination directory identity changed; choose it again"
         )
-    if (current.st_dev, current.st_ino) != (granted_device, granted_inode):
+    if (current.st_dev, current.st_ino) != (parsed.device, parsed.inode):
         raise PermissionError(changed_message)
     return resolved
 
@@ -492,8 +608,8 @@ def open_verified_read_grant(
         opened = os.fstat(descriptor)
         # Re-parse only the authenticated identity fields. verify_file_grant
         # already validated their shape, expiry, and signature.
-        parts = grant.split(".")
-        granted_identity = (int(parts[1]), int(parts[2]))
+        parsed = _parse_file_grant(grant)
+        granted_identity = (parsed.device, parsed.inode)
         if not stat.S_ISREG(opened.st_mode):
             raise PermissionError("The selected input is no longer a regular file")
         if (opened.st_dev, opened.st_ino) != granted_identity:
@@ -544,8 +660,8 @@ def open_verified_write_grant(
     descriptor = os.open(path.parent, flags)
     try:
         opened = os.fstat(descriptor)
-        parts = grant.split(".")
-        granted_identity = (int(parts[1]), int(parts[2]))
+        parsed = _parse_file_grant(grant)
+        granted_identity = (parsed.device, parsed.inode)
         if not stat.S_ISDIR(opened.st_mode):
             raise PermissionError("The selected destination directory is unavailable")
         if (opened.st_dev, opened.st_ino) != granted_identity:

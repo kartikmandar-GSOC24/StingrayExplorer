@@ -13,7 +13,11 @@ import numpy as np
 import pytest
 from services.state_manager import StateManager
 from services.utility_helpers import (
+    FILE_GRANT_MAX_FUTURE_SECONDS,
     FILE_GRANT_SECRET_ENV,
+    FILE_GRANT_TTL_SECONDS,
+    FILE_GRANT_VERSION,
+    issue_file_grant,
     json_safe,
     open_verified_read_grant,
     open_verified_write_grant,
@@ -23,21 +27,27 @@ from services.utility_helpers import (
 )
 from stingray import EventList
 
+from services import utility_helpers
+
 
 def _grant(secret: str, path, access: str, expires: int | None = None) -> str:
-    expires = expires or int(time.time()) + 60
+    expires = int(time.time()) + 60 if expires is None else expires
     resolved = path.resolve()
     identity_path = resolved if access == "read" else resolved.parent
     selected_stat = identity_path.stat()
-    identity = f"\0{selected_stat.st_dev}\0{selected_stat.st_ino}"
-    prefix = f"{expires}.{selected_stat.st_dev}.{selected_stat.st_ino}"
-    payload = f"{access}\0{expires}\0{resolved}{identity}".encode()
+    prefix = (
+        f"{FILE_GRANT_VERSION}.{expires}.{selected_stat.st_dev}.{selected_stat.st_ino}"
+    )
+    payload = (
+        f"{FILE_GRANT_VERSION}\0{access}\0{expires}\0{resolved}\0"
+        f"{selected_stat.st_dev}\0{selected_stat.st_ino}"
+    ).encode()
     digest = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
     return f"{prefix}.{digest}"
 
 
 def test_file_grant_is_bound_to_exact_path_and_access(tmp_path, monkeypatch):
-    secret = "test-only-secret"
+    secret = "test-only-file-grant-secret-32-bytes"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / "selected.fits"
     selected.write_bytes(b"fits")
@@ -58,7 +68,7 @@ def test_file_grant_is_bound_to_exact_path_and_access(tmp_path, monkeypatch):
 def test_file_grant_rejects_expired_or_missing_secret(tmp_path, monkeypatch):
     selected = tmp_path / "selected.fits"
     selected.write_bytes(b"fits")
-    secret = "test-only-secret"
+    secret = "test-only-file-grant-secret-32-bytes"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     expired = _grant(secret, selected, "read", int(time.time()) - 1)
     with pytest.raises(PermissionError, match="expired"):
@@ -68,8 +78,60 @@ def test_file_grant_rejects_expired_or_missing_secret(tmp_path, monkeypatch):
         verify_file_grant(str(selected), expired, access="read", must_exist=True)
 
 
+def test_python_issuer_creates_canonical_v2_grants_with_fixed_ttl(
+    tmp_path, monkeypatch
+):
+    secret = "test-only-file-grant-secret-32-bytes"
+    monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
+    monkeypatch.setattr(utility_helpers.time, "time", lambda: 1_900_000_000)
+    selected = tmp_path / "selected.fits"
+    selected.write_bytes(b"fits")
+
+    issued = issue_file_grant(str(selected), access="read")
+
+    assert issued.path == selected.resolve()
+    assert issued.expires_at == 1_900_000_000 + FILE_GRANT_TTL_SECONDS
+    assert issued.grant.startswith(f"{FILE_GRANT_VERSION}.{issued.expires_at}.")
+    assert (
+        verify_file_grant(
+            str(issued.path), issued.grant, access="read", must_exist=True
+        )
+        == issued.path
+    )
+
+
+def test_file_grant_rejects_malformed_future_and_weak_secret(tmp_path, monkeypatch):
+    secret = "test-only-file-grant-secret-32-bytes"
+    selected = tmp_path / "selected.fits"
+    selected.write_bytes(b"fits")
+    monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
+
+    malformed_grants = (
+        "v1.1.2.3." + "0" * 64,
+        "v2." + "9" * 10_000 + ".2.3." + "0" * 64,
+        "v2." + "9" * 21 + ".2.3." + "0" * 64,
+        "v2.123.\u0661.3." + "0" * 64,
+    )
+    for malformed in malformed_grants:
+        with pytest.raises(PermissionError, match="malformed"):
+            verify_file_grant(str(selected), malformed, access="read", must_exist=True)
+
+    future = _grant(
+        secret,
+        selected,
+        "read",
+        int(time.time()) + FILE_GRANT_MAX_FUTURE_SECONDS + 1,
+    )
+    with pytest.raises(PermissionError, match="expiry is invalid"):
+        verify_file_grant(str(selected), future, access="read", must_exist=True)
+
+    monkeypatch.setenv(FILE_GRANT_SECRET_ENV, "too-short")
+    with pytest.raises(PermissionError, match="strong per-launch secret"):
+        verify_file_grant(str(selected), future, access="read", must_exist=True)
+
+
 def test_read_grant_pins_identity_and_open_descriptor(tmp_path, monkeypatch):
-    secret = "test-only-secret"
+    secret = "test-only-file-grant-secret-32-bytes"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / "selected.fits"
     selected.write_bytes(b"original")
@@ -93,7 +155,7 @@ def test_read_grant_pins_identity_and_open_descriptor(tmp_path, monkeypatch):
 def test_read_grant_rejects_swap_between_path_check_and_descriptor_open(
     tmp_path, monkeypatch
 ):
-    secret = "test-only-secret"
+    secret = "test-only-file-grant-secret-32-bytes"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / "selected.fits"
     selected.write_bytes(b"original")
@@ -119,7 +181,7 @@ def test_read_grant_rejects_swap_between_path_check_and_descriptor_open(
 
 
 def test_write_grant_is_bound_to_selected_parent_directory(tmp_path, monkeypatch):
-    secret = "test-only-secret"
+    secret = "test-only-file-grant-secret-32-bytes"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected_parent = tmp_path / "selected-parent"
     selected_parent.mkdir()
@@ -137,7 +199,7 @@ def test_write_grant_is_bound_to_selected_parent_directory(tmp_path, monkeypatch
 def test_write_grant_rejects_swap_between_path_check_and_parent_open(
     tmp_path, monkeypatch
 ):
-    secret = "test-only-secret"
+    secret = "test-only-file-grant-secret-32-bytes"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected_parent = tmp_path / "selected-parent"
     selected_parent.mkdir()

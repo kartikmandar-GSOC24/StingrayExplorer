@@ -3,6 +3,19 @@ import { randomBytes } from 'crypto';
 import path from 'path';
 import { app } from 'electron';
 import http from 'http';
+import {
+  MAX_FILE_GRANT_RESPONSE_BYTES,
+  parseFileGrantResponse,
+  type NativeFileGrant,
+} from './fileGrantResponse';
+export type { NativeFileGrant } from './fileGrantResponse';
+
+const FILE_GRANT_ENDPOINT = '/internal/file-grants/issue';
+const BACKEND_SESSION_HEADER = 'X-Stingray-Session';
+const FILE_GRANT_ISSUER_HEADER = 'X-Stingray-Grant-Issuer';
+const FILE_GRANT_REQUEST_TIMEOUT_MS = 5000;
+const MAX_SELECTED_PATH_LENGTH = 4096;
+const MAX_FILE_GRANT_REQUEST_BYTES = 16 * 1024;
 
 export type LogLevel = 'info' | 'warn' | 'error' | 'debug';
 export type LogSource = 'python' | 'electron';
@@ -353,7 +366,7 @@ export class PythonManager {
           port: this.port,
           path: '/api/status',
           method: 'GET',
-          headers: { 'X-Stingray-Session': this.backendSessionSecret },
+          headers: { [BACKEND_SESSION_HEADER]: this.backendSessionSecret },
           timeout: 1000,
         },
         (res) => {
@@ -400,14 +413,149 @@ export class PythonManager {
     return this.backendSessionSecret;
   }
 
-  /** Session secret used by Electron main to sign exact native-dialog paths. */
-  getFileGrantSecret(): string {
-    if (!this.process) {
-      throw new Error(
-        'Native file access is unavailable until the Electron-managed backend is running; try again after startup.'
+  /**
+   * Exchange an exact native-dialog selection for a short-lived backend grant.
+   * Both credentials remain in Electron main; renderer requests never receive
+   * either header and cannot ask the backend to authorize an arbitrary path.
+   */
+  issueFileGrant(selectedPath: string, access: 'read' | 'write'): Promise<NativeFileGrant> {
+    if (!this.process || !this.isRunning) {
+      return Promise.reject(
+        new Error(
+          'Native file authorization is unavailable until the Electron-managed backend is ready. Wait for startup to finish, then select the file again.'
+        )
       );
     }
-    return this.fileGrantSecret;
+    if (
+      typeof selectedPath !== 'string' ||
+      selectedPath.length === 0 ||
+      selectedPath.length > MAX_SELECTED_PATH_LENGTH ||
+      selectedPath.includes('\0')
+    ) {
+      return Promise.reject(new Error('The native file dialog returned an invalid path'));
+    }
+
+    const requestBody = Buffer.from(JSON.stringify({ path: selectedPath, access }), 'utf8');
+    if (requestBody.byteLength > MAX_FILE_GRANT_REQUEST_BYTES) {
+      return Promise.reject(new Error('The selected path is too long to authorize safely'));
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      const fail = (message: string) => {
+        if (settled) return;
+        settled = true;
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        reject(new Error(message));
+      };
+      const succeed = (grant: NativeFileGrant) => {
+        if (settled) return;
+        settled = true;
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        resolve(grant);
+      };
+
+      const req = http.request(
+        {
+          hostname: '127.0.0.1',
+          port: this.port,
+          path: FILE_GRANT_ENDPOINT,
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'Content-Length': requestBody.byteLength,
+            [BACKEND_SESSION_HEADER]: this.backendSessionSecret,
+            [FILE_GRANT_ISSUER_HEADER]: this.fileGrantSecret,
+          },
+          timeout: FILE_GRANT_REQUEST_TIMEOUT_MS,
+        },
+        (res) => {
+          const advertisedLength = Number(res.headers['content-length']);
+          if (
+            Number.isFinite(advertisedLength) &&
+            advertisedLength > MAX_FILE_GRANT_RESPONSE_BYTES
+          ) {
+            res.destroy();
+            fail('The backend returned an oversized native file authorization response');
+            return;
+          }
+
+          let responseBytes = 0;
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer | string) => {
+            if (settled) return;
+            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            responseBytes += bytes.byteLength;
+            if (responseBytes > MAX_FILE_GRANT_RESPONSE_BYTES) {
+              res.destroy();
+              fail('The backend returned an oversized native file authorization response');
+              return;
+            }
+            chunks.push(bytes);
+          });
+          res.on('error', () => {
+            fail(
+              'Native file authorization was interrupted. Restart Stingray Explorer and select the file again.'
+            );
+          });
+          res.on('end', () => {
+            if (settled) return;
+            const statusCode = res.statusCode ?? 0;
+            if (statusCode !== 200) {
+              res.resume();
+              if (statusCode === 401 || statusCode === 403) {
+                fail(
+                  'The backend refused native file authorization. Restart Stingray Explorer and select the file again.'
+                );
+              } else if (statusCode === 400 || statusCode === 422) {
+                fail(
+                  'The backend could not authorize that selection. Choose an existing input file or a writable destination.'
+                );
+              } else if (statusCode === 503) {
+                fail(
+                  'The backend is not ready to authorize native files. Wait for startup to finish and try again.'
+                );
+              } else {
+                fail(
+                  'The backend could not authorize the native file selection. Restart Stingray Explorer and try again.'
+                );
+              }
+              return;
+            }
+
+            try {
+              const grant = parseFileGrantResponse(Buffer.concat(chunks).toString('utf8'));
+              succeed(grant);
+            } catch {
+              fail(
+                'The Electron-managed backend returned an invalid native file authorization response. Restart Stingray Explorer and select the file again.'
+              );
+            }
+          });
+        }
+      );
+
+      req.on('timeout', () => {
+        req.destroy();
+        fail(
+          'Native file authorization timed out. Check that the backend is running, then select the file again.'
+        );
+      });
+      req.on('error', () => {
+        fail(
+          'Native file authorization could not reach the Electron-managed backend. Restart Stingray Explorer and try again.'
+        );
+      });
+      deadlineTimer = setTimeout(() => {
+        req.destroy();
+        fail(
+          'Native file authorization timed out. Check that the backend is running, then select the file again.'
+        );
+      }, FILE_GRANT_REQUEST_TIMEOUT_MS);
+      req.end(requestBody);
+    });
   }
 
   /**

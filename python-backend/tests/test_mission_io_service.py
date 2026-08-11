@@ -10,8 +10,13 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import routes.mission_io_routes as mission_routes
+import services.mission_io_service as mission_module
 from astropy.io import fits
 from pydantic import ValidationError
+from routes.mission_io_routes import MissionIdentifyRequest, RoughPiConversionRequest
+from services.mission_io_service import MissionIOService
+from services.utility_helpers import FILE_GRANT_SECRET_ENV, FILE_GRANT_VERSION
 from stingray import EventList
 from stingray.mission_support import (
     get_rough_conversion_function,
@@ -19,21 +24,19 @@ from stingray.mission_support import (
     read_mission_info,
 )
 
-import routes.mission_io_routes as mission_routes
-import services.mission_io_service as mission_module
-from routes.mission_io_routes import MissionIdentifyRequest, RoughPiConversionRequest
-from services.mission_io_service import MissionIOService
-from services.utility_helpers import FILE_GRANT_SECRET_ENV
-
 
 def _grant(secret: str, path: Path, access: str = "read") -> str:
     expires = int(time.time()) + 60
     resolved = path.resolve()
     identity_path = resolved if access == "read" else resolved.parent
     selected_stat = identity_path.stat()
-    identity = f"\0{selected_stat.st_dev}\0{selected_stat.st_ino}"
-    prefix = f"{expires}.{selected_stat.st_dev}.{selected_stat.st_ino}"
-    payload = f"{access}\0{expires}\0{resolved}{identity}".encode()
+    prefix = (
+        f"{FILE_GRANT_VERSION}.{expires}.{selected_stat.st_dev}.{selected_stat.st_ino}"
+    )
+    payload = (
+        f"{FILE_GRANT_VERSION}\0{access}\0{expires}\0{resolved}\0"
+        f"{selected_stat.st_dev}\0{selected_stat.st_ino}"
+    ).encode()
     digest = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
     return f"{prefix}.{digest}"
 
@@ -971,7 +974,7 @@ def test_identification_omits_overflowed_split_mjdref(service, state_manager):
 
 
 def test_fits_identification_requires_exact_read_grant(service, tmp_path, monkeypatch):
-    secret = "mission-io-test-secret"
+    secret = "mission-io-test-file-grant-secret"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / "selected.fits"
     adjacent = tmp_path / "adjacent.fits"
@@ -1004,7 +1007,7 @@ def test_fits_identification_requires_exact_read_grant(service, tmp_path, monkey
 def test_fits_identification_preserves_raw_mjdref_card_precision(
     service, tmp_path, monkeypatch
 ):
-    secret = "mission-io-test-secret"
+    secret = "mission-io-test-file-grant-secret"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / "exact-mjdref.fits"
     primary = fits.PrimaryHDU()
@@ -1032,7 +1035,7 @@ def test_fits_identification_preserves_raw_mjdref_card_precision(
 def test_malformed_fits_returns_clean_identification_and_interpretation_failures(
     service, tmp_path, monkeypatch
 ):
-    secret = "mission-io-test-secret"
+    secret = "mission-io-test-file-grant-secret"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / "malformed.fits"
     selected.write_bytes(b"this is not a FITS file")
@@ -1054,7 +1057,7 @@ def test_malformed_fits_returns_clean_identification_and_interpretation_failures
 
 
 def test_malformed_mjdreff_is_not_substituted_with_zero(service, tmp_path, monkeypatch):
-    secret = "mission-io-test-secret"
+    secret = "mission-io-test-file-grant-secret"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / "malformed-mjdreff.fits"
     _write_identification_fits(selected)
@@ -1077,7 +1080,7 @@ def test_malformed_mjdreff_is_not_substituted_with_zero(service, tmp_path, monke
 def test_mission_fits_hdu_count_is_capped_before_header_iteration(
     service, tmp_path, monkeypatch
 ):
-    secret = "mission-io-test-secret"
+    secret = "mission-io-test-file-grant-secret"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / "too-many-hdus.fits"
     hdus = [fits.PrimaryHDU()]
@@ -1099,7 +1102,7 @@ def test_mission_fits_hdu_count_is_capped_before_header_iteration(
 
 
 def test_mission_header_precedes_telescope_header(service, tmp_path, monkeypatch):
-    secret = "mission-io-test-secret"
+    secret = "mission-io-test-file-grant-secret"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / "precedence.fits"
     _write_identification_fits(selected, mission="NICER", instrument="XTI")
@@ -1119,7 +1122,7 @@ def test_mission_header_precedes_telescope_header(service, tmp_path, monkeypatch
 def test_xte_interpretation_matches_public_api_and_does_not_change_file(
     service, tmp_path, monkeypatch
 ):
-    secret = "mission-io-test-secret"
+    secret = "mission-io-test-file-grant-secret"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / "xte-science.fits"
     _write_xte_science_fits(selected)
@@ -1147,7 +1150,7 @@ def test_xte_interpretation_matches_public_api_and_does_not_change_file(
 def test_xte_interpretation_rejects_missing_hdu_pha_and_oversized_table(
     service, tmp_path, monkeypatch
 ):
-    secret = "mission-io-test-secret"
+    secret = "mission-io-test-file-grant-secret"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
 
     missing_hdu = tmp_path / "xte-missing-hdu.fits"
@@ -1188,7 +1191,7 @@ def test_xte_interpretation_rejects_missing_hdu_pha_and_oversized_table(
 
 
 def test_specialized_interpretation_is_xte_only(service, tmp_path, monkeypatch):
-    secret = "mission-io-test-secret"
+    secret = "mission-io-test-file-grant-secret"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / "nicer.fits"
     _write_identification_fits(selected)
@@ -1205,7 +1208,7 @@ def test_specialized_interpretation_is_xte_only(service, tmp_path, monkeypatch):
 def test_xte_specialized_interpretation_requires_pca(
     service, tmp_path, monkeypatch, instrument
 ):
-    secret = "mission-io-test-secret"
+    secret = "mission-io-test-file-grant-secret"
     monkeypatch.setenv(FILE_GRANT_SECRET_ENV, secret)
     selected = tmp_path / f"xte-{instrument or 'missing'}.fits"
     _write_xte_science_fits(selected)

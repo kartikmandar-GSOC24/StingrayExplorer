@@ -11,15 +11,13 @@ import secrets
 import signal
 import socket
 import sys
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
-
 from routes import (
     archive_routes,
     correlation_routes,
@@ -27,6 +25,7 @@ from routes import (
     deadtime_routes,
     export_routes,
     gti_routes,
+    internal_grant_routes,
     io_utility_routes,
     job_routes,
     lightcurve_routes,
@@ -38,11 +37,13 @@ from routes import (
     timing_routes,
     varenergy_routes,
 )
-from services.state_manager import StateManager
-from services.data_service import DataService
 from services.job_manager import JobManager
-from utils.performance_monitor import PerformanceMonitor
+from services.state_manager import StateManager
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from utils.log_stream import log_stream_manager
+
+from services.data_service import DataService
+from utils.performance_monitor import PerformanceMonitor
 
 MAX_REQUEST_BODY_BYTES = 8 * 1024**2
 MAX_SERIALIZED_VALIDATION_ERRORS = 50
@@ -306,12 +307,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     log_stream_manager.uninstall()
 
 
-def create_app(*, session_secret: str | None = None) -> FastAPI:
+def create_app(
+    *,
+    session_secret: str | None = None,
+    file_grant_secret: str | None = None,
+) -> FastAPI:
     """Create and configure the FastAPI application."""
     resolved_session_secret = (
         session_secret
         if session_secret is not None
         else os.environ.get(BACKEND_SESSION_ENV)
+    )
+    resolved_file_grant_secret = (
+        file_grant_secret
+        if file_grant_secret is not None
+        else os.environ.get("STINGRAY_FILE_GRANT_SECRET")
     )
     app = FastAPI(
         title="Stingray Explorer API",
@@ -319,6 +329,9 @@ def create_app(*, session_secret: str | None = None) -> FastAPI:
         version="1.0.0",
         lifespan=lifespan,
     )
+    # This value is consumed only by the hidden main-process issuance route.
+    # It is never returned by an endpoint or added to renderer request headers.
+    app.state._file_grant_secret = resolved_file_grant_secret
 
     app.add_middleware(RequestBodyLimitMiddleware, max_body_size=MAX_REQUEST_BODY_BYTES)
     app.add_middleware(BackendSessionMiddleware, session_secret=resolved_session_secret)
@@ -345,6 +358,7 @@ def create_app(*, session_secret: str | None = None) -> FastAPI:
         )
 
     # Register routes
+    app.include_router(internal_grant_routes.router, prefix="/internal")
     app.include_router(data_routes.router, prefix="/api/data", tags=["Data"])
     app.include_router(
         lightcurve_routes.router, prefix="/api/lightcurve", tags=["Lightcurve"]

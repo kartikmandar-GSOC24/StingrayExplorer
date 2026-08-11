@@ -21,9 +21,6 @@ from astropy.table import MaskedColumn, Table
 from astropy.utils.exceptions import AstropyUserWarning
 from fastapi import FastAPI
 from pydantic import ValidationError
-from stingray import EventList, Lightcurve
-from stingray.io import pi_to_energy
-
 from routes import io_utility_routes
 from routes.io_utility_routes import (
     ConvertEventListRequest,
@@ -33,9 +30,13 @@ from routes.io_utility_routes import (
 )
 from services.io_utility_service import IOUtilityService
 from services.state_manager import StateManager
+from services.utility_helpers import FILE_GRANT_VERSION
+from stingray import EventList, Lightcurve
+from stingray.io import pi_to_energy
+
 from services.timing_service import TimingService
 
-TEST_SECRET = "io-utility-test-secret"
+TEST_SECRET = "io-utility-test-file-grant-secret"
 
 
 @pytest.fixture(autouse=True)
@@ -59,11 +60,15 @@ def make_grant(
     expires = int(time.time()) + expires_delta
     identity_path = resolved if access == "read" else resolved.parent
     selected_stat = identity_path.stat()
-    identity = f"\0{selected_stat.st_dev}\0{selected_stat.st_ino}"
-    prefix = f"{expires}.{selected_stat.st_dev}.{selected_stat.st_ino}"
+    prefix = (
+        f"{FILE_GRANT_VERSION}.{expires}.{selected_stat.st_dev}.{selected_stat.st_ino}"
+    )
     digest = hmac.new(
         TEST_SECRET.encode(),
-        f"{access}\0{expires}\0{resolved}{identity}".encode(),
+        (
+            f"{FILE_GRANT_VERSION}\0{access}\0{expires}\0{resolved}\0"
+            f"{selected_stat.st_dev}\0{selected_stat.st_ino}"
+        ).encode(),
         hashlib.sha256,
     ).hexdigest()
     return f"{prefix}.{digest}"

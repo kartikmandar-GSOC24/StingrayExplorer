@@ -8,50 +8,19 @@ import {
   type OpenDialogOptions,
 } from 'electron';
 import fs from 'fs/promises';
-import { realpathSync, statSync } from 'fs';
 import path from 'path';
-import { createHmac } from 'crypto';
-import { PythonManager } from './pythonManager';
+import { PythonManager, type NativeFileGrant } from './pythonManager';
 
 type PythonManagerGetter = () => PythonManager | null;
 type PythonRestarter = () => Promise<void>;
 
-export interface NativeFileGrant {
-  path: string;
-  grant: string;
-}
-
-const FILE_GRANT_TTL_SECONDS = 10 * 60;
-
-function issueFileGrant(
-  selectedPath: string,
-  access: 'read' | 'write',
-  pythonManager: PythonManager | null
-): NativeFileGrant {
+function requirePythonManager(pythonManager: PythonManager | null): PythonManager {
   if (!pythonManager) {
-    throw new Error('Python backend is not initialized; try selecting the file again');
+    throw new Error(
+      'Native file authorization is unavailable because the Python backend is not initialized. Wait for startup to finish and select the file again.'
+    );
   }
-  const secret = pythonManager.getFileGrantSecret();
-  const resolvedPath =
-    access === 'read'
-      ? realpathSync(selectedPath)
-      : path.join(realpathSync(path.dirname(selectedPath)), path.basename(selectedPath));
-  const expires = Math.floor(Date.now() / 1000) + FILE_GRANT_TTL_SECONDS;
-  const identityPath = access === 'read' ? resolvedPath : path.dirname(resolvedPath);
-  const selectedStat = statSync(identityPath, { bigint: true });
-  if (access === 'read' && !selectedStat.isFile()) {
-    throw new Error('The selected input is not a regular file');
-  }
-  if (access === 'write' && !selectedStat.isDirectory()) {
-    throw new Error('The selected destination directory is unavailable');
-  }
-  const identity = `\0${selectedStat.dev}\0${selectedStat.ino}`;
-  const grantPrefix = `${expires}.${selectedStat.dev}.${selectedStat.ino}`;
-  const payload = `${access}\0${expires}\0${resolvedPath}${identity}`;
-  const digest = createHmac('sha256', secret)
-    .update(payload)
-    .digest('hex');
-  return { path: resolvedPath, grant: `${grantPrefix}.${digest}` };
+  return pythonManager;
 }
 
 /**
@@ -136,14 +105,14 @@ export function setupIpcHandlers(
   // mode, rather than trusting an arbitrary renderer-provided path string.
   ipcMain.handle(
     'dialog:openGrantedFile',
-    (
+    async (
       event,
       options?: {
         title?: string;
         filters?: { name: string; extensions: string[] }[];
         multiple?: boolean;
       }
-    ): NativeFileGrant[] | null => {
+    ): Promise<NativeFileGrant[] | null> => {
       const parentWindow = BrowserWindow.fromWebContents(event.sender);
       const dialogOptions: OpenDialogOptions = {
         title: options?.title || 'Open Scientific File',
@@ -159,22 +128,23 @@ export function setupIpcHandlers(
         ? dialog.showOpenDialogSync(parentWindow, dialogOptions)
         : dialog.showOpenDialogSync(dialogOptions);
       if (!selected?.length) return null;
-      return selected.map((selectedPath) =>
-        issueFileGrant(selectedPath, 'read', getPythonManager())
+      const pythonManager = requirePythonManager(getPythonManager());
+      return Promise.all(
+        selected.map((selectedPath) => pythonManager.issueFileGrant(selectedPath, 'read'))
       );
     }
   );
 
   ipcMain.handle(
     'dialog:saveGrantedFile',
-    (
+    async (
       event,
       options?: {
         title?: string;
         defaultPath?: string;
         filters?: { name: string; extensions: string[] }[];
       }
-    ): NativeFileGrant | null => {
+    ): Promise<NativeFileGrant | null> => {
       const parentWindow = BrowserWindow.fromWebContents(event.sender);
       const dialogOptions = {
         title: options?.title || 'Export Scientific Data',
@@ -189,7 +159,8 @@ export function setupIpcHandlers(
       const selected = parentWindow
         ? dialog.showSaveDialogSync(parentWindow, dialogOptions)
         : dialog.showSaveDialogSync(dialogOptions);
-      return selected ? issueFileGrant(selected, 'write', getPythonManager()) : null;
+      if (!selected) return null;
+      return requirePythonManager(getPythonManager()).issueFileGrant(selected, 'write');
     }
   );
 
