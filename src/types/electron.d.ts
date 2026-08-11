@@ -16,11 +16,19 @@ export interface ElectronAPI {
     filters?: { name: string; extensions: string[] }[];
   }) => Promise<string | null>;
 
+  openGrantedFile: (options?: {
+    title?: string;
+    filters?: { name: string; extensions: string[] }[];
+    multiple?: boolean;
+  }) => Promise<{ path: string; grant: string }[] | null>;
+
+  saveGrantedFile: (options?: {
+    title?: string;
+    defaultPath?: string;
+    filters?: { name: string; extensions: string[] }[];
+  }) => Promise<{ path: string; grant: string } | null>;
+
   openDirectory: () => Promise<string | null>;
-
-  readFile: (filePath: string) => Promise<ArrayBuffer>;
-
-  writeFile: (filePath: string, data: ArrayBuffer | string) => Promise<void>;
 
   fileExists: (filePath: string) => Promise<boolean>;
 

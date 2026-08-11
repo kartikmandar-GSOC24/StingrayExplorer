@@ -30,3 +30,13 @@ export {
   type CovarianceSpectrumData,
 } from './varenergyApi';
 export { deadtimeApi, type PdsCorrectionData, type FadCorrectionData } from './deadtimeApi';
+export { statisticsApi } from './statisticsApi';
+export { gtiApi } from './gtiApi';
+export {
+  ioApi,
+  type ExportableObjectType,
+  type UtilityExportFormat,
+  type ExportResult as UtilityIoExportResult,
+} from './ioApi';
+export { missionIoApi } from './missionIoApi';
+export { miscApi } from './miscApi';

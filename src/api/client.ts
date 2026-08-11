@@ -7,6 +7,8 @@ export interface ApiResponse<T = unknown> {
   data: T | null;
   message: string;
   error: string | null;
+  /** Non-fatal scientific advisories, including warnings returned with failures. */
+  warnings?: string[];
 }
 
 class ApiClient {
@@ -62,11 +64,26 @@ class ApiClient {
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         console.error(`[ApiClient] HTTP ${response.status}:`, errorData);
+        const validationMessage = Array.isArray(errorData.detail)
+          ? errorData.detail
+              .map((issue: { loc?: Array<string | number>; msg?: string }) => {
+                const field = issue.loc?.slice(1).join('.') || 'request';
+                return `${field}: ${issue.msg || 'invalid value'}`;
+              })
+              .join('; ')
+          : typeof errorData.detail === 'string'
+            ? errorData.detail
+            : null;
         return {
           success: false,
           data: null,
-          message: errorData.message || `HTTP error: ${response.status}`,
-          error: errorData.error || response.statusText,
+          message: errorData.message || validationMessage || `HTTP error: ${response.status}`,
+          error: errorData.error || validationMessage || response.statusText,
+          warnings: Array.isArray(errorData.warnings)
+            ? errorData.warnings.filter(
+                (warning: unknown): warning is string => typeof warning === 'string'
+              )
+            : undefined,
         };
       }
 

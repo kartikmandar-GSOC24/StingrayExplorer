@@ -42,10 +42,12 @@ describe('useAnalysisRunner', () => {
         data: null,
         message: 'bad dt',
         error: 'bad dt',
+        warnings: ['Approximate conversion was not performed.'],
       }));
     });
     expect(result.current.error).toBe('bad dt');
     expect(result.current.result?.v).toBe(1);
+    expect(result.current.warnings).toEqual(['Approximate conversion was not performed.']);
     expect(useUIStore.getState().notifications[0].type).toBe('error');
   });
 
@@ -65,6 +67,7 @@ describe('useAnalysisRunner', () => {
     expect(result.current.result).toBeNull();
     expect(result.current.error).toBeNull();
     expect(result.current.running).toBe(false);
+    expect(result.current.warnings).toEqual([]);
   });
 
   it('captures thrown errors (network failures)', async () => {

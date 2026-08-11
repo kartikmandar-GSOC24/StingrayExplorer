@@ -6,6 +6,15 @@ interface AnalysisRunnerState<T> {
   result: T | null;
   running: boolean;
   error: string | null;
+  warnings: string[];
+}
+
+function dataWarnings(value: unknown): string[] {
+  if (typeof value !== 'object' || value === null || !('warnings' in value)) return [];
+  const warnings = (value as { warnings?: unknown }).warnings;
+  return Array.isArray(warnings)
+    ? warnings.filter((warning): warning is string => typeof warning === 'string')
+    : [];
 }
 
 /**
@@ -19,24 +28,38 @@ export function useAnalysisRunner<T>(label: string) {
     result: null,
     running: false,
     error: null,
+    warnings: [],
   });
 
   const run = useCallback(
     async (call: () => Promise<ApiResponse<T>>): Promise<void> => {
-      setState((s) => ({ ...s, running: true, error: null }));
+      setState((s) => ({ ...s, running: true, error: null, warnings: [] }));
       try {
         const res = await call();
         if (res.success && res.data != null) {
-          setState({ result: res.data, running: false, error: null });
+          const embeddedWarnings = dataWarnings(res.data);
+          setState({
+            result: res.data,
+            running: false,
+            error: null,
+            warnings: (res.warnings ?? []).filter(
+              (warning) => !embeddedWarnings.includes(warning)
+            ),
+          });
           addNotification({ type: 'success', title: label, message: res.message || 'Done' });
         } else {
           const msg = res.error || res.message || 'Operation failed';
-          setState((s) => ({ ...s, running: false, error: msg }));
+          setState((s) => ({
+            ...s,
+            running: false,
+            error: msg,
+            warnings: res.warnings ?? [],
+          }));
           addNotification({ type: 'error', title: label, message: msg });
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        setState((s) => ({ ...s, running: false, error: msg }));
+        setState((s) => ({ ...s, running: false, error: msg, warnings: [] }));
         addNotification({ type: 'error', title: label, message: msg });
       }
     },
@@ -44,7 +67,7 @@ export function useAnalysisRunner<T>(label: string) {
   );
 
   const reset = useCallback((): void => {
-    setState({ result: null, running: false, error: null });
+    setState({ result: null, running: false, error: null, warnings: [] });
   }, []);
 
   return { ...state, run, reset };

@@ -100,4 +100,34 @@ describe('EventListSelector', () => {
     expect(screen.getByText(/boom/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Refresh event lists' })).toBeInTheDocument();
   });
+
+  it('disables EventLists that lack a required scientific data capability', async () => {
+    listEventLists.mockResolvedValue({
+      success: true,
+      data: [
+        { name: 'with-pi', n_events: 10, time_range: [0, 1], has_pi: true },
+        { name: 'without-pi', n_events: 10, time_range: [0, 1], has_pi: false },
+      ],
+      message: '',
+      error: null,
+    });
+    renderWithProviders(
+      <EventListSelector
+        label="PI EventList"
+        value=""
+        onChange={() => undefined}
+        requiredCapability="pi"
+      />
+    );
+
+    await userEvent.click(await screen.findByLabelText('PI EventList'));
+    expect(screen.getByRole('option', { name: /without-pi.*no PI\/channel data/ })).toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+    expect(screen.getByRole('option', { name: /with-pi/ })).not.toHaveAttribute(
+      'aria-disabled',
+      'true'
+    );
+  });
 });
