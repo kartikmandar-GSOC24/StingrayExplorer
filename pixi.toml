@@ -1,0 +1,87 @@
+[workspace]
+name = "stingray-explorer"
+version = "1.0.0"
+description = "Desktop application for X-ray timing analysis using the Stingray library"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
+
+[tasks]
+# Development - Run these in separate terminals
+start-backend = { cmd = "cd python-backend && python main.py", description = "Start Python backend server (auto-finds free port)" }
+start-frontend = { cmd = "npm run dev", description = "Start Electron frontend" }
+
+# Run both together (recommended)
+dev = { cmd = "bash scripts/dev.sh", description = "Start full development environment" }
+
+# Kill any orphaned backend processes
+kill-backend = { cmd = "pkill -f 'python main.py' || true", description = "Kill any running backend processes" }
+
+# Build
+build = { cmd = "npm run build", description = "Build the Electron app" }
+build-frontend = { cmd = "npm run build", description = "Build frontend only" }
+
+# Install
+install-npm = { cmd = "npm install", description = "Install npm dependencies" }
+setup = { depends-on = ["install-npm"], description = "Setup the project" }
+
+# Testing
+test = { depends-on = ["test-python"], description = "Run all tests" }
+
+# Utilities
+lint = { cmd = "npm run lint", description = "Run linter" }
+format = { cmd = "npm run format", description = "Format code" }
+health-check = { cmd = "curl -s http://127.0.0.1:8765/health", description = "Check backend health" }
+
+# Package
+package = { cmd = "npm run build && npm run package", description = "Package the application" }
+
+[dependencies]
+# Python
+python = ">=3.10"
+pip = "*"
+
+# Stingray and scientific stack
+stingray = ">=2.0"
+numpy = ">=1.24"
+scipy = ">=1.11"
+astropy = ">=5.3"
+pandas = ">=2.0"
+matplotlib = ">=3.7"
+pytables = ">=3.8"
+numba = ">=0.58"  # Optional but recommended for faster Stingray computations
+
+# FastAPI backend
+fastapi = ">=0.109"
+uvicorn = ">=0.27"
+pydantic = ">=2.5"
+httpx = ">=0.26"
+python-multipart = "*"
+aiofiles = "*"
+
+# Utilities
+psutil = ">=5.9"
+requests = ">=2.31"
+
+# HEASARC archive queries
+astroquery = ">=0.4.8"
+
+# HTML parsing for HEASARC directory listings
+beautifulsoup4 = ">=4.12"
+lxml = ">=5.0"
+
+# Node.js (npm is included with nodejs)
+nodejs = ">=20"
+
+[feature.dev.tasks]
+test-python = { cmd = "pytest python-backend/tests", description = "Run Python backend tests" }
+
+[feature.dev.dependencies]
+# Development dependencies
+pytest = ">=7.0"
+pytest-asyncio = "*"
+black = "*"
+ruff = "*"
+
+[environments]
+default = { features = [], solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }

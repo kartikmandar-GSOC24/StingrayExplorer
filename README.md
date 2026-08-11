@@ -1,471 +1,93 @@
----
-title: Stingray Explorer
-emoji: 🚀
-colorFrom: gray
-colorTo: green
-sdk: docker
-pinned: false
-license: mit
-thumbnail: >-
-  https://cdn-uploads.huggingface.co/production/uploads/668d17c6e6887d1f6afde2a6/4q5lnlS6-eJ_JBh8tW3_I.png
-short_description: Stingray Explorer Dashboard Demo
----
+# Stingray Explorer
 
-# StingrayExplorer
+Stingray Explorer is a desktop application for X-ray timing analysis. It combines
+an Electron and React interface with a loopback FastAPI service backed by
+[Stingray](https://docs.stingray.science/), Astropy, and NumPy.
 
-StingrayExplorer is a comprehensive data analysis and visualization dashboard designed for X-ray astronomy time series data. Built on top of the Stingray library, it provides an intuitive graphical interface for analyzing event lists, generating light curves, computing various types of spectra, and performing advanced timing analysis.
+> [!IMPORTANT]
+> The original Panel, public Docker, and Hugging Face Spaces runtime has been
+> retired. It accepted browser-controlled local paths, arbitrary download URLs,
+> and unsafe serialization formats that do not belong at a public web boundary.
+> The files still under `modules/`, root `services/`, and `utils/` are migration
+> reference code; they are not a supported application entrypoint.
 
-## Overview
+## Current application
 
-StingrayExplorer combines the powerful timing analysis capabilities of the Stingray library with a modern, interactive dashboard built using Panel and HoloViz. It enables astronomers to:
+The supported runtime is the Electron desktop app:
 
-- Load and analyze event lists from various X-ray telescopes
-- Generate and manipulate light curves
-- Compute power spectra, cross spectra, and bispectra
-- Analyze dynamical power spectra and power colors
-- Visualize results through interactive plots
-- Export analysis results in multiple formats
+- React, TypeScript, Material UI, and Plotly provide the renderer.
+- Electron owns native file dialogs and launches the Python service.
+- FastAPI exposes the local scientific API on an ephemeral loopback port.
+- Native selections are represented by short-lived grants instead of accepting
+  paths typed by renderer code.
+- Stingray performs event-list, light-curve, spectral, timing, correlation,
+  variable-energy, and dead-time analyses.
 
-The dashboard is designed to be user-friendly while providing access to advanced features for experienced users.
+The desktop UI includes data ingestion, HEASARC archive browsing, quick-look
+analysis pages, job progress, logs, and utility workflows for General I/O, GTIs,
+mission I/O, statistics, and miscellaneous Stingray helpers.
 
-## Key Features
+## Development setup
 
-### Data Loading and Management
-- Support for multiple file formats (FITS, HDF5, ASCII, etc.)
-- Batch loading of multiple event lists
-- Automatic GTI (Good Time Interval) handling
-- Energy calibration using RMF (Response Matrix File)
-- File preview and metadata inspection
+Install [Pixi](https://pixi.sh/) and a Node version supported by the locked
+frontend toolchain, then run:
 
-### Event List Analysis
-- Event list creation and simulation
-- Deadtime correction
-- Energy filtering and PI channel conversion
-- Event list joining and sorting
-- Color and intensity evolution analysis
-
-### Spectral Analysis
-- Power spectrum computation
-- Cross spectrum analysis
-- Averaged power/cross spectra
-- Bispectrum calculation
-- Dynamical power spectrum visualization
-- Power color analysis
-
-### Interactive Visualization
-- Real-time plot updates
-- Customizable plot layouts
-- Floating plot panels
-- Interactive plot manipulation
-- Multiple visualization options
-
-### System Features
-- Resource monitoring (CPU, RAM usage)
-- Warning and error handling
-- Comprehensive help documentation
-- Responsive layout design
-
-## Architecture
-
-The project follows a modular architecture with clear separation of concerns:
-
-### Core Components
-
-1. **explorer.py**: Main entry point and dashboard initialization
-   - Panel/HoloViz setup
-   - Layout configuration
-   - Component integration
-
-2. **modules/**: Core functionality modules
-   - **DataLoading/**: Data ingestion and management
-   - **Home/**: Dashboard home page and navigation
-   - **QuickLook/**: Analysis tools and visualizations
-     - EventList handling
-     - Light curve generation
-     - Spectral analysis
-     - Power color computation
-
-3. **utils/**: Utility classes and functions
-   - **DashboardClasses.py**: Reusable UI components
-   - **sidebar.py**: Navigation and control
-   - **globals.py**: Global state management
-   - **strings.py**: Text content
-
-4. **assets/**: Static resources
-   - Images and icons
-   - CSS stylesheets
-   - Documentation assets
-
-5. **files/**: Data storage
-   - Sample data files
-   - User-loaded data
-   - Analysis outputs
-
-### Technology Stack
-
-- **Backend**: Python 3.11+
-- **Frontend**: Panel, HoloViz
-- **Data Analysis**: Stingray, NumPy, Astropy
-- **Visualization**: Bokeh, Matplotlib
-- **Deployment**: Docker, Hugging Face Spaces
-
-## Installation Guide
-
-### Prerequisites
-
-- Python 3.11 or above
-- Conda package manager
-- Git (for cloning the repository)
-
-### Dependencies
-
-Core packages:
-- Panel >= 1.3.0
-- HoloViews >= 1.18.0
-- Stingray >= 0.3
-- NumPy >= 1.24.0
-- Astropy >= 5.0
-- Matplotlib >= 3.7.0
-- Bokeh >= 3.3.0
-
-### Setup Instructions
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/kartikmandar-GSOC24/StingrayExplorer.git
-   cd StingrayExplorer
-   ```
-
-2. Create and activate the conda environment:
-   ```bash
-   conda env create -f environment.yml
-   conda activate stingray-env
-   ```
-
-3. Verify installation:
-   ```bash
-   python -c "import stingray; import panel; import holoviews"
-   ```
-
-### Troubleshooting Dependencies
-
-If you encounter dependency conflicts:
-
-1. Check individual package versions:
-   ```bash
-   conda list stingray
-   conda list panel
-   conda list holoviews
-   ```
-
-2. Try installing missing dependencies:
-   ```bash
-   conda install -c conda-forge <package_name>
-   # or
-   pip install <package_name>
-   ```
-
-3. Common issues:
-   - Stingray version compatibility
-   - Panel/HoloViews version mismatch
-   - Missing system libraries
-
-4. Support channels:
-   - Email: kartik4321mandar@gmail.com
-   - Stingray Slack: @kartikmandar
-   - GitHub Issues
-
-## Deployment Options
-
-### Local Development Server
-
-Run the application locally:
 ```bash
-panel serve explorer.py --autoreload --static-dirs assets=./assets
+pixi install
+npm install
+npm run dev
 ```
 
-This starts a development server with:
-- Auto-reloading on file changes
-- Static file serving
-- Debug information
-- Default port 5006
+Electron starts and authenticates the Python service automatically. Running the
+FastAPI service as an unrelated external process is intentionally unsupported;
+it cannot share Electron's per-launch credentials or native file grants.
 
-### Docker Deployment
+Useful commands:
 
-1. Build the image:
-   ```bash
-   docker build -t stingray-explorer .
-   ```
-
-2. Run the container:
-   ```bash
-   docker run -p 7860:7860 stingray-explorer
-   ```
-
-3. Access the application at `http://localhost:7860`
-
-### Hugging Face Spaces
-
-The dashboard is deployed on Hugging Face Spaces:
-- Live demo: [https://kartikmandar-stingrayexplorer.hf.space/explorer](https://kartikmandar-stingrayexplorer.hf.space/explorer)
-- Repository: [https://huggingface.co/spaces/kartikmandar/StingrayExplorer](https://huggingface.co/spaces/kartikmandar/StingrayExplorer)
-- Website demo: [https://www.kartikmandar.com/gsoc-2024/stingray-explorer](https://www.kartikmandar.com/gsoc-2024/stingray-explorer)
-
-### Continuous Integration
-
-GitHub Actions automatically sync changes to Hugging Face Spaces:
-- Triggers on pushes to `main` branch
-- Builds and deploys Docker image
-- Updates Hugging Face Space
-
-## Usage Guide
-
-### Quick Start
-
-1. Launch the application:
-   ```bash
-   panel serve explorer.py --autoreload --static-dirs assets=./assets
-   ```
-
-2. Navigate to `http://localhost:5006` in your browser
-
-3. Basic workflow:
-   - Use the sidebar navigation
-   - Load data files
-   - Generate visualizations
-   - Export results
-
-### Data Loading
-
-1. Click "Read Data" in the sidebar
-2. Choose from multiple options:
-   - Load local files
-   - Fetch from URL
-   - Use sample data
-
-Supported formats:
-- FITS event files
-- HDF5 files
-- ASCII tables
-- ECSV files
-
-#### Sample Data Files
-
-The repository includes small sample data files (< 1MB total) in `files/data/` for basic testing:
-- Small event lists (.evt files)
-- Example light curves (.fits files)
-
-**Note**: Large sample files (HDF5, RMF > 10MB) are not included in the repository to keep the codebase lightweight and deployable on free-tier hosting platforms like Hugging Face Spaces.
-
-For full-scale analysis:
-- Upload your own data files using the "Read Data" feature
-- Load data directly from URLs
-- Download X-ray astronomy datasets from archives like [HEASARC](https://heasarc.gsfc.nasa.gov/)
-
-### Analysis Tools
-
-1. **Event List Operations**
-   - Create/simulate event lists
-   - Apply deadtime corrections
-   - Filter by energy range
-   - Convert PI to energy
-
-2. **Light Curve Analysis**
-   - Generate light curves
-   - Apply GTI filters
-   - Compute statistics
-   - Plot time series
-
-3. **Spectral Analysis**
-   - Compute power spectra
-   - Generate cross spectra
-   - Calculate bispectra
-   - Analyze power colors
-
-4. **Advanced Features**
-   - Dynamical power spectra
-   - Color evolution
-   - Intensity analysis
-   - Custom plotting
-
-### Visualization Options
-
-1. **Plot Types**
-   - Time series
-   - Spectral plots
-   - Contour plots
-   - Scatter plots
-
-2. **Interactive Features**
-   - Zoom/pan
-   - Hover tooltips
-   - Plot customization
-   - Export options
-
-3. **Layout Options**
-   - Floating panels
-   - Grid arrangements
-   - Multiple views
-   - Responsive design
-
-### Data Export
-
-- Save plots as PNG/SVG
-- Export data as CSV/FITS
-- Save analysis results
-- Generate reports
-
-## Development Guide
-
-### Setting Up Development Environment
-
-1. Fork and clone the repository
-2. Create development environment:
-   ```bash
-   conda env create -f environment.yml
-   conda activate stingray-env
-   ```
-3. Install development dependencies:
-   ```bash
-   pip install -r docs/requirements.txt
-   ```
-
-### Project Structure
-
-```
-stingray-explorer/
-├── explorer.py          # Main application entry point
-├── modules/            # Core functionality modules
-│   ├── DataLoading/   # Data ingestion components
-│   ├── Home/          # Dashboard home components
-│   └── QuickLook/     # Analysis tools
-├── utils/             # Utility functions and classes
-├── assets/            # Static resources
-├── files/            # Data files
-└── tests/            # Test suite
-```
-
-### Development Workflow
-
-1. Create feature branch:
-   ```bash
-   git checkout -b feature/new-feature
-   ```
-
-2. Make changes and test:
-   ```bash
-   # Run tests
-   pytest tests/
-   
-   # Start development server
-   panel serve explorer.py --autoreload
-   ```
-
-3. Submit pull request:
-   - Fork repository
-   - Push changes
-   - Create PR with description
-
-### Coding Standards
-
-- Follow PEP 8 style guide
-- Add docstrings (NumPy format)
-- Write unit tests
-- Update documentation
-
-### Testing
-
-Run test suite:
 ```bash
-pytest tests/
+# Backend tests in the development environment
+pixi run -e dev pytest python-backend/tests
+
+# Frontend tests, type checking, linting, and production build
+npm test -- --run
+npm run typecheck
+npm run lint
+npm run build
 ```
 
-Test coverage:
-```bash
-pytest --cov=./ tests/
+Additional scripts and packaging targets are listed in `package.json` and
+`pixi.toml`.
+
+## Repository layout
+
+```text
+electron/          Electron main process, preload bridge, and backend lifecycle
+python-backend/    Authenticated FastAPI routes, services, models, and tests
+src/               React renderer, API clients, state, pages, and component tests
+files/             Small sample data used for development
+resources/         Desktop application icons and packaging resources
+docs/              Implementation plans and engineering notes
 ```
 
-## Troubleshooting Guide
+The historical Panel implementation remains in the legacy root Python folders
+while migration work is completed. It has no executable `explorer.py`, Docker
+image, or deployment workflow.
 
-### Common Issues
+## Data and exports
 
-1. **Installation Problems**
-   - Dependency conflicts
-   - Python version mismatch
-   - Missing system libraries
+Use the desktop application's native open and save dialogs for local files.
+General I/O is the maintained export path; the duplicate raw-path `/api/export/*`
+API has been retired. User-visible outputs are expected to use explicit formats,
+refuse unintended overwrite, and pass format-specific verification before
+publication.
 
-   Solution: Check versions, use conda-forge channel
+Large scientific files are intentionally not tracked. The small examples under
+`files/data/` are suitable for local development; use your own mission data for
+full-scale analysis.
 
-2. **Import Errors**
-   - Missing packages
-   - Version incompatibilities
-   - Path issues
+## License
 
-   Solution: Verify environment, check imports
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
 
-3. **Runtime Errors**
-   - Memory issues
-   - Performance problems
-   - Display errors
-
-   Solution: Monitor resources, check logs
-
-4. **Data Loading Issues**
-   - File format problems
-   - Permission errors
-   - Corrupt files
-
-   Solution: Verify file integrity, check formats
-
-### Performance Optimization
-
-1. **Memory Management**
-   - Use chunked loading
-   - Clear unused data
-   - Monitor memory usage
-
-2. **Speed Improvements**
-   - Enable caching
-   - Optimize computations
-   - Use efficient algorithms
-
-3. **Display Performance**
-   - Limit plot sizes
-   - Use appropriate renderers
-   - Optimize updates
-
-### Getting Help
-
-1. **Documentation**
-   - Read the docs
-   - Check examples
-   - Review tutorials
-
-2. **Support Channels**
-   - GitHub Issues
-   - Email support
-   - Slack channel
-
-3. **Debugging**
-   - Check logs
-   - Use debugger
-   - Print statements
-
-## License and Credits
-
-### License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) file for details.
-
-### Credits
-
-- **Stingray Library**: Core timing analysis functionality
-- **Panel/HoloViz**: Interactive visualization framework
-- **Contributors**: See [GitHub contributors page](https://github.com/kartikmandar-GSOC24/StingrayExplorer/graphs/contributors)
-
-### Acknowledgments
-
-- The Stingray development team
-- HoloViz community
-- X-ray astronomy community
-- Google Summer of Code program
+Stingray Explorer builds on the work of the Stingray, Astropy, HoloViz, and
+broader X-ray astronomy communities.
