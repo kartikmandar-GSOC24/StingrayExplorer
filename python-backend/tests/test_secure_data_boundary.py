@@ -40,7 +40,7 @@ from services.data_service import DataService
 from services.job_manager import JobManager
 from services.remote_source import GENERAL_HTTPS_POLICY, RemoteSourceError
 from services.state_manager import StateManager
-from services.utility_helpers import issue_file_grant
+from services.utility_helpers import GrantedReadFile, issue_file_grant
 from tests.backend_auth import TEST_BACKEND_SESSION_SECRET
 
 
@@ -1126,6 +1126,75 @@ def test_batch_stream_maps_bad_grant_to_sanitized_error(tmp_path: Path) -> None:
     ]
     assert str(selected) not in repr(events)
     assert "forged-private-grant" not in repr(events)
+
+
+def test_batch_stream_emits_each_file_before_the_slowest_worker_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = [tmp_path / "a.evt", tmp_path / "b.evt"]
+    for index, path in enumerate(paths):
+        _write_event_fits(path)
+    service = DataService(StateManager())
+    a_finished = threading.Event()
+    b_started = threading.Event()
+    release_b = threading.Event()
+    observed_sources: dict[str, GrantedReadFile] = {}
+
+    def fake_load(*args, **kwargs):
+        name = args[1]
+        observed_sources[name] = kwargs["_file_source"]
+        if name == "a":
+            a_finished.set()
+            return {"success": True, "data": {"n_events": 1}, "message": "loaded"}
+        b_started.set()
+        assert release_b.wait(2.0)
+        return {"success": True, "data": {"n_events": 2}, "message": "loaded"}
+
+    monkeypatch.setattr(service, "load_event_list", fake_load)
+
+    async def consume() -> list[dict[str, Any]]:
+        stream = service.load_batch_event_lists_stream(
+            [
+                {
+                    "file_path": str(paths[0]),
+                    "file_grant": _grant(paths[0]),
+                    "name": "a",
+                },
+                {
+                    "file_path": str(paths[1]),
+                    "file_grant": _grant(paths[1]),
+                    "name": "b",
+                },
+            ],
+            max_workers=2,
+        )
+        first = await anext(stream)
+        assert await asyncio.to_thread(a_finished.wait, 2.0)
+        assert await asyncio.to_thread(b_started.wait, 2.0)
+        assert first == {
+            "type": "file_complete",
+            "name": "a",
+            "success": True,
+            "completed": 1,
+            "total": 2,
+            "data": {"n_events": 1},
+        }
+        assert observed_sources["a"].stream.closed is False
+        assert observed_sources["b"].stream.closed is False
+        release_b.set()
+        remaining = [event async for event in stream]
+        return [first, *remaining]
+
+    events = asyncio.run(consume())
+    assert [event["type"] for event in events] == [
+        "file_complete",
+        "file_complete",
+        "complete",
+    ]
+    assert events[1]["name"] == "b"
+    assert events[-1]["total_events"] == 3
+    assert observed_sources["a"].stream.closed is True
+    assert observed_sources["b"].stream.closed is True
 
 
 def test_job_capability_budget_rejects_before_pinning_and_releases(

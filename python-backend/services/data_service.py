@@ -16,7 +16,16 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, AsyncGenerator, BinaryIO, Dict, Generator, List, Optional
+from typing import (
+    Any,
+    AsyncGenerator,
+    BinaryIO,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Optional,
+)
 
 import numpy as np
 import psutil
@@ -2862,6 +2871,7 @@ class DataService(BaseService):
         _rmf_sources: List[GrantedReadFile | None] | None = None,
         _shared_rmf_source: GrantedReadFile | None = None,
         _cancellation_check=None,
+        _on_file_complete: Callable[[Dict[str, Any]], None] | None = None,
     ) -> Dict[str, Any]:
         """Pin an entire batch before loading and never reopen selected paths."""
         files, shared_fmt = require_batch_input_formats(files, shared_fmt)
@@ -3047,20 +3057,23 @@ class DataService(BaseService):
                     _raise_if_cancelled(_cancellation_check)
                     result = future.result()
                     if result["success"]:
+                        normalized = {
+                            "success": True,
+                            "name": result["name"],
+                            "data": result.get("data"),
+                        }
                         successful.append(
-                            {
-                                "name": result["name"],
-                                "data": result.get("data"),
-                                "message": result.get("message"),
-                            }
+                            {**normalized, "message": result.get("message")}
                         )
                     else:
-                        failed.append(
-                            {
-                                "name": result["name"],
-                                "error": result.get("error") or "Unknown error",
-                            }
-                        )
+                        normalized = {
+                            "success": False,
+                            "name": result["name"],
+                            "error": result.get("error") or "Unknown error",
+                        }
+                        failed.append(normalized)
+                    if _on_file_complete is not None:
+                        _on_file_complete(normalized)
 
             total_time_ms = (time.time() - start_time) * 1000
             total_events = sum(
@@ -3105,35 +3118,47 @@ class DataService(BaseService):
         shared_event_count: Optional[int] = None,
         max_workers: Optional[int] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Return the legacy SSE envelope backed by the secure batch loader."""
+        """Stream one redacted completion event as each file finishes."""
         # Format policy is an admission decision, not a runtime SSE failure.
         # Preserve fail-fast behavior before any worker or native I/O exists.
         files, shared_fmt = require_batch_input_formats(files, shared_fmt)
         cancellation_signal = threading.Event()
-        worker = asyncio.create_task(
-            asyncio.to_thread(
-                self.load_batch_event_lists,
-                files,
-                use_same_settings,
-                shared_fmt,
-                shared_rmf_file,
-                shared_rmf_grant,
-                shared_additional_columns,
-                shared_high_precision,
-                shared_skip_checks,
-                shared_use_partial_loading,
-                shared_partial_mode,
-                shared_time_range_start,
-                shared_time_range_end,
-                shared_event_start_index,
-                shared_event_count,
-                max_workers,
-                _cancellation_check=cancellation_signal.is_set,
-            )
+        loop = asyncio.get_running_loop()
+        completion_queue: asyncio.Queue[Dict[str, Any] | object] = asyncio.Queue(
+            maxsize=len(files) + 1
         )
-        try:
-            result = await asyncio.shield(worker)
-        except asyncio.CancelledError:
+        terminal = object()
+
+        def enqueue(item: Dict[str, Any] | object) -> None:
+            loop.call_soon_threadsafe(completion_queue.put_nowait, item)
+
+        def run_loader() -> Dict[str, Any]:
+            try:
+                return self.load_batch_event_lists(
+                    files,
+                    use_same_settings,
+                    shared_fmt,
+                    shared_rmf_file,
+                    shared_rmf_grant,
+                    shared_additional_columns,
+                    shared_high_precision,
+                    shared_skip_checks,
+                    shared_use_partial_loading,
+                    shared_partial_mode,
+                    shared_time_range_start,
+                    shared_time_range_end,
+                    shared_event_start_index,
+                    shared_event_count,
+                    max_workers,
+                    _cancellation_check=cancellation_signal.is_set,
+                    _on_file_complete=enqueue,
+                )
+            finally:
+                enqueue(terminal)
+
+        worker = asyncio.create_task(asyncio.to_thread(run_loader))
+
+        async def drain_worker() -> None:
             cancellation_signal.set()
             while not worker.done():
                 try:
@@ -3144,15 +3169,40 @@ class DataService(BaseService):
                 worker.result()
             except BaseException:
                 pass
-            raise
-        except Exception:
-            yield {
-                "type": "error",
-                "error": "The selected batch could not be admitted or loaded",
-            }
-            return
+
+        completed = 0
+        try:
+            while True:
+                item = await completion_queue.get()
+                if item is terminal:
+                    break
+                completed += 1
+                success = bool(item.get("success"))
+                event = {
+                    "type": "file_complete",
+                    "name": item.get("name", ""),
+                    "success": success,
+                    "completed": completed,
+                    "total": len(files),
+                }
+                if success:
+                    event["data"] = item.get("data")
+                else:
+                    event["error"] = item.get(
+                        "error", "The selected file could not be loaded"
+                    )
+                yield event
+                await asyncio.sleep(0)
+            try:
+                result = await asyncio.shield(worker)
+            except Exception:
+                yield {
+                    "type": "error",
+                    "error": "The selected batch could not be admitted or loaded",
+                }
+                return
         finally:
-            cancellation_signal.set()
+            await drain_worker()
         if result.get("data") is None:
             yield {
                 "type": "error",
@@ -3161,24 +3211,6 @@ class DataService(BaseService):
             return
 
         data = result["data"]
-        completed = 0
-        for item in [*data["successful"], *data["failed"]]:
-            completed += 1
-            success = "data" in item
-            event = {
-                "type": "file_complete",
-                "name": item["name"],
-                "success": success,
-                "completed": completed,
-                "total": len(files),
-            }
-            if success:
-                event["data"] = item.get("data")
-            else:
-                event["error"] = item.get("error", "Unknown error")
-            yield event
-            await asyncio.sleep(0)
-
         summary = data["summary"]
         yield {
             "type": "complete",
