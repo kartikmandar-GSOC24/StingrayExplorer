@@ -11,14 +11,11 @@ from __future__ import annotations
 import json
 import math
 import os
-import secrets
-import stat
 from collections.abc import Iterable, Mapping, Sized
 from contextlib import ExitStack
 from decimal import Decimal, InvalidOperation
 from itertools import islice
 from numbers import Integral, Real
-from pathlib import Path
 from typing import Any, BinaryIO
 
 import numpy as np
@@ -29,6 +26,7 @@ from stingray.io import high_precision_keyword_read, pi_to_energy, read_rmf
 
 from .analysis_helpers import collect_warnings
 from .base_service import BaseService
+from .secure_publication import open_secure_publication
 from .state_manager import _enforce_precopy_caps
 from .utility_helpers import (
     MAX_ARRAY_INPUT,
@@ -39,11 +37,9 @@ from .utility_helpers import (
     duplicate_binary_stream,
     json_safe,
     open_verified_read_grant,
-    open_verified_write_grant,
     operation_provenance,
     validate_derived_name,
     validate_file_size,
-    verify_file_grant,
 )
 
 MAX_INSPECT_HDUS = 512
@@ -1470,53 +1466,6 @@ def _json_export_payload(
     }
 
 
-def _unlink_owned_entry(
-    directory_descriptor: int, name: str, identity: tuple[int, int]
-) -> None:
-    """Remove only the exact regular entry reserved by this operation."""
-    try:
-        current = os.stat(
-            name,
-            dir_fd=directory_descriptor,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return
-    if stat.S_ISREG(current.st_mode) and (current.st_dev, current.st_ino) == identity:
-        os.unlink(name, dir_fd=directory_descriptor)
-
-
-def _assert_new_destination_at(
-    parent_descriptor: int, filename: str, display_path: Path
-) -> None:
-    """Reject an existing entry relative to the pinned selected directory."""
-    try:
-        os.stat(filename, dir_fd=parent_descriptor, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    raise FileExistsError(f"Destination already exists: {display_path}")
-
-
-def _rmdir_owned_entry(
-    parent_descriptor: int, name: str, identity: tuple[int, int]
-) -> bool:
-    """Remove a staging directory only while its pinned identity still matches."""
-    try:
-        current = os.stat(
-            name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-    except FileNotFoundError:
-        return True
-    if not stat.S_ISDIR(current.st_mode):
-        return False
-    if (current.st_dev, current.st_ino) != identity:
-        return False
-    os.rmdir(name, dir_fd=parent_descriptor)
-    return True
-
-
 class IOUtilityService(BaseService):
     """General I/O Utilities service with exact native-file grant checks."""
 
@@ -1912,36 +1861,22 @@ class IOUtilityService(BaseService):
         destination_grant: str,
     ) -> dict[str, Any]:
         context_stack = ExitStack()
-        parent_descriptor = -1
-        staging_descriptor = -1
-        staging_name: str | None = None
-        staging_identity: tuple[int, int] | None = None
-        artifact_name: str | None = None
-        reserved_identity: tuple[int, int] | None = None
         warning_messages: list[str] = []
         try:
-            destination = context_stack.enter_context(
-                open_verified_write_grant(
+            publication = context_stack.enter_context(
+                open_secure_publication(
                     destination_path,
                     destination_grant,
                 )
             )
-            path = destination.path
-            parent_descriptor = destination.parent_descriptor
-            destination_name = destination.filename
+            path = publication.path
+            destination_name = publication.filename
             if destination_name in {"", ".", ".."} or os.sep in destination_name:
                 raise ValueError("The selected destination filename is invalid")
             if os.altsep is not None and os.altsep in destination_name:
                 raise ValueError("The selected destination filename is invalid")
 
-            verified_path = verify_file_grant(
-                destination_path,
-                destination_grant,
-                access="write",
-                must_exist=False,
-            )
-            if verified_path != path:
-                raise PermissionError("The selected destination path changed")
+            publication.revalidate("The selected destination path changed")
             requested_format = export_format.lower().strip()
             if requested_format not in EXPORT_EXTENSIONS:
                 raise ValueError(
@@ -1953,7 +1888,7 @@ class IOUtilityService(BaseService):
                     f"{requested_format.upper()} export requires the exact "
                     f"'{expected_extension}' filename extension"
                 )
-            _assert_new_destination_at(parent_descriptor, destination_name, path)
+            publication.assert_destination_available()
             obj = self._copy_export_object(object_type, object_name)
             row_count = _object_row_count(obj, object_type)
             if row_count > MAX_EXPORT_ROWS:
@@ -1967,56 +1902,9 @@ class IOUtilityService(BaseService):
                 )
 
             # Write and verify in a private same-directory staging area.  The
-            # user-visible destination is published only after verification by
-            # an atomic hard link that cannot overwrite an existing path.
-            for _ in range(10):
-                candidate_name = f".stingray-export-{secrets.token_hex(16)}"
-                try:
-                    os.mkdir(
-                        candidate_name,
-                        0o700,
-                        dir_fd=parent_descriptor,
-                    )
-                except FileExistsError:
-                    continue
-                staging_name = candidate_name
-                break
-            else:
-                raise FileExistsError("Could not reserve a private export staging area")
-
-            directory_flags = os.O_RDONLY
-            if hasattr(os, "O_CLOEXEC"):
-                directory_flags |= os.O_CLOEXEC
-            if hasattr(os, "O_DIRECTORY"):
-                directory_flags |= os.O_DIRECTORY
-            if hasattr(os, "O_NOFOLLOW"):
-                directory_flags |= os.O_NOFOLLOW
-            staging_descriptor = os.open(
-                staging_name,
-                directory_flags,
-                dir_fd=parent_descriptor,
-            )
-            staging_stat = os.fstat(staging_descriptor)
-            if not stat.S_ISDIR(staging_stat.st_mode):
-                raise PermissionError("The private export staging area was replaced")
-            staging_identity = (staging_stat.st_dev, staging_stat.st_ino)
-
-            artifact_name = f"artifact{expected_extension}"
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            descriptor = os.open(
-                artifact_name,
-                flags,
-                0o600,
-                dir_fd=staging_descriptor,
-            )
-            try:
-                reserved_stat = os.fstat(descriptor)
-            except Exception:
-                os.close(descriptor)
-                raise
-            reserved_identity = (reserved_stat.st_dev, reserved_stat.st_ino)
+            # platform adapter exposes the user-visible destination only after
+            # verification, using an exclusive no-replacement publication.
+            publication.reserve_staging(expected_extension)
             if (
                 object_type in {"event_list", "lightcurve"}
                 and table.meta.get("gti_status") == "missing"
@@ -2036,14 +1924,10 @@ class IOUtilityService(BaseService):
                 )
 
             mode = "wb" if requested_format == "fits" else "w"
-            try:
-                output_stream = os.fdopen(
-                    descriptor, mode, encoding=None if mode == "wb" else "utf-8"
-                )
-            except Exception:
-                os.close(descriptor)
-                raise
-            with output_stream as stream:
+            with publication.open_writer(
+                mode,
+                encoding=None if mode == "wb" else "utf-8",
+            ) as stream:
                 with collect_warnings(warning_messages):
                     if requested_format == "csv":
                         table.write(stream, format="ascii.csv", overwrite=False)
@@ -2068,64 +1952,14 @@ class IOUtilityService(BaseService):
                             ensure_ascii=False,
                             separators=(",", ":"),
                         )
-                stream.flush()
-                os.fsync(stream.fileno())
-
-            verified_path = verify_file_grant(
-                destination_path,
-                destination_grant,
-                access="write",
-                must_exist=False,
-            )
-            if verified_path != path:
-                raise PermissionError(
-                    "Written artifact path changed during verification"
-                )
-            before_reopen = os.stat(
-                artifact_name,
-                dir_fd=staging_descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISREG(before_reopen.st_mode)
-                or (before_reopen.st_dev, before_reopen.st_ino) != reserved_identity
-            ):
-                raise PermissionError(
-                    "Export destination was replaced before verification"
-                )
-
-            read_flags = os.O_RDONLY
-            if hasattr(os, "O_NOFOLLOW"):
-                read_flags |= os.O_NOFOLLOW
-            read_descriptor = os.open(
-                artifact_name,
-                read_flags,
-                dir_fd=staging_descriptor,
-            )
-            try:
-                read_stat = os.fstat(read_descriptor)
-            except Exception:
-                os.close(read_descriptor)
-                raise
-            if (read_stat.st_dev, read_stat.st_ino) != reserved_identity:
-                os.close(read_descriptor)
-                raise PermissionError(
-                    "Export destination was replaced before verification"
-                )
 
             # Astropy's ASCII registry expects a binary-readable file object;
             # JSON's standard decoder expects text.
             read_mode = "r" if requested_format == "json" else "rb"
-            try:
-                reopened_file = os.fdopen(
-                    read_descriptor,
-                    read_mode,
-                    encoding=None if read_mode == "rb" else "utf-8",
-                )
-            except Exception:
-                os.close(read_descriptor)
-                raise
-            with reopened_file as reopened_stream:
+            with publication.open_reader(
+                read_mode,
+                encoding=None if read_mode == "rb" else "utf-8",
+            ) as reopened_stream:
                 if requested_format in {"csv", "ecsv"}:
                     reopened = Table.read(
                         reopened_stream,
@@ -2176,81 +2010,11 @@ class IOUtilityService(BaseService):
                     f"Reopened artifact has {reopened_rows:,} rows; expected {row_count:,}"
                 )
 
-            final_stat = os.stat(
-                artifact_name,
-                dir_fd=staging_descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISREG(final_stat.st_mode)
-                or (final_stat.st_dev, final_stat.st_ino) != reserved_identity
-            ):
-                raise PermissionError(
-                    "Export destination was replaced during verification"
-                )
-            byte_size = final_stat.st_size
-            if byte_size < 1:
-                raise ValueError("Written artifact is empty")
+            byte_size = publication.verified_size()
 
-            # `link` publishes the already verified inode atomically and fails
-            # if a destination appeared after the initial non-overwrite check.
-            verified_path = verify_file_grant(
-                destination_path,
-                destination_grant,
-                access="write",
-                must_exist=False,
-            )
-            if verified_path != path:
-                raise PermissionError("The selected destination path changed")
-            try:
-                os.link(
-                    artifact_name,
-                    destination_name,
-                    src_dir_fd=staging_descriptor,
-                    dst_dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-            except FileExistsError as exc:
-                raise FileExistsError(f"Destination already exists: {path}") from exc
-            published_stat = os.stat(
-                destination_name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                not stat.S_ISREG(published_stat.st_mode)
-                or (published_stat.st_dev, published_stat.st_ino) != reserved_identity
-            ):
-                raise PermissionError(
-                    "Export destination changed during atomic publication"
-                )
-
-            # Cleanup touches only the random private staging path, never the
-            # user-visible destination.  If its identity changed, retain it
-            # and report a warning instead of deleting an unrelated file.
-            try:
-                _unlink_owned_entry(
-                    staging_descriptor,
-                    artifact_name,
-                    reserved_identity,
-                )
-                os.close(staging_descriptor)
-                staging_descriptor = -1
-                if not _rmdir_owned_entry(
-                    parent_descriptor,
-                    staging_name,
-                    staging_identity,
-                ):
-                    raise OSError("private staging directory identity changed")
-            except OSError as cleanup_error:
-                warning_messages.append(
-                    "Export succeeded, but its private staging artifact could not be "
-                    f"removed safely ({cleanup_error})."
-                )
-            artifact_name = None
-            reserved_identity = None
-            staging_name = None
-            staging_identity = None
+            # Publish the already verified artifact through the platform's
+            # single-operation, exclusive no-replacement primitive.
+            warning_messages.extend(publication.publish())
             data = {
                 "path": str(path),
                 "bytes": byte_size,
@@ -2286,36 +2050,4 @@ class IOUtilityService(BaseService):
                 destination=destination_path,
             )
         finally:
-            if (
-                staging_descriptor >= 0
-                and artifact_name is not None
-                and reserved_identity is not None
-            ):
-                try:
-                    _unlink_owned_entry(
-                        staging_descriptor,
-                        artifact_name,
-                        reserved_identity,
-                    )
-                except OSError:
-                    pass
-            if staging_descriptor >= 0:
-                try:
-                    os.close(staging_descriptor)
-                except OSError:
-                    pass
-            if (
-                staging_name is not None
-                and staging_identity is not None
-                and parent_descriptor >= 0
-            ):
-                try:
-                    _rmdir_owned_entry(
-                        parent_descriptor,
-                        staging_name,
-                        staging_identity,
-                    )
-                except OSError:
-                    # Never broaden cleanup or delete an unexpected entry.
-                    pass
             context_stack.close()

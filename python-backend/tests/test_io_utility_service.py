@@ -2154,20 +2154,21 @@ def test_export_cleanup_retains_replacement_staging_directory(
     ("failure_kind", "failure_role"),
     [
         ("fstat", "write"),
-        ("fdopen", "write"),
+        ("stream", "write"),
         ("fstat", "read"),
-        ("fdopen", "read"),
+        ("stream", "read"),
     ],
 )
 def test_export_closes_raw_descriptors_on_setup_failure(
     service, tmp_path, monkeypatch, failure_kind, failure_role
 ):
     import services.io_utility_service as module
+    import services.secure_publication as publication_module
 
     destination = tmp_path / "events.json"
     real_open = os.open
     real_fstat = os.fstat
-    real_fdopen = os.fdopen
+    real_file_io = publication_module.io.FileIO
     captured: dict[str, int] = {}
 
     def tracked_open(name, flags, *args, **kwargs):
@@ -2182,14 +2183,14 @@ def test_export_closes_raw_descriptors_on_setup_failure(
             raise OSError(f"synthetic {failure_role} fstat failure")
         return real_fstat(descriptor)
 
-    def injected_fdopen(descriptor, *args, **kwargs):
-        if failure_kind == "fdopen" and descriptor == captured.get(failure_role):
-            raise OSError(f"synthetic {failure_role} fdopen failure")
-        return real_fdopen(descriptor, *args, **kwargs)
+    def injected_file_io(descriptor, *args, **kwargs):
+        if failure_kind == "stream" and descriptor == captured.get(failure_role):
+            raise OSError(f"synthetic {failure_role} stream failure")
+        return real_file_io(descriptor, *args, **kwargs)
 
     monkeypatch.setattr(module.os, "open", tracked_open)
     monkeypatch.setattr(module.os, "fstat", injected_fstat)
-    monkeypatch.setattr(module.os, "fdopen", injected_fdopen)
+    monkeypatch.setattr(publication_module.io, "FileIO", injected_file_io)
     result = service.export_object(
         "event_list",
         "events",
