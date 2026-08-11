@@ -1,4 +1,12 @@
-import { ipcMain, dialog, app, shell, clipboard, BrowserWindow } from 'electron';
+import {
+  ipcMain,
+  dialog,
+  app,
+  shell,
+  clipboard,
+  BrowserWindow,
+  type OpenDialogOptions,
+} from 'electron';
 import fs from 'fs/promises';
 import { realpathSync, statSync } from 'fs';
 import path from 'path';
@@ -137,17 +145,16 @@ export function setupIpcHandlers(
       }
     ): NativeFileGrant[] | null => {
       const parentWindow = BrowserWindow.fromWebContents(event.sender);
-      const dialogOptions = {
+      const dialogOptions: OpenDialogOptions = {
         title: options?.title || 'Open Scientific File',
-        filters: options?.filters || [
-          { name: 'FITS and response files', extensions: ['fits', 'fit', 'fts', 'evt', 'rmf', 'rsp'] },
-          { name: 'Tabular files', extensions: ['csv', 'ecsv', 'json'] },
-          { name: 'All files', extensions: ['*'] },
-        ],
         properties: options?.multiple
           ? (['openFile', 'multiSelections'] as ('openFile' | 'multiSelections')[])
           : (['openFile'] as ('openFile')[]),
       };
+      // On macOS, even valid custom scientific extensions can be disabled when
+      // NSOpenPanel receives an extension filter. Omit the property entirely
+      // for unrestricted pickers; the backend validates the selected format.
+      if (options?.filters?.length) dialogOptions.filters = options.filters;
       const selected = parentWindow
         ? dialog.showOpenDialogSync(parentWindow, dialogOptions)
         : dialog.showOpenDialogSync(dialogOptions);

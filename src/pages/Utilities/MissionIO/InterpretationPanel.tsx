@@ -128,7 +128,6 @@ const InterpretationPanel: React.FC = () => {
               value={fitsFile}
               onChange={setFitsFile}
               disabled={running}
-              filters={[{ name: 'FITS files', extensions: ['fits', 'fit', 'fts', 'evt'] }]}
             />
             <OptionalOverrides values={overrides} onChange={setOverrides} disabled={running} />
             <Button

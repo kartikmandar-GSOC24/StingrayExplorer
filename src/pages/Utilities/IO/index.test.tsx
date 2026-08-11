@@ -208,6 +208,10 @@ describe('General I/O Utilities page', () => {
     renderWithProviders(<IOPage />);
 
     await userEvent.click(screen.getByRole('button', { name: 'Choose' }));
+    expect(openGrantedFile).toHaveBeenNthCalledWith(1, {
+      title: 'Scientific file',
+      filters: undefined,
+    });
     expect(screen.getByLabelText('Scientific file')).toHaveValue('/science/events.fits');
     await userEvent.click(screen.getByRole('button', { name: 'Choose' }));
     expect(screen.getByLabelText('Scientific file')).toHaveValue('/science/events.fits');
@@ -298,6 +302,10 @@ describe('General I/O Utilities page', () => {
     await userEvent.click(screen.getByRole('tab', { name: 'RMF utilities' }));
 
     await userEvent.click(screen.getByRole('button', { name: 'Choose' }));
+    expect(openGrantedFile).toHaveBeenCalledWith({
+      title: 'RMF file',
+      filters: undefined,
+    });
     await userEvent.click(screen.getByRole('button', { name: 'Inspect RMF' }));
 
     expect(await screen.findByText('Energy range (unit not declared)')).toBeInTheDocument();

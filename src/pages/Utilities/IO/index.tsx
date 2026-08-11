@@ -53,15 +53,6 @@ import {
   UtilityExportFormat,
 } from '@/api/ioApi';
 
-const FILE_FILTERS = [
-  { name: 'Scientific data', extensions: ['fits', 'fit', 'fts', 'rmf', 'rsp', 'csv', 'ecsv', 'json'] },
-  { name: 'All files', extensions: ['*'] },
-];
-
-const RMF_FILTERS = [
-  { name: 'Response matrix files', extensions: ['rmf', 'rsp', 'fits', 'fit'] },
-];
-
 const EMPTY_EXPORTABLE_OBJECTS: ExportableObject[] = [];
 
 interface SummaryDatum {
@@ -263,7 +254,6 @@ const FileInspectorPanel: React.FC<FileInspectorPanelProps> = ({ selection, onSe
         label="Scientific file"
         value={selection}
         onChange={changeSelection}
-        filters={FILE_FILTERS}
         disabled={inspection.running}
       />
       <Box>
@@ -493,7 +483,6 @@ const RmfPanel: React.FC<RmfPanelProps> = ({
             label="RMF file"
             value={rmfSelection}
             onChange={changeRmfSelection}
-            filters={RMF_FILTERS}
             disabled={panelRunning}
           />
           <Box>
