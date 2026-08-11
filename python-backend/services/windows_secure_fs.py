@@ -77,10 +77,10 @@ FILE_OPEN = 0x00000001
 FILE_CREATE = 0x00000002
 OBJ_CASE_INSENSITIVE = 0x00000040
 
-FILE_RENAME_INFO_CLASS = 3
 FILE_DISPOSITION_INFO_CLASS = 4
 FILE_ATTRIBUTE_TAG_INFO_CLASS = 9
 FILE_ID_INFO_CLASS = 18
+FILE_RENAME_INFORMATION_CLASS = 10
 
 DRIVE_FIXED = 3
 DUPLICATE_SAME_ACCESS = 0x00000002
@@ -140,13 +140,45 @@ class _FILE_DISPOSITION_INFO(ctypes.Structure):
     _fields_ = [("DeleteFile", wintypes.BOOLEAN)]
 
 
-class _FILE_RENAME_INFO(ctypes.Structure):
+class _FILE_RENAME_OPERATION(ctypes.Union):
     _fields_ = [
-        ("ReplaceIfExists", wintypes.BOOLEAN),
-        ("RootDirectory", wintypes.HANDLE),
-        ("FileNameLength", wintypes.DWORD),
-        ("FileName", wintypes.WCHAR * 1),
+        ("ReplaceIfExists", ctypes.c_ubyte),
+        ("Flags", ctypes.c_uint32),
     ]
+
+
+class _FILE_RENAME_INFORMATION(ctypes.Structure):
+    _anonymous_ = ("Operation",)
+    _fields_ = [
+        ("Operation", _FILE_RENAME_OPERATION),
+        ("RootDirectory", ctypes.c_void_p),
+        ("FileNameLength", ctypes.c_uint32),
+        ("FileName", ctypes.c_uint16 * 1),
+    ]
+
+
+def _build_file_rename_information(
+    parent_handle: int,
+    filename: str,
+) -> tuple[ctypes.Array[Any], int]:
+    """Build the native FILE_RENAME_INFORMATION variable-length buffer."""
+    _validate_windows_component(filename)
+    encoded_name = filename.encode("utf-16-le")
+    buffer_size = ctypes.sizeof(_FILE_RENAME_INFORMATION) + len(encoded_name)
+    buffer = ctypes.create_string_buffer(buffer_size)
+    rename_info = ctypes.cast(
+        buffer,
+        ctypes.POINTER(_FILE_RENAME_INFORMATION),
+    ).contents
+    rename_info.ReplaceIfExists = False
+    rename_info.RootDirectory = parent_handle
+    rename_info.FileNameLength = len(encoded_name)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + _FILE_RENAME_INFORMATION.FileName.offset,
+        encoded_name,
+        len(encoded_name),
+    )
+    return buffer, buffer_size
 
 
 @dataclass(frozen=True)
@@ -315,6 +347,14 @@ class WindowsNativeApi:
             wintypes.ULONG,
         ]
         self.ntdll.NtCreateFile.restype = ctypes.c_long
+        self.ntdll.NtSetInformationFile.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_IO_STATUS_BLOCK),
+            wintypes.LPVOID,
+            wintypes.ULONG,
+            ctypes.c_int,
+        ]
+        self.ntdll.NtSetInformationFile.restype = ctypes.c_long
         self.ntdll.RtlNtStatusToDosError.argtypes = [ctypes.c_long]
         self.ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
 
@@ -516,29 +556,20 @@ class WindowsNativeApi:
         parent_handle: int,
         filename: str,
     ) -> None:
-        encoded_name = filename.encode("utf-16-le")
-        buffer_size = (
-            ctypes.sizeof(_FILE_RENAME_INFO)
-            + len(encoded_name)
-            + ctypes.sizeof(wintypes.WCHAR)
+        buffer, buffer_size = _build_file_rename_information(
+            parent_handle,
+            filename,
         )
-        buffer = ctypes.create_string_buffer(buffer_size)
-        rename_info = ctypes.cast(buffer, ctypes.POINTER(_FILE_RENAME_INFO)).contents
-        rename_info.ReplaceIfExists = False
-        rename_info.RootDirectory = wintypes.HANDLE(parent_handle)
-        rename_info.FileNameLength = len(encoded_name)
-        ctypes.memmove(
-            ctypes.addressof(buffer) + _FILE_RENAME_INFO.FileName.offset,
-            encoded_name,
-            len(encoded_name),
-        )
-        if not self.kernel32.SetFileInformationByHandle(
+        io_status = _IO_STATUS_BLOCK()
+        status = self.ntdll.NtSetInformationFile(
             wintypes.HANDLE(handle),
-            FILE_RENAME_INFO_CLASS,
+            ctypes.byref(io_status),
             buffer,
             buffer_size,
-        ):
-            error = ctypes.get_last_error()
+            FILE_RENAME_INFORMATION_CLASS,
+        )
+        if status < 0:
+            error = int(self.ntdll.RtlNtStatusToDosError(status))
             if error in {ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS}:
                 raise FileExistsError(error, "The export destination already exists")
             raise OSError(

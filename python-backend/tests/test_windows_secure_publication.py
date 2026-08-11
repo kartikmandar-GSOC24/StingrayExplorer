@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import subprocess
 import time
@@ -22,9 +23,13 @@ from services.utility_helpers import (
     verify_file_grant,
 )
 from services.windows_secure_fs import (
+    FILE_RENAME_INFORMATION_CLASS,
     WINDOWS_FILE_GRANT_VERSION,
     WindowsFileIdentity,
     WindowsNativeApi,
+    _build_file_rename_information,
+    _FILE_RENAME_INFORMATION,
+    _FILE_RENAME_OPERATION,
     canonicalize_windows_path,
     pin_windows_path,
     validate_windows_path_text,
@@ -63,6 +68,81 @@ def test_windows_path_canonicalizes_drive_case_and_separators():
     assert str(canonical) == r"C:\Science\Events.fits"
     assert str(canonicalize_windows_path("d:/artifact.bin")) == r"D:\artifact.bin"
     assert str(canonicalize_windows_path("e:/")) == "E:\\"
+
+
+def test_windows_native_rename_buffer_matches_file_rename_information_abi():
+    pointer_size = ctypes.sizeof(ctypes.c_void_p)
+    assert ctypes.sizeof(_FILE_RENAME_OPERATION) == 4
+    assert _FILE_RENAME_INFORMATION.RootDirectory.offset == (
+        8 if pointer_size == 8 else 4
+    )
+    assert _FILE_RENAME_INFORMATION.FileNameLength.offset == (
+        16 if pointer_size == 8 else 8
+    )
+    assert _FILE_RENAME_INFORMATION.FileName.offset == (20 if pointer_size == 8 else 12)
+    assert ctypes.sizeof(_FILE_RENAME_INFORMATION) == (24 if pointer_size == 8 else 16)
+
+    parent_handle = 0x01020304 if pointer_size == 4 else 0x0102030405060708
+    filename = "artifact.bin"
+    encoded_name = filename.encode("utf-16-le")
+    buffer, buffer_size = _build_file_rename_information(parent_handle, filename)
+    raw = bytes(buffer)
+
+    assert FILE_RENAME_INFORMATION_CLASS == 10
+    assert buffer_size == ctypes.sizeof(_FILE_RENAME_INFORMATION) + len(encoded_name)
+    assert raw[:4] == b"\0" * 4
+    root_offset = _FILE_RENAME_INFORMATION.RootDirectory.offset
+    assert int.from_bytes(raw[root_offset : root_offset + pointer_size], "little") == (
+        parent_handle
+    )
+    length_offset = _FILE_RENAME_INFORMATION.FileNameLength.offset
+    assert int.from_bytes(raw[length_offset : length_offset + 4], "little") == len(
+        encoded_name
+    )
+    name_offset = _FILE_RENAME_INFORMATION.FileName.offset
+    assert raw[name_offset : name_offset + len(encoded_name)] == encoded_name
+
+
+def test_windows_native_rename_uses_nt_class_10_and_relative_parent_handle():
+    captured: dict[str, object] = {}
+
+    class FakeNtdll:
+        def NtSetInformationFile(
+            self,
+            handle,
+            io_status,
+            buffer,
+            buffer_size,
+            information_class,
+        ):
+            captured["handle"] = handle.value
+            captured["io_status"] = io_status
+            captured["buffer"] = bytes(buffer)
+            captured["buffer_size"] = buffer_size
+            captured["information_class"] = information_class
+            return 0
+
+        def RtlNtStatusToDosError(self, status):
+            raise AssertionError(
+                f"Successful NT status was unexpectedly mapped: {status}"
+            )
+
+    api = object.__new__(WindowsNativeApi)
+    api.ntdll = FakeNtdll()
+    parent_handle = 0x1234
+    filename = "artifact.bin"
+    api.rename_no_replace(0x5678, parent_handle, filename)
+
+    assert captured["handle"] == 0x5678
+    assert captured["information_class"] == FILE_RENAME_INFORMATION_CLASS
+    assert captured["buffer_size"] == len(captured["buffer"])
+    raw = captured["buffer"]
+    assert isinstance(raw, bytes)
+    pointer_size = ctypes.sizeof(ctypes.c_void_p)
+    root_offset = _FILE_RENAME_INFORMATION.RootDirectory.offset
+    assert int.from_bytes(raw[root_offset : root_offset + pointer_size], "little") == (
+        parent_handle
+    )
 
 
 @pytest.mark.parametrize(
