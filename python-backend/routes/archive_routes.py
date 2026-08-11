@@ -73,7 +73,7 @@ async def _run_bounded_archive_search(
     service: ArchiveService,
     operation: Callable[[], dict[str, Any]],
 ) -> dict[str, Any]:
-    """Run synchronous astroquery work off-loop under process-wide capacity."""
+    """Run synchronous archive transport and parsing off-loop under capacity."""
     capacity = ARCHIVE_SEARCH_CAPACITY
     if not capacity.acquire(blocking=False):
         return service.create_result(
