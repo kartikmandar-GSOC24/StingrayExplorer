@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote_to_bytes, urlsplit
 
+import requests
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 
@@ -63,9 +64,39 @@ MAX_ARCHIVE_ENTRY_NAME_CHARS = 255
 MAX_ARCHIVE_ENTRY_HREF_CHARS = 1_024
 ARCHIVE_CRAWL_TOTAL_SECONDS = 120.0
 ARCHIVE_CRAWL_HOP_SECONDS = 30.0
+MAX_ARCHIVE_SEARCH_REMOTE_ROWS = 5_000
+MAX_ARCHIVE_OBSID_REMOTE_ROWS = 10
+ARCHIVE_SEARCH_CONNECT_TIMEOUT_SECONDS = 10.0
+ARCHIVE_SEARCH_READ_TIMEOUT_SECONDS = 30.0
 ARCHIVE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 ARCHIVE_PROPOSAL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 CancellationCheck = Callable[[], bool | None | Awaitable[bool | None]]
+
+
+class ArchiveSearchSession(requests.Session):
+    """Apply finite connect/read timeouts to astroquery's TAP requests."""
+
+    def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = (
+                ARCHIVE_SEARCH_CONNECT_TIMEOUT_SECONDS,
+                ARCHIVE_SEARCH_READ_TIMEOUT_SECONDS,
+            )
+        return super().request(method, url, **kwargs)
+
+
+@contextmanager
+def _open_heasarc_client() -> Generator[Any, None, None]:
+    """Create one isolated HEASARC client with a bounded HTTP session."""
+    from astroquery.heasarc.core import HeasarcClass
+
+    client = HeasarcClass()
+    session = ArchiveSearchSession()
+    client._set_session(session)
+    try:
+        yield client
+    finally:
+        session.close()
 
 
 class ArchiveDownloadBusyError(RuntimeError):
@@ -705,9 +736,6 @@ class ArchiveService(BaseService):
             Result dictionary with observations
         """
         try:
-            # Import here to avoid startup delay
-            from astroquery.heasarc import Heasarc
-
             # Validate mission
             if mission not in SUPPORTED_CATALOGS:
                 return self.create_result(
@@ -732,11 +760,14 @@ class ArchiveService(BaseService):
 
             # Query HEASARC
             try:
-                table = Heasarc.query_region(
-                    coords,
-                    catalog=catalog_name,
-                    radius=radius * u.deg,
-                )
+                with _open_heasarc_client() as heasarc:
+                    table = heasarc.query_region(
+                        coords,
+                        catalog=catalog_name,
+                        radius=radius * u.deg,
+                        columns="*",
+                        maxrec=MAX_ARCHIVE_SEARCH_REMOTE_ROWS,
+                    )
             except Exception as e:
                 return self.create_result(
                     success=False,
@@ -803,9 +834,6 @@ class ArchiveService(BaseService):
             Result dictionary with observations
         """
         try:
-            # Import here to avoid startup delay
-            from astroquery.heasarc import Heasarc
-
             # Validate mission
             if mission not in SUPPORTED_CATALOGS:
                 return self.create_result(
@@ -823,11 +851,14 @@ class ArchiveService(BaseService):
 
             # Query HEASARC
             try:
-                table = Heasarc.query_region(
-                    coords,
-                    catalog=catalog_name,
-                    radius=radius * u.deg,
-                )
+                with _open_heasarc_client() as heasarc:
+                    table = heasarc.query_region(
+                        coords,
+                        catalog=catalog_name,
+                        radius=radius * u.deg,
+                        columns="*",
+                        maxrec=MAX_ARCHIVE_SEARCH_REMOTE_ROWS,
+                    )
             except Exception as e:
                 return self.create_result(
                     success=False,
@@ -887,8 +918,6 @@ class ArchiveService(BaseService):
             Result dictionary with observations
         """
         try:
-            from astroquery.heasarc import Heasarc
-
             # Validate mission
             if mission not in SUPPORTED_CATALOGS:
                 return self.create_result(
@@ -914,8 +943,12 @@ class ArchiveService(BaseService):
             adql = f"SELECT * FROM {catalog_name} WHERE obsid = '{safe_obsid}'"
 
             try:
-                tap_result = Heasarc.query_tap(adql, maxrec=10)
-                table = tap_result.to_table()
+                with _open_heasarc_client() as heasarc:
+                    tap_result = heasarc.query_tap(
+                        adql,
+                        maxrec=MAX_ARCHIVE_OBSID_REMOTE_ROWS,
+                    )
+                    table = tap_result.to_table()
             except Exception as e:
                 return self.create_result(
                     success=False,

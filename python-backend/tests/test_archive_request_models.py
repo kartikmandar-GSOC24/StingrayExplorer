@@ -37,7 +37,7 @@ def test_valid_archive_search_requests_keep_supported_behavior():
             "ra": 0.0,
             "dec": -90.0,
             "mission": "NuSTAR",
-            "radius": 180.0,
+            "radius": 10.0,
             "max_results": 1_000,
             "min_exposure": 1_000_000_000.0,
         }
@@ -73,6 +73,10 @@ def test_valid_archive_search_requests_keep_supported_behavior():
         (
             SearchByNameRequest,
             {"source_name": "Crab", "mission": "NICER", "radius": 0.0},
+        ),
+        (
+            SearchByNameRequest,
+            {"source_name": "Crab", "mission": "NICER", "radius": 10.1},
         ),
         (
             SearchByNameRequest,

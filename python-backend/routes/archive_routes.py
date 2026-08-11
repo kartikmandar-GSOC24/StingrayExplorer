@@ -5,10 +5,13 @@ Provides endpoints for searching NASA's HEASARC archive and downloading
 X-ray observation data with progress tracking.
 """
 
+import asyncio
 import json
+import threading
 from contextlib import aclosing
 from datetime import date
-from typing import Annotated, Literal, Optional, Tuple
+from functools import partial
+from typing import Annotated, Any, Callable, Literal, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Path, Request
 from fastapi.responses import StreamingResponse
@@ -44,6 +47,64 @@ ArchiveMission = Literal[
     "XRISM",
     "Hitomi",
 ]
+MAX_CONCURRENT_ARCHIVE_SEARCHES = 2
+ARCHIVE_SEARCH_RESPONSE_TIMEOUT_SECONDS = 35.0
+ARCHIVE_SEARCH_CAPACITY = threading.BoundedSemaphore(MAX_CONCURRENT_ARCHIVE_SEARCHES)
+
+
+def _execute_archive_search(
+    operation: Callable[[], dict[str, Any]],
+    capacity: threading.BoundedSemaphore,
+) -> dict[str, Any]:
+    try:
+        return operation()
+    finally:
+        capacity.release()
+
+
+def _consume_background_search(task: asyncio.Task[dict[str, Any]]) -> None:
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+async def _run_bounded_archive_search(
+    service: ArchiveService,
+    operation: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    """Run synchronous astroquery work off-loop under process-wide capacity."""
+    capacity = ARCHIVE_SEARCH_CAPACITY
+    if not capacity.acquire(blocking=False):
+        return service.create_result(
+            success=False,
+            data=None,
+            message="Too many archive searches are already active",
+            error="Archive search capacity is temporarily unavailable",
+        )
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(_execute_archive_search, operation, capacity)
+    )
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(worker),
+            timeout=ARCHIVE_SEARCH_RESPONSE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        # The underlying synchronous library cannot be interrupted safely. It
+        # retains its capacity slot until the bounded-session worker actually
+        # exits, while the request receives a finite response wait.
+        worker.add_done_callback(_consume_background_search)
+        return service.create_result(
+            success=False,
+            data=None,
+            message="The archive search timed out",
+            error="The bounded archive search deadline expired",
+        )
+    except asyncio.CancelledError:
+        worker.add_done_callback(_consume_background_search)
+        raise
 
 
 def _validate_iso_date(value: Optional[str]) -> Optional[str]:
@@ -115,7 +176,7 @@ class SearchByNameRequest(BaseModel):
 
     source_name: str = Field(min_length=1, max_length=256)
     mission: ArchiveMission
-    radius: float = Field(default=0.5, gt=0.0, le=180.0)
+    radius: float = Field(default=0.5, gt=0.0, le=10.0)
     max_results: int = Field(default=100, ge=1, le=1_000)
     min_exposure: Optional[float] = Field(
         default=None,
@@ -147,7 +208,7 @@ class SearchByCoordinatesRequest(BaseModel):
     ra: float = Field(ge=0.0, le=360.0)
     dec: float = Field(ge=-90.0, le=90.0)
     mission: ArchiveMission
-    radius: float = Field(default=0.5, gt=0.0, le=180.0)
+    radius: float = Field(default=0.5, gt=0.0, le=10.0)
     max_results: int = Field(default=100, ge=1, le=1_000)
     min_exposure: Optional[float] = Field(
         default=None,
@@ -252,13 +313,17 @@ async def search_by_name(
         max_results: Maximum number of results (default: 100)
     """
     time_range = _iso_dates_to_mjd_range(request.start_date, request.end_date)
-    return service.search_by_name(
-        source_name=request.source_name,
-        mission=request.mission,
-        radius=request.radius,
-        max_results=request.max_results,
-        min_exposure=request.min_exposure,
-        time_range=time_range,
+    return await _run_bounded_archive_search(
+        service,
+        partial(
+            service.search_by_name,
+            source_name=request.source_name,
+            mission=request.mission,
+            radius=request.radius,
+            max_results=request.max_results,
+            min_exposure=request.min_exposure,
+            time_range=time_range,
+        ),
     )
 
 
@@ -278,14 +343,18 @@ async def search_by_coordinates(
         max_results: Maximum number of results (default: 100)
     """
     time_range = _iso_dates_to_mjd_range(request.start_date, request.end_date)
-    return service.search_by_coordinates(
-        ra=request.ra,
-        dec=request.dec,
-        mission=request.mission,
-        radius=request.radius,
-        max_results=request.max_results,
-        min_exposure=request.min_exposure,
-        time_range=time_range,
+    return await _run_bounded_archive_search(
+        service,
+        partial(
+            service.search_by_coordinates,
+            ra=request.ra,
+            dec=request.dec,
+            mission=request.mission,
+            radius=request.radius,
+            max_results=request.max_results,
+            min_exposure=request.min_exposure,
+            time_range=time_range,
+        ),
     )
 
 
@@ -304,9 +373,13 @@ async def search_by_obsid(
         obsid: Observation ID (e.g., "4010080142")
         mission: Mission to search (e.g., "NICER", "NuSTAR")
     """
-    return service.search_by_obsid(
-        obsid=request.obsid,
-        mission=request.mission,
+    return await _run_bounded_archive_search(
+        service,
+        partial(
+            service.search_by_obsid,
+            obsid=request.obsid,
+            mission=request.mission,
+        ),
     )
 
 
