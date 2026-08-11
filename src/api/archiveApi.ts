@@ -111,8 +111,10 @@ export interface DownloadToDiskProgressEvent {
 
 export interface DownloadToDiskCompleteEvent {
   type: 'complete';
-  file_path: string;
+  file_name: string;
   size_bytes: number;
+  sha256: string;
+  warnings: string[];
 }
 
 export interface DownloadToDiskErrorEvent {
@@ -124,6 +126,72 @@ export type DownloadToDiskEvent =
   | DownloadToDiskProgressEvent
   | DownloadToDiskCompleteEvent
   | DownloadToDiskErrorEvent;
+
+const isFiniteNonNegativeNumber = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value >= 0;
+
+const parseDownloadEvent = (value: unknown): DownloadToDiskEvent => {
+  if (!value || typeof value !== 'object') {
+    throw new Error('Malformed download progress response');
+  }
+  const event = value as Record<string, unknown>;
+  if (event.type === 'progress') {
+    if (
+      !isFiniteNonNegativeNumber(event.bytes_downloaded) ||
+      !isFiniteNonNegativeNumber(event.total_bytes) ||
+      !isFiniteNonNegativeNumber(event.percent) ||
+      event.percent > 100
+    ) {
+      throw new Error('Malformed download progress response');
+    }
+    return {
+      type: 'progress',
+      bytes_downloaded: event.bytes_downloaded,
+      total_bytes: event.total_bytes,
+      percent: event.percent,
+    };
+  }
+  if (event.type === 'complete') {
+    if (
+      typeof event.file_name !== 'string' ||
+      event.file_name.length < 1 ||
+      event.file_name.length > 512 ||
+      event.file_name === '.' ||
+      event.file_name === '..' ||
+      event.file_name.includes('/') ||
+      event.file_name.includes('\\') ||
+      Array.from(event.file_name).some((character) => {
+        const codePoint = character.codePointAt(0) ?? 0;
+        return codePoint < 0x20 || codePoint === 0x7f;
+      }) ||
+      !isFiniteNonNegativeNumber(event.size_bytes) ||
+      typeof event.sha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(event.sha256) ||
+      !Array.isArray(event.warnings) ||
+      event.warnings.some(
+        (warning) => typeof warning !== 'string' || warning.length > 1_024
+      )
+    ) {
+      throw new Error('Malformed download progress response');
+    }
+    return {
+      type: 'complete',
+      file_name: event.file_name,
+      size_bytes: event.size_bytes,
+      sha256: event.sha256,
+      warnings: [...(event.warnings as string[])],
+    };
+  }
+  if (
+    event.type === 'error' &&
+    typeof event.error === 'string' &&
+    event.error.length > 0 &&
+    event.error.length <= 1_024
+  ) {
+    return { type: 'error', error: event.error };
+  }
+  throw new Error('Malformed download progress response');
+};
 
 // API functions
 export const archiveApi = {
@@ -240,16 +308,20 @@ export const archiveApi = {
   /**
    * Download a file from URL to local disk with SSE progress streaming.
    *
-   * This function routes the download through the backend to bypass CORS
-   * restrictions. Progress is streamed as SSE events.
+   * This function routes the download through the authenticated backend so its
+   * HEASARC source policy, bounds, and secure publication rules are enforced.
+   * Progress is streamed as SSE events.
    *
    * @param params.url - URL to download from (e.g., HEASARC HTTPS URL)
-   * @param params.save_path - Local path to save the file
+   * @param params.destination_path - Exact native-selected destination
+   * @param params.destination_grant - Short-lived backend-verifiable write grant
    * @yields DownloadToDiskEvent - Progress, complete, or error events
    */
   async *downloadToDiskSSE(params: {
     url: string;
-    save_path: string;
+    destination_path: string;
+    destination_grant: string;
+    signal?: AbortSignal;
   }): AsyncGenerator<DownloadToDiskEvent, void, unknown> {
     const port = await apiClient.getPort();
     const endpointUrl = `http://127.0.0.1:${port}/api/archive/download-to-disk`;
@@ -259,8 +331,10 @@ export const archiveApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         url: params.url,
-        save_path: params.save_path,
+        destination_path: params.destination_path,
+        destination_grant: params.destination_grant,
       }),
+      signal: params.signal,
     });
 
     if (!response.ok) {
@@ -290,10 +364,9 @@ export const archiveApi = {
           if (line.startsWith('data: ')) {
             const jsonStr = line.slice(6);
             try {
-              const event = JSON.parse(jsonStr) as DownloadToDiskEvent;
-              yield event;
-            } catch (parseError) {
-              console.error('Failed to parse SSE event:', parseError, jsonStr);
+              yield parseDownloadEvent(JSON.parse(jsonStr));
+            } catch {
+              throw new Error('Malformed download progress response');
             }
           }
         }
@@ -304,14 +377,14 @@ export const archiveApi = {
         const jsonStr = buffer.slice(6).trim();
         if (jsonStr) {
           try {
-            const event = JSON.parse(jsonStr) as DownloadToDiskEvent;
-            yield event;
-          } catch (parseError) {
-            console.error('Failed to parse final SSE event:', parseError, jsonStr);
+            yield parseDownloadEvent(JSON.parse(jsonStr));
+          } catch {
+            throw new Error('Malformed download progress response');
           }
         }
       }
     } finally {
+      await reader.cancel().catch(() => undefined);
       reader.releaseLock();
     }
   },

@@ -6,18 +6,229 @@ and download data with progress tracking.
 """
 
 import asyncio
+import hashlib
+import inspect
+import math
 import os
+import queue
 import re
-import tempfile
+import threading
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote, unquote_to_bytes, urlsplit
 
-import httpx
 from astropy import units as u
 from astropy.coordinates import SkyCoord
-from stingray import EventList
 
 from .base_service import BaseService
+from .remote_source import (
+    HEASARC_ARCHIVE_POLICY,
+    RemoteSourceCancelled,
+    RemoteSourceClient,
+    RemoteSourceError,
+    RemoteSourceHTTPError,
+    RemoteSourcePolicyError,
+    RemoteSourceTimeout,
+    RemoteTimeouts,
+)
+from .secure_publication import SecurePublication, open_secure_publication
+
+MAX_ARCHIVE_DOWNLOAD_BYTES = 20 * 1024**3
+MAX_CONCURRENT_ARCHIVE_DOWNLOADS = 2
+MAX_AGGREGATE_ARCHIVE_DOWNLOAD_BYTES = (
+    MAX_CONCURRENT_ARCHIVE_DOWNLOADS * MAX_ARCHIVE_DOWNLOAD_BYTES
+)
+ARCHIVE_DOWNLOAD_CHUNK_BYTES = 256 * 1024
+ARCHIVE_DOWNLOAD_TIMEOUTS = RemoteTimeouts(
+    connect=10.0,
+    read=60.0,
+    write=10.0,
+    pool=5.0,
+    total=3600.0,
+)
+ARCHIVE_STAGING_WARNING = (
+    "Download completed, but private staging cleanup could not be confirmed."
+)
+ARCHIVE_VERIFICATION_CANCEL_POLL_SECONDS = 0.05
+ARCHIVE_WRITER_QUEUE_CHUNKS = 2
+MAX_ARCHIVE_DIRECTORY_HTML_BYTES = 2 * 1024**2
+MAX_ARCHIVE_DIRECTORY_ENTRIES = 1_000
+MAX_ARCHIVE_CRAWL_ENTRIES = 5_000
+MAX_ARCHIVE_CRAWL_DIRECTORIES = 64
+MAX_ARCHIVE_CRAWL_DEPTH = 3
+MAX_ARCHIVE_ENTRY_NAME_CHARS = 255
+MAX_ARCHIVE_ENTRY_HREF_CHARS = 1_024
+ARCHIVE_CRAWL_TOTAL_SECONDS = 120.0
+ARCHIVE_CRAWL_HOP_SECONDS = 30.0
+ARCHIVE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+ARCHIVE_PROPOSAL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+CancellationCheck = Callable[[], bool | None | Awaitable[bool | None]]
+
+
+class ArchiveDownloadBusyError(RuntimeError):
+    """The exact destination is already owned by an active download."""
+
+
+class ArchiveDownloadCapacityError(RuntimeError):
+    """The process-wide bounded archive-download capacity is occupied."""
+
+
+class ArchiveArtifactWriter:
+    """Own the staging writer and its flush/fsync lifecycle off the event loop."""
+
+    _SENTINEL = object()
+
+    def __init__(self, publication: SecurePublication) -> None:
+        self._publication = publication
+        self._queue: queue.Queue[bytes | object] = queue.Queue(
+            maxsize=ARCHIVE_WRITER_QUEUE_CHUNKS
+        )
+        self._cancel = threading.Event()
+        self._done = threading.Event()
+        self._exception: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="archive-artifact-writer",
+            daemon=False,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            with self._publication.open_writer("wb", encoding=None) as writer:
+                while True:
+                    if self._cancel.is_set():
+                        raise RemoteSourceCancelled("Archive write was cancelled")
+                    try:
+                        item = self._queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if item is self._SENTINEL:
+                        break
+                    writer.write(item)
+                    if self._cancel.is_set():
+                        raise RemoteSourceCancelled("Archive write was cancelled")
+        except BaseException as error:
+            self._exception = error
+        finally:
+            self._done.set()
+
+    def _raise_worker_failure(self) -> None:
+        error = self._exception
+        if error is None:
+            return
+        if isinstance(error, Exception):
+            raise error
+        raise RuntimeError("The archive writer terminated unexpectedly")
+
+    async def _put(
+        self,
+        item: bytes | object,
+        cancellation_check: CancellationCheck | None,
+    ) -> None:
+        while True:
+            if self._done.is_set():
+                self._thread.join()
+                self._raise_worker_failure()
+                raise RuntimeError("The archive writer stopped unexpectedly")
+            await ArchiveService._raise_if_download_cancelled(cancellation_check)
+            try:
+                self._queue.put_nowait(item)
+                return
+            except queue.Full:
+                await asyncio.sleep(0.01)
+
+    async def write(
+        self,
+        chunk: bytes,
+        cancellation_check: CancellationCheck | None,
+    ) -> None:
+        await self._put(chunk, cancellation_check)
+
+    async def finish(
+        self,
+        cancellation_check: CancellationCheck | None,
+    ) -> None:
+        await self._put(self._SENTINEL, cancellation_check)
+        while not self._done.is_set():
+            await ArchiveService._raise_if_download_cancelled(cancellation_check)
+            await asyncio.sleep(0.01)
+        self._thread.join()
+        self._raise_worker_failure()
+
+    async def abort_and_join(self) -> None:
+        """Signal cancellation and defer teardown until writer ownership ends."""
+        self._cancel.set()
+        while not self._done.is_set():
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                continue
+        self._thread.join()
+
+
+class ArchiveDownloadCoordinator:
+    """Fail-fast process-wide claims for bounded archive download resources."""
+
+    def __init__(self, maximum_active: int) -> None:
+        self._maximum_active = maximum_active
+        self._lock = threading.Lock()
+        self._active_destinations: set[bytes] = set()
+
+    @contextmanager
+    def claim(self, destination_key: bytes) -> Generator[None, None, None]:
+        with self._lock:
+            if destination_key in self._active_destinations:
+                raise ArchiveDownloadBusyError
+            if len(self._active_destinations) >= self._maximum_active:
+                raise ArchiveDownloadCapacityError
+            self._active_destinations.add(destination_key)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active_destinations.discard(destination_key)
+
+
+ARCHIVE_DOWNLOAD_COORDINATOR = ArchiveDownloadCoordinator(
+    MAX_CONCURRENT_ARCHIVE_DOWNLOADS
+)
+
+
+@dataclass
+class ArchiveCrawlBudget:
+    """Shared total-time, directory, and entry budget for one crawl."""
+
+    deadline: float
+    directories: int = 0
+    entries: int = 0
+
+    def remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise RemoteSourceTimeout("The archive directory crawl timed out")
+        return remaining
+
+    def begin_directory(self) -> None:
+        self.remaining()
+        self.directories += 1
+        if self.directories > MAX_ARCHIVE_CRAWL_DIRECTORIES:
+            raise RemoteSourceError("The archive directory crawl is too large")
+
+    def add_entries(self, count: int) -> None:
+        self.remaining()
+        if count > MAX_ARCHIVE_DIRECTORY_ENTRIES:
+            raise RemoteSourceError("An archive directory contains too many entries")
+        self.entries += count
+        if self.entries > MAX_ARCHIVE_CRAWL_ENTRIES:
+            raise RemoteSourceError(
+                "The archive directory crawl contains too many entries"
+            )
 
 
 # Supported HEASARC catalogs for X-ray missions
@@ -165,9 +376,28 @@ class ArchiveService(BaseService):
 
         # Column mapping varies by catalog - try common column names
         # HEASARC returns lowercase column names from astroquery
-        obsid_cols = ["obsid", "obs_id", "observation_id", "seq_num", "sequence_number",
-                      "OBSID", "OBS_ID", "OBSERVATION_ID", "SEQ_NUM", "SEQUENCE_NUMBER"]
-        name_cols = ["name", "target_name", "object", "src_name", "NAME", "TARGET_NAME", "OBJECT", "SRC_NAME"]
+        obsid_cols = [
+            "obsid",
+            "obs_id",
+            "observation_id",
+            "seq_num",
+            "sequence_number",
+            "OBSID",
+            "OBS_ID",
+            "OBSERVATION_ID",
+            "SEQ_NUM",
+            "SEQUENCE_NUMBER",
+        ]
+        name_cols = [
+            "name",
+            "target_name",
+            "object",
+            "src_name",
+            "NAME",
+            "TARGET_NAME",
+            "OBJECT",
+            "SRC_NAME",
+        ]
         ra_cols = ["ra", "ra_obj", "ra_pnt", "RA", "RA_OBJ", "RA_PNT"]
         dec_cols = ["dec", "dec_obj", "dec_pnt", "DEC", "DEC_OBJ", "DEC_PNT"]
         # Mission-specific exposure columns:
@@ -181,33 +411,71 @@ class ArchiveService(BaseService):
             # For Swift, prefer xrt_exposure first (X-ray timing), then
             # fall back to bat_exposure (BAT-only triggers have 0 XRT exposure)
             exposure_cols = [
-                "xrt_exposure", "XRT_EXPOSURE",
-                "bat_exposure", "BAT_EXPOSURE",
-                "uvot_exposure", "UVOT_EXPOSURE",
-                "exposure", "duration", "ontime", "livetime",
-                "EXPOSURE", "DURATION", "ONTIME", "LIVETIME",
+                "xrt_exposure",
+                "XRT_EXPOSURE",
+                "bat_exposure",
+                "BAT_EXPOSURE",
+                "uvot_exposure",
+                "UVOT_EXPOSURE",
+                "exposure",
+                "duration",
+                "ontime",
+                "livetime",
+                "EXPOSURE",
+                "DURATION",
+                "ONTIME",
+                "LIVETIME",
             ]
         elif catalog_name == "IXPE":
             # IXPE has per-detector-unit exposures: exposure_1, exposure_2, exposure_3
             # The main "exposure" column also exists
             exposure_cols = [
-                "exposure", "exposure_1", "exposure_2", "exposure_3",
-                "ontime_1", "ontime_2", "ontime_3",
-                "EXPOSURE", "EXPOSURE_1", "EXPOSURE_2", "EXPOSURE_3",
+                "exposure",
+                "exposure_1",
+                "exposure_2",
+                "exposure_3",
+                "ontime_1",
+                "ontime_2",
+                "ontime_3",
+                "EXPOSURE",
+                "EXPOSURE_1",
+                "EXPOSURE_2",
+                "EXPOSURE_3",
             ]
         else:
             exposure_cols = [
-                "exposure", "exposure_a", "duration",
-                "ontime", "livetime", "good_time", "xrt_exposure",
-                "EXPOSURE", "EXPOSURE_A", "DURATION",
-                "ONTIME", "LIVETIME", "GOOD_TIME", "XRT_EXPOSURE",
+                "exposure",
+                "exposure_a",
+                "duration",
+                "ontime",
+                "livetime",
+                "good_time",
+                "xrt_exposure",
+                "EXPOSURE",
+                "EXPOSURE_A",
+                "DURATION",
+                "ONTIME",
+                "LIVETIME",
+                "GOOD_TIME",
+                "XRT_EXPOSURE",
             ]
-        time_cols = ["time", "start_time", "date_obs", "tstart", "TIME", "START_TIME", "DATE_OBS", "TSTART"]
+        time_cols = [
+            "time",
+            "start_time",
+            "date_obs",
+            "tstart",
+            "TIME",
+            "START_TIME",
+            "DATE_OBS",
+            "TSTART",
+        ]
 
         # Get table column names once
         table_cols = set(table.colnames)
 
-        def get_column_value(row: Any, col_names: List[str], default: Any = None) -> Any:
+        def get_column_value(
+            row: Any, col_names: List[str], default: Any = None
+        ) -> Any:
             """Get value from first matching column."""
             for col in col_names:
                 if col in table_cols:
@@ -232,7 +500,9 @@ class ArchiveService(BaseService):
                     "name": str(get_column_value(row, name_cols, "Unknown")),
                     "ra": _to_python_float(get_column_value(row, ra_cols)),
                     "dec": _to_python_float(get_column_value(row, dec_cols)),
-                    "exposure": _to_python_float(get_column_value(row, exposure_cols, 0)),
+                    "exposure": _to_python_float(
+                        get_column_value(row, exposure_cols, 0)
+                    ),
                     "time": str(get_column_value(row, time_cols, "")),
                     "catalog": catalog_name,
                 }
@@ -263,9 +533,15 @@ class ArchiveService(BaseService):
                     ixpe_du1_cols = ["exposure_1", "EXPOSURE_1"]
                     ixpe_du2_cols = ["exposure_2", "EXPOSURE_2"]
                     ixpe_du3_cols = ["exposure_3", "EXPOSURE_3"]
-                    obs["exposure_du1"] = _to_python_float(get_column_value(row, ixpe_du1_cols))
-                    obs["exposure_du2"] = _to_python_float(get_column_value(row, ixpe_du2_cols))
-                    obs["exposure_du3"] = _to_python_float(get_column_value(row, ixpe_du3_cols))
+                    obs["exposure_du1"] = _to_python_float(
+                        get_column_value(row, ixpe_du1_cols)
+                    )
+                    obs["exposure_du2"] = _to_python_float(
+                        get_column_value(row, ixpe_du2_cols)
+                    )
+                    obs["exposure_du3"] = _to_python_float(
+                        get_column_value(row, ixpe_du3_cols)
+                    )
 
                 # NICER: Include processing status and number of FPMs
                 if catalog_name == "NICER":
@@ -281,9 +557,15 @@ class ArchiveService(BaseService):
                     exp_b_cols = ["exposure_b", "EXPOSURE_B"]
                     obs_mode_cols = ["observation_mode", "OBSERVATION_MODE"]
                     issue_cols = ["issue_flag", "ISSUE_FLAG"]
-                    obs["exposure_b"] = _to_python_float(get_column_value(row, exp_b_cols))
-                    obs["observation_mode"] = str(get_column_value(row, obs_mode_cols, ""))
-                    obs["issue_flag"] = _to_python_int(get_column_value(row, issue_cols))
+                    obs["exposure_b"] = _to_python_float(
+                        get_column_value(row, exp_b_cols)
+                    )
+                    obs["observation_mode"] = str(
+                        get_column_value(row, obs_mode_cols, "")
+                    )
+                    obs["issue_flag"] = _to_python_int(
+                        get_column_value(row, issue_cols)
+                    )
 
                 # XMM-Newton: Include per-instrument exposures, modes, and status
                 # query_region() returns: status, data_in_heasarc (always available)
@@ -298,14 +580,22 @@ class ArchiveService(BaseService):
                     mos2_mode_cols = ["mos2_mode", "MOS2_MODE"]
                     status_cols = ["status", "STATUS"]
                     data_avail_cols = ["data_in_heasarc", "DATA_IN_HEASARC"]
-                    obs["pn_time"] = _to_python_float(get_column_value(row, pn_time_cols))
+                    obs["pn_time"] = _to_python_float(
+                        get_column_value(row, pn_time_cols)
+                    )
                     obs["pn_mode"] = str(get_column_value(row, pn_mode_cols, ""))
-                    obs["mos1_time"] = _to_python_float(get_column_value(row, mos1_time_cols))
+                    obs["mos1_time"] = _to_python_float(
+                        get_column_value(row, mos1_time_cols)
+                    )
                     obs["mos1_mode"] = str(get_column_value(row, mos1_mode_cols, ""))
-                    obs["mos2_time"] = _to_python_float(get_column_value(row, mos2_time_cols))
+                    obs["mos2_time"] = _to_python_float(
+                        get_column_value(row, mos2_time_cols)
+                    )
                     obs["mos2_mode"] = str(get_column_value(row, mos2_mode_cols, ""))
                     obs["xmm_status"] = str(get_column_value(row, status_cols, ""))
-                    obs["data_in_heasarc"] = str(get_column_value(row, data_avail_cols, ""))
+                    obs["data_in_heasarc"] = str(
+                        get_column_value(row, data_avail_cols, "")
+                    )
 
                 # Chandra: Include detector, grating, status
                 if catalog_name == "Chandra":
@@ -314,7 +604,9 @@ class ArchiveService(BaseService):
                     chandra_status_cols = ["status", "STATUS"]
                     obs["detector"] = str(get_column_value(row, detector_cols, ""))
                     obs["grating"] = str(get_column_value(row, grating_cols, ""))
-                    obs["chandra_status"] = str(get_column_value(row, chandra_status_cols, ""))
+                    obs["chandra_status"] = str(
+                        get_column_value(row, chandra_status_cols, "")
+                    )
 
                 # RXTE: Include proposal number for directory lookup
                 prnb = get_column_value(row, prnb_cols)
@@ -352,8 +644,14 @@ class ArchiveService(BaseService):
 
         if min_exposure is not None:
             exposure_col = None
-            for col in ["exposure", "exposure_a", "duration", "ontime",
-                        "xrt_exposure", "bat_exposure"]:
+            for col in [
+                "exposure",
+                "exposure_a",
+                "duration",
+                "ontime",
+                "xrt_exposure",
+                "bat_exposure",
+            ]:
                 if col in table.colnames:
                     exposure_col = col
                     break
@@ -373,8 +671,7 @@ class ArchiveService(BaseService):
                 try:
                     mjd_start, mjd_end = time_range
                     table = table[
-                        (table[time_col] >= mjd_start)
-                        & (table[time_col] <= mjd_end)
+                        (table[time_col] >= mjd_start) & (table[time_col] <= mjd_end)
                     ]
                 except Exception:
                     pass
@@ -724,163 +1021,215 @@ class ArchiveService(BaseService):
         """
         urls = {}
 
-        # Base HEASARC FTP/HTTPS URL
-        base_url = "https://heasarc.gsfc.nasa.gov/FTP"
-
         if mission == "NICER":
             # NICER data path: /nicer/data/obs/YYYY_MM/OBSID/
             # We can't know the exact date folder without more info
             # But we can construct a search URL
-            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dnicermastr&obsid={obsid}"
+            urls["browse"] = (
+                f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dnicermastr&obsid={obsid}"
+            )
 
         elif mission == "NuSTAR":
-            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dnumaster&obsid={obsid}"
+            urls["browse"] = (
+                f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dnumaster&obsid={obsid}"
+            )
 
         elif mission == "XMM-Newton":
-            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dxmmmaster&obsid={obsid}"
+            urls["browse"] = (
+                f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dxmmmaster&obsid={obsid}"
+            )
 
         elif mission == "Chandra":
-            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dchanmaster&obsid={obsid}"
+            urls["browse"] = (
+                f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dchanmaster&obsid={obsid}"
+            )
 
         elif mission == "Swift":
-            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dswiftmastr&obsid={obsid}"
+            urls["browse"] = (
+                f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dswiftmastr&obsid={obsid}"
+            )
 
         elif mission == "RXTE":
-            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dxtemaster&obsid={obsid}"
+            urls["browse"] = (
+                f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dxtemaster&obsid={obsid}"
+            )
 
         elif mission == "IXPE":
-            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dixmaster&obsid={obsid}"
+            urls["browse"] = (
+                f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dixmaster&obsid={obsid}"
+            )
 
         elif mission == "Suzaku":
-            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dsuzamaster&obsid={obsid}"
+            urls["browse"] = (
+                f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dsuzamaster&obsid={obsid}"
+            )
 
         elif mission == "ASCA":
-            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dascamaster&obsid={obsid}"
+            urls["browse"] = (
+                f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dascamaster&obsid={obsid}"
+            )
 
         elif mission == "XRISM":
-            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dxrismmastr&obsid={obsid}"
+            urls["browse"] = (
+                f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dxrismmastr&obsid={obsid}"
+            )
 
         elif mission == "Hitomi":
-            urls["browse"] = f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dhitomaster&obsid={obsid}"
+            urls["browse"] = (
+                f"https://heasarc.gsfc.nasa.gov/cgi-bin/W3Browse/w3browse.pl?tablehead=name%3Dhitomaster&obsid={obsid}"
+            )
 
         return urls
 
-    async def _list_directory_files(self, directory_url: str) -> List[str]:
-        """
-        Parse HEASARC HTTPS directory listing to get file names.
-
-        HEASARC serves directory listings as HTML pages. This method fetches
-        the HTML and extracts file names from anchor tags.
-
-        Args:
-            directory_url: URL of the directory to list
-
-        Returns:
-            List of file names (not full URLs)
-
-        Raises:
-            httpx.HTTPStatusError: If the HTTP request fails
-        """
-        from bs4 import BeautifulSoup
-
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            response = await client.get(directory_url)
-            response.raise_for_status()
-
-        soup = BeautifulSoup(response.text, "lxml")
-        files = []
-
-        for link in soup.find_all("a"):
-            href = link.get("href", "")
-            # Skip navigation links (parent dir, sorting, etc.)
-            if not href or href.startswith("?") or href.startswith("/"):
-                continue
-            # Skip subdirectories (end with /)
-            if href.endswith("/"):
-                continue
-            # Clean up URL-encoded characters
-            files.append(href)
-
-        return files
-
     async def _list_directory_with_metadata(
-        self, directory_url: str
+        self,
+        directory_url: str,
+        budget: ArchiveCrawlBudget,
+        cancellation_check: CancellationCheck | None,
     ) -> List[Dict[str, Any]]:
-        """
-        Parse HEASARC HTTPS directory listing to get files with metadata.
+        """Fetch and parse one bounded HEASARC directory listing."""
+        budget.begin_directory()
+        hop_seconds = min(ARCHIVE_CRAWL_HOP_SECONDS, budget.remaining())
+        client = RemoteSourceClient(
+            HEASARC_ARCHIVE_POLICY,
+            timeouts=RemoteTimeouts(
+                connect=min(10.0, hop_seconds),
+                read=min(10.0, hop_seconds),
+                write=min(10.0, hop_seconds),
+                pool=min(5.0, hop_seconds),
+                total=hop_seconds,
+            ),
+            max_redirects=3,
+            chunk_size=64 * 1024,
+        )
+        body, info = await client.fetch_bytes(
+            directory_url,
+            max_bytes=MAX_ARCHIVE_DIRECTORY_HTML_BYTES,
+            cancellation_check=cancellation_check,
+        )
+        if info.status_code != 200:
+            raise RemoteSourceError(
+                "The archive server did not return a complete directory listing"
+            )
+        if info.content_type is not None:
+            media_type = info.content_type.split(";", 1)[0].strip().lower()
+            if media_type not in {
+                "text/html",
+                "text/plain",
+                "application/xhtml+xml",
+            }:
+                raise RemoteSourceError(
+                    "The archive server returned an unexpected directory format"
+                )
+        try:
+            html = body.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise RemoteSourceError(
+                "The archive directory listing is not valid UTF-8"
+            ) from error
 
-        Returns both files and subdirectories with size information when available.
+        await self._raise_if_download_cancelled(cancellation_check)
+        entries = await asyncio.to_thread(self._parse_archive_directory_html, html)
+        await self._raise_if_download_cancelled(cancellation_check)
+        budget.add_entries(len(entries))
+        return entries
 
-        Args:
-            directory_url: URL of the directory to list
+    @staticmethod
+    def _decode_archive_entry_href(href: Any) -> tuple[str, bool] | None:
+        """Accept one canonical relative UTF-8 path segment from listing HTML."""
+        if not isinstance(href, str) or not href:
+            return None
+        if len(href) > MAX_ARCHIVE_ENTRY_HREF_CHARS:
+            raise RemoteSourceError("An archive directory entry is too long")
+        if href.startswith("?") or href.startswith("#") or href in {".", "./", "../"}:
+            return None
 
-        Returns:
-            List of dicts with keys: name, is_directory, size_bytes (may be None)
-        """
-        from bs4 import BeautifulSoup
+        try:
+            parts = urlsplit(href)
+        except ValueError as error:
+            raise RemoteSourceError("An archive directory entry is invalid") from error
+        if parts.scheme or parts.netloc:
+            raise RemoteSourceError("An archive directory entry is not relative")
+        if parts.query or parts.fragment:
+            raise RemoteSourceError("An archive directory entry has metadata")
+        if parts.path.startswith("/"):
+            # Apache listings can contain root navigation or icon links. They are
+            # not children of the observation and must never become crawl hops.
+            return None
 
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            response = await client.get(directory_url)
-            response.raise_for_status()
+        is_directory = parts.path.endswith("/")
+        encoded_name = parts.path[:-1] if is_directory else parts.path
+        if not encoded_name:
+            return None
+        percent_index = 0
+        while True:
+            percent_index = encoded_name.find("%", percent_index)
+            if percent_index < 0:
+                break
+            if percent_index + 2 >= len(encoded_name) or not all(
+                character in "0123456789abcdefABCDEF"
+                for character in encoded_name[percent_index + 1 : percent_index + 3]
+            ):
+                raise RemoteSourceError(
+                    "An archive directory entry has invalid percent encoding"
+                )
+            percent_index += 3
+        try:
+            name = unquote_to_bytes(encoded_name).decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise RemoteSourceError(
+                "An archive directory entry is not valid UTF-8"
+            ) from error
+        if (
+            not name
+            or name != name.strip()
+            or len(name) > MAX_ARCHIVE_ENTRY_NAME_CHARS
+            or name in {".", ".."}
+            or "%" in name
+            or "/" in name
+            or "\\" in name
+            or any(
+                ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F
+                for character in name
+            )
+        ):
+            raise RemoteSourceError("An archive directory entry is unsafe")
+        return name, is_directory
 
-        soup = BeautifulSoup(response.text, "lxml")
-        entries = []
+    def _parse_archive_directory_html(self, html: str) -> List[Dict[str, Any]]:
+        """Parse a byte-bounded listing without accepting arbitrary URL targets."""
+        from bs4 import BeautifulSoup, NavigableString
 
-        # HEASARC directory listings typically use <pre> format with size info
-        # or standard <a> tags. Try to extract size from the text content.
-        pre_content = soup.find("pre")
+        soup = BeautifulSoup(html, "lxml")
+        links = soup.find_all("a", limit=MAX_ARCHIVE_DIRECTORY_ENTRIES + 1)
+        if len(links) > MAX_ARCHIVE_DIRECTORY_ENTRIES:
+            raise RemoteSourceError("An archive directory contains too many entries")
 
-        if pre_content:
-            # Parse Apache-style directory listing in <pre> tag
-            # Format: "Name                    Last modified      Size"
-            text = pre_content.get_text()
-            for link in pre_content.find_all("a"):
-                href = link.get("href", "")
-                if not href or href.startswith("?") or href.startswith("/"):
-                    continue
-                if href == "../":
-                    continue
+        entries: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for link in links:
+            decoded = self._decode_archive_entry_href(link.get("href"))
+            if decoded is None:
+                continue
+            name, is_directory = decoded
+            if name in seen:
+                continue
+            seen.add(name)
 
-                is_directory = href.endswith("/")
-                name = href.rstrip("/")
-
-                # Try to extract size from the line containing this link
-                size_bytes = None
-                link_text = link.get_text()
-                # Find the line containing this link and extract size
-                for line in text.split("\n"):
-                    if link_text in line:
-                        # Look for size pattern (e.g., "125M", "45K", "1.2G", "12345")
-                        parts = line.split()
-                        for part in parts:
-                            size_bytes = self._parse_size(part)
-                            if size_bytes is not None:
-                                break
-                        break
-
-                entries.append({
+            size_bytes = None
+            sibling = link.next_sibling
+            if not is_directory and isinstance(sibling, NavigableString):
+                line_tail = str(sibling).splitlines()[0][:256]
+                parts = line_tail.split()
+                if parts:
+                    size_bytes = self._parse_size(parts[-1])
+            entries.append(
+                {
                     "name": name,
                     "is_directory": is_directory,
                     "size_bytes": size_bytes,
-                })
-        else:
-            # Fallback: just get names from anchor tags
-            for link in soup.find_all("a"):
-                href = link.get("href", "")
-                if not href or href.startswith("?") or href.startswith("/"):
-                    continue
-                if href == "../":
-                    continue
-
-                is_directory = href.endswith("/")
-                name = href.rstrip("/")
-
-                entries.append({
-                    "name": name,
-                    "is_directory": is_directory,
-                    "size_bytes": None,
-                })
-
+                }
+            )
         return entries
 
     def _parse_size(self, size_str: str) -> Optional[int]:
@@ -897,29 +1246,22 @@ class ArchiveService(BaseService):
         if not size_str:
             return None
 
-        # Try numeric first
-        try:
-            return int(size_str)
-        except ValueError:
-            pass
-
-        # Try with suffix
         suffixes = {
             "K": 1024,
             "M": 1024 * 1024,
             "G": 1024 * 1024 * 1024,
             "T": 1024 * 1024 * 1024 * 1024,
         }
-
-        for suffix, multiplier in suffixes.items():
-            if size_str.upper().endswith(suffix):
-                try:
-                    num = float(size_str[:-1])
-                    return int(num * multiplier)
-                except ValueError:
-                    pass
-
-        return None
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([KMGT]?)", size_str.upper())
+        if match is None:
+            return None
+        try:
+            value = float(match.group(1)) * suffixes.get(match.group(2), 1)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(value) or value < 0 or value > (2**63 - 1):
+            return None
+        return int(value)
 
     def _classify_file_type(self, filename: str, mission: str) -> str:
         """
@@ -935,9 +1277,9 @@ class ArchiveService(BaseService):
         filename_lower = filename.lower()
 
         # Strip compression suffixes for pattern matching
-        for ext in ('.gz', '.bz2', '.z', '.zip'):
+        for ext in (".gz", ".bz2", ".z", ".zip"):
             if filename_lower.endswith(ext):
-                filename_lower = filename_lower[:-len(ext)]
+                filename_lower = filename_lower[: -len(ext)]
                 break
 
         # Event file patterns
@@ -974,10 +1316,10 @@ class ArchiveService(BaseService):
             "orbit",
             "housekeeping",
             "hk",
-            "_asol",   # Chandra aspect solution
-            "_dtf",    # Chandra dead time factor (HRC)
-            "_bpix",   # Chandra bad pixel list
-            "_fov",    # Chandra field of view
+            "_asol",  # Chandra aspect solution
+            "_dtf",  # Chandra dead time factor (HRC)
+            "_bpix",  # Chandra bad pixel list
+            "_fov",  # Chandra field of view
         ]
         if any(p in filename_lower for p in aux_patterns):
             return "auxiliary"
@@ -1011,6 +1353,7 @@ class ArchiveService(BaseService):
         obs_data: Optional[Dict[str, Any]] = None,
         recursive: bool = True,
         max_depth: int = 3,
+        cancellation_check: CancellationCheck | None = None,
     ) -> Dict[str, Any]:
         """
         List all files in an observation directory.
@@ -1030,33 +1373,39 @@ class ArchiveService(BaseService):
             Result dictionary with file tree structure
         """
         try:
-            # Validate mission
-            if mission not in SUPPORTED_CATALOGS:
+            clean_obs_data = self._validate_archive_crawl_request(
+                mission,
+                obsid,
+                obs_time,
+                obs_data,
+                recursive,
+                max_depth,
+            )
+            base_url = self._get_observation_directory_url(
+                mission,
+                obsid,
+                obs_time,
+                clean_obs_data,
+            )
+            if base_url is None:
                 return self.create_result(
                     success=False,
                     data=None,
-                    message=f"Unsupported mission: {mission}",
-                    error=f"Supported missions: {list(SUPPORTED_CATALOGS.keys())}",
+                    message="The observation directory cannot be derived safely",
+                    error="Required bounded observation metadata is unavailable",
                 )
 
-            # Get base directory URL
-            base_url = self._get_observation_directory_url(mission, obsid, obs_time, obs_data)
-
-            if not base_url:
-                # Try locate_data as fallback
-                base_url = await self._locate_observation_directory(mission, obsid, obs_data)
-
-            if not base_url:
-                return self.create_result(
-                    success=False,
-                    data=None,
-                    message=f"Could not locate observation directory for {mission} {obsid}",
-                    error="Directory URL construction failed. The observation time may be needed.",
-                )
-
-            # Recursively list files
+            budget = ArchiveCrawlBudget(
+                deadline=time.monotonic() + ARCHIVE_CRAWL_TOTAL_SECONDS
+            )
             files = await self._list_files_recursive(
-                base_url, mission, recursive, max_depth, 0
+                base_url,
+                mission,
+                recursive,
+                max_depth,
+                0,
+                budget,
+                cancellation_check,
             )
 
             return self.create_result(
@@ -1070,21 +1419,89 @@ class ArchiveService(BaseService):
                 },
                 message=f"Found {self._count_files(files)} files in {mission} observation {obsid}",
             )
-
-        except httpx.HTTPStatusError as e:
+        except RemoteSourceCancelled:
             return self.create_result(
                 success=False,
                 data=None,
-                message=f"HTTP error listing directory: {e.response.status_code}",
-                error=str(e),
+                message="Archive directory listing cancelled",
+                error="The request was cancelled before the listing completed",
             )
-        except Exception as e:
-            return self.handle_error(
-                e,
-                "Listing observation files",
-                mission=mission,
-                obsid=obsid,
+        except RemoteSourceTimeout:
+            return self.create_result(
+                success=False,
+                data=None,
+                message="The archive directory listing timed out",
+                error="The bounded archive crawl deadline expired",
             )
+        except (RemoteSourceError, TypeError, ValueError):
+            return self.create_result(
+                success=False,
+                data=None,
+                message="The archive directory listing failed validation",
+                error="The archive crawl was rejected safely",
+            )
+
+    @staticmethod
+    def _validate_archive_crawl_request(
+        mission: Any,
+        obsid: Any,
+        obs_time: Any,
+        obs_data: Any,
+        recursive: Any,
+        max_depth: Any,
+    ) -> Dict[str, Any]:
+        """Defend the service boundary even when called without the API model."""
+        if mission not in SUPPORTED_CATALOGS:
+            raise ValueError("Unsupported archive mission")
+        if not isinstance(obsid, str) or ARCHIVE_IDENTIFIER.fullmatch(obsid) is None:
+            raise ValueError("Invalid archive observation identifier")
+        if obs_time is not None and (
+            not isinstance(obs_time, str)
+            or not obs_time
+            or len(obs_time) > 64
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in obs_time
+            )
+        ):
+            raise ValueError("Invalid archive observation time")
+        if not isinstance(recursive, bool):
+            raise TypeError("Archive recursion must be a boolean")
+        if (
+            not isinstance(max_depth, int)
+            or isinstance(max_depth, bool)
+            or not 0 <= max_depth <= MAX_ARCHIVE_CRAWL_DEPTH
+        ):
+            raise ValueError("Archive recursion depth is out of range")
+        if obs_data is None:
+            return {}
+        if not isinstance(obs_data, dict) or not set(obs_data) <= {"ra", "dec", "prnb"}:
+            raise ValueError("Invalid archive observation metadata")
+
+        clean_data: Dict[str, Any] = {}
+        for key, lower, upper in (("ra", 0.0, 360.0), ("dec", -90.0, 90.0)):
+            value = obs_data.get(key)
+            if value is None:
+                continue
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or not lower <= float(value) <= upper
+            ):
+                raise ValueError("Invalid archive observation coordinates")
+            clean_data[key] = float(value)
+        proposal = obs_data.get("prnb")
+        if proposal is not None:
+            if (
+                not isinstance(proposal, str)
+                or ARCHIVE_PROPOSAL.fullmatch(proposal) is None
+            ):
+                raise ValueError("Invalid archive proposal identifier")
+            if not proposal.isdigit() or len(proposal) > 6:
+                raise ValueError("Invalid archive proposal identifier")
+            clean_data["prnb"] = proposal
+        return clean_data
 
     async def _list_files_recursive(
         self,
@@ -1093,6 +1510,8 @@ class ArchiveService(BaseService):
         recursive: bool,
         max_depth: int,
         current_depth: int,
+        budget: ArchiveCrawlBudget,
+        cancellation_check: CancellationCheck | None,
     ) -> List[Dict[str, Any]]:
         """
         Recursively list files in a directory.
@@ -1107,61 +1526,65 @@ class ArchiveService(BaseService):
         Returns:
             List of file/directory entries
         """
-        entries = await self._list_directory_with_metadata(directory_url)
+        if current_depth > max_depth or current_depth > MAX_ARCHIVE_CRAWL_DEPTH:
+            raise RemoteSourceError("The archive crawl exceeded its recursion depth")
+        await self._raise_if_download_cancelled(cancellation_check)
+        budget.remaining()
+        entries = await self._list_directory_with_metadata(
+            directory_url,
+            budget,
+            cancellation_check,
+        )
         result = []
 
         for entry in entries:
+            await self._raise_if_download_cancelled(cancellation_check)
+            budget.remaining()
             name = entry["name"]
             is_directory = entry["is_directory"]
             size_bytes = entry["size_bytes"]
 
-            full_url = directory_url.rstrip("/") + "/" + name
+            encoded_name = quote(name, safe="-._~")
+            full_url = directory_url.rstrip("/") + "/" + encoded_name
 
             if is_directory:
                 children = []
                 if recursive and current_depth < max_depth:
-                    try:
-                        children = await self._list_files_recursive(
-                            full_url + "/",
-                            mission,
-                            recursive,
-                            max_depth,
-                            current_depth + 1,
-                        )
-                    except Exception as e:
-                        # Log but don't fail if a subdirectory can't be listed
-                        print(f"Could not list subdirectory {full_url}: {e}")
+                    children = await self._list_files_recursive(
+                        full_url + "/",
+                        mission,
+                        recursive,
+                        max_depth,
+                        current_depth + 1,
+                        budget,
+                        cancellation_check,
+                    )
 
-                result.append({
-                    "path": name,
-                    "name": name,
-                    "is_directory": True,
-                    "file_type": "directory",
-                    "size_bytes": None,
-                    "size_display": "",
-                    "full_url": full_url + "/",
-                    "children": children,
-                })
+                result.append(
+                    {
+                        "path": name,
+                        "name": name,
+                        "is_directory": True,
+                        "file_type": "directory",
+                        "size_bytes": None,
+                        "size_display": "",
+                        "full_url": full_url + "/",
+                        "children": children,
+                    }
+                )
             else:
-                # For files, try to get size via HEAD request if not available
-                if size_bytes is None:
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0) as client:
-                            head_resp = await client.head(full_url, follow_redirects=True)
-                            size_bytes = int(head_resp.headers.get("content-length", 0)) or None
-                    except Exception:
-                        pass
-
                 file_type = self._classify_file_type(name, mission)
-                result.append({
-                    "path": name,
-                    "name": name,
-                    "is_directory": False,
-                    "file_type": file_type,
-                    "size_bytes": size_bytes,
-                    "size_display": self._format_size(size_bytes),
-                    "full_url": full_url,
-                })
+                result.append(
+                    {
+                        "path": name,
+                        "name": name,
+                        "is_directory": False,
+                        "file_type": file_type,
+                        "size_bytes": size_bytes,
+                        "size_display": self._format_size(size_bytes),
+                        "full_url": full_url,
+                    }
+                )
 
         return result
 
@@ -1348,226 +1771,255 @@ class ArchiveService(BaseService):
     async def download_file_to_disk(
         self,
         url: str,
-        save_path: str,
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """
-        Download a file from URL and save to local disk with progress streaming.
+        destination_path: str,
+        destination_grant: str,
+        cancellation_check: CancellationCheck | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Download one approved HEASARC object to one granted destination.
 
-        This method bypasses CORS restrictions by downloading on the backend.
-        Progress is streamed via SSE events.
-
-        Args:
-            url: URL to download from (e.g., HEASARC HTTPS URL)
-            save_path: Local path to save the file
-
-        Yields:
-            Dict with event type and data:
-            - {"type": "progress", "percent": 45, "bytes_downloaded": ..., "total_bytes": ...}
-            - {"type": "complete", "file_path": "...", "size_bytes": ...}
-            - {"type": "error", "error": "..."}
+        Bytes remain private until the complete response has been size-checked,
+        hashed, reopened, and hashed again.  The secure-publication adapter is
+        solely responsible for exclusive publication and owned cleanup.
         """
         try:
-            # Ensure the parent directory exists
-            save_dir = os.path.dirname(save_path)
-            if save_dir and not os.path.exists(save_dir):
-                os.makedirs(save_dir, exist_ok=True)
+            completion_event: dict[str, Any] | None = None
+            with ExitStack() as context_stack:
+                publication = context_stack.enter_context(
+                    open_secure_publication(
+                        destination_path,
+                        destination_grant,
+                    )
+                )
+                publication.revalidate("The selected destination path changed")
+                self._validate_download_filename(publication.filename)
+                destination_key = hashlib.sha256(
+                    os.fsencode(os.path.normcase(str(publication.path)))
+                ).digest()
+                context_stack.enter_context(
+                    ARCHIVE_DOWNLOAD_COORDINATOR.claim(destination_key)
+                )
+                publication.assert_destination_available()
+                publication.reserve_staging(".download")
 
-            async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
-                async with client.stream("GET", url) as response:
-                    response.raise_for_status()
+                client = RemoteSourceClient(
+                    HEASARC_ARCHIVE_POLICY,
+                    timeouts=ARCHIVE_DOWNLOAD_TIMEOUTS,
+                    max_redirects=5,
+                    chunk_size=ARCHIVE_DOWNLOAD_CHUNK_BYTES,
+                )
+                content_digest = hashlib.sha256()
+                bytes_downloaded = 0
+                content_length: int | None = None
 
-                    # Get total size from headers if available
-                    total_bytes = int(response.headers.get("content-length", 0))
-                    bytes_downloaded = 0
-
-                    # Open file for writing
-                    with open(save_path, "wb") as f:
-                        async for chunk in response.aiter_bytes(chunk_size=65536):
-                            f.write(chunk)
+                artifact_writer = ArchiveArtifactWriter(publication)
+                artifact_writer.start()
+                try:
+                    async with client.stream(
+                        url,
+                        max_bytes=MAX_ARCHIVE_DOWNLOAD_BYTES,
+                        cancellation_check=cancellation_check,
+                    ) as remote_stream:
+                        if remote_stream.info.status_code != 200:
+                            raise RemoteSourceError(
+                                "The archive server did not return a complete object"
+                            )
+                        content_length = remote_stream.info.content_length
+                        async for chunk in remote_stream.aiter_bytes():
+                            await artifact_writer.write(
+                                chunk,
+                                cancellation_check,
+                            )
+                            content_digest.update(chunk)
                             bytes_downloaded += len(chunk)
-
-                            # Calculate progress
-                            if total_bytes > 0:
-                                percent = (bytes_downloaded / total_bytes) * 100
-                            else:
-                                percent = 0
-
+                            total_bytes = content_length or 0
+                            percent = (
+                                min(100.0, bytes_downloaded / total_bytes * 100.0)
+                                if total_bytes
+                                else 0.0
+                            )
                             yield {
                                 "type": "progress",
                                 "bytes_downloaded": bytes_downloaded,
                                 "total_bytes": total_bytes,
                                 "percent": round(percent, 1),
                             }
+                    await artifact_writer.finish(cancellation_check)
+                except BaseException:
+                    await artifact_writer.abort_and_join()
+                    raise
 
-                            # Small yield to allow other async operations
-                            await asyncio.sleep(0)
-
-            # Get actual file size after writing
-            actual_size = os.path.getsize(save_path)
-
-            yield {
-                "type": "complete",
-                "file_path": save_path,
-                "size_bytes": actual_size,
-            }
-
-        except httpx.HTTPStatusError as e:
-            yield {
-                "type": "error",
-                "error": f"HTTP {e.response.status_code}: {e.response.reason_phrase}",
-            }
-        except httpx.RequestError as e:
-            yield {
-                "type": "error",
-                "error": f"Request failed: {str(e)}",
-            }
-        except OSError as e:
-            yield {
-                "type": "error",
-                "error": f"File system error: {str(e)}",
-            }
-        except Exception as e:
-            yield {
-                "type": "error",
-                "error": f"Download failed: {str(e)}",
-            }
-
-    async def _locate_observation_directory(
-        self,
-        mission: str,
-        obsid: str,
-        obs_data: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
-        """
-        Locate the observation directory URL using Heasarc.locate_data().
-
-        This uses astroquery's Heasarc class to find the actual data location,
-        which handles the complex directory structures of different missions.
-
-        The correct API usage is:
-        1. Query to get observation row(s) from the catalog
-        2. Call locate_data(table) with the query result table
-
-        Args:
-            mission: Mission key
-            obsid: Observation ID
-            obs_data: Additional observation data (e.g., ra/dec for coordinate queries)
-
-        Returns:
-            Directory URL or None if not found
-        """
-        try:
-            from astroquery.heasarc import Heasarc
-
-            catalog_name = SUPPORTED_CATALOGS[mission]["catalog"]
-            obs_data = obs_data or {}
-
-            # Step 1: Query to get observation row
-            # We need the actual table row for locate_data
-            # Best approach: query by coordinates if available, then filter by obsid
-            table = None
-
-            # Try coordinate-based query if we have ra/dec
-            ra = obs_data.get("ra")
-            dec = obs_data.get("dec")
-            if ra is not None and dec is not None:
-                try:
-                    coords = SkyCoord(ra=float(ra) * u.deg, dec=float(dec) * u.deg)
-                    table = Heasarc.query_region(
-                        coords,
-                        catalog=catalog_name,
-                        radius=0.5 * u.deg,
+                await self._raise_if_download_cancelled(cancellation_check)
+                if content_length is not None and bytes_downloaded != content_length:
+                    raise RemoteSourceError(
+                        "The remote response did not match its declared size"
                     )
-                    print(f"Coordinate query for {mission} returned {len(table) if table else 0} results")
-                except Exception as coord_err:
-                    print(f"Coordinate query failed: {coord_err}")
+                if bytes_downloaded < 1:
+                    raise RemoteSourceError("The remote response was empty")
 
-            # Fallback: use ADQL via query_tap to find the observation by obsid
-            if table is None or len(table) == 0:
+                expected_digest = content_digest.digest()
+                await self._run_download_verification(
+                    publication,
+                    bytes_downloaded,
+                    expected_digest,
+                    cancellation_check,
+                )
+                await self._raise_if_download_cancelled(cancellation_check)
+                # Publication is a short, descriptor-relative metadata operation.
+                # Keep it in this task so cancellation cannot detach it and expose
+                # a final file after the request has already unwound.
+                warnings = publication.publish()
+
+                completion_event = {
+                    "type": "complete",
+                    "file_name": publication.filename,
+                    "size_bytes": bytes_downloaded,
+                    "sha256": content_digest.hexdigest(),
+                    "warnings": ([ARCHIVE_STAGING_WARNING] if warnings else []),
+                }
+
+            # Release the global claim and every pinned publication handle before
+            # signaling terminal success to a potentially stalled SSE consumer.
+            if completion_event is None:
+                raise RuntimeError("Download completion was not constructed")
+            yield completion_event
+
+        except asyncio.CancelledError:
+            # StreamingResponse cancellation closes the generator; ExitStack
+            # removes only the adapter-owned private artifact before propagation.
+            raise
+        except RemoteSourceCancelled:
+            yield {"type": "error", "error": "Download cancelled"}
+        except ArchiveDownloadBusyError:
+            yield {
+                "type": "error",
+                "error": "A download is already using the selected destination",
+            }
+        except ArchiveDownloadCapacityError:
+            yield {
+                "type": "error",
+                "error": "Too many archive downloads are already active",
+            }
+        except RemoteSourcePolicyError:
+            yield {
+                "type": "error",
+                "error": "The selected URL is not an approved HEASARC archive download",
+            }
+        except RemoteSourceHTTPError as error:
+            yield {
+                "type": "error",
+                "error": f"The HEASARC server returned HTTP {error.status_code}",
+            }
+        except RemoteSourceTimeout:
+            yield {"type": "error", "error": "The HEASARC download timed out"}
+        except RemoteSourceError:
+            yield {"type": "error", "error": "The HEASARC download failed validation"}
+        except PermissionError:
+            yield {
+                "type": "error",
+                "error": (
+                    "The save authorization is invalid or expired; choose the "
+                    "destination again"
+                ),
+            }
+        except FileExistsError:
+            yield {
+                "type": "error",
+                "error": "A file already exists at the selected destination",
+            }
+        except (OSError, ValueError, RuntimeError):
+            yield {
+                "type": "error",
+                "error": "The download could not be published safely",
+            }
+
+    @staticmethod
+    async def _raise_if_download_cancelled(
+        cancellation_check: CancellationCheck | None,
+    ) -> None:
+        if cancellation_check is None:
+            return
+        cancelled = cancellation_check()
+        if inspect.isawaitable(cancelled):
+            cancelled = await cancelled
+        if cancelled:
+            raise RemoteSourceCancelled("Remote transfer was cancelled")
+
+    @staticmethod
+    def _validate_download_filename(filename: str) -> None:
+        if (
+            filename in {"", ".", ".."}
+            or len(filename) > 512
+            or "/" in filename
+            or "\\" in filename
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in filename
+            )
+        ):
+            raise ValueError("The selected destination filename is invalid")
+
+    @staticmethod
+    async def _run_download_verification(
+        publication: SecurePublication,
+        expected_size: int,
+        expected_digest: bytes,
+        cancellation_check: CancellationCheck | None,
+    ) -> None:
+        """Poll cancellation and join the descriptor-owning verifier on exit."""
+        cancellation_event = threading.Event()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                ArchiveService._verify_download_artifact,
+                publication,
+                expected_size,
+                expected_digest,
+                cancellation_event,
+            )
+        )
+        try:
+            while True:
+                completed, _pending = await asyncio.wait(
+                    {task},
+                    timeout=ARCHIVE_VERIFICATION_CANCEL_POLL_SECONDS,
+                )
+                if completed:
+                    task.result()
+                    return
+                await ArchiveService._raise_if_download_cancelled(cancellation_check)
+        except BaseException:
+            cancellation_event.set()
+            while not task.done():
                 try:
-                    safe_obsid = obsid.strip().replace("'", "''")
-                    adql = f"SELECT * FROM {catalog_name} WHERE obsid = '{safe_obsid}'"
-                    tap_result = Heasarc.query_tap(adql, maxrec=1)
-                    tap_table = tap_result.to_table()
-                    if tap_table is not None and len(tap_table) > 0:
-                        # TAP results lack __row column, so locate_data won't work.
-                        # Instead, extract time and construct URL directly.
-                        time_cols = ["time", "start_time", "date_obs", "tstart"]
-                        obs_time_val = None
-                        for tc in time_cols:
-                            if tc in tap_table.colnames:
-                                obs_time_val = str(tap_table[0][tc])
-                                break
-                        if obs_time_val:
-                            url = self._get_observation_directory_url(
-                                mission, obsid, obs_time_val, obs_data
-                            )
-                            if url:
-                                return url
-                except Exception as adql_err:
-                    print(f"ADQL obsid query failed: {adql_err}")
-                    return None
-
-            if table is None or len(table) == 0:
-                print(f"No observations found in {catalog_name}")
-                return None
-
-            # Step 2: Filter to the specific obsid
-            obsid_cols = ["obsid", "obs_id", "observation_id", "OBSID", "OBS_ID"]
-            obsid_column = None
-            for col in obsid_cols:
-                if col in table.colnames:
-                    obsid_column = col
-                    break
-
-            if obsid_column is None:
-                print(f"Could not find obsid column in {catalog_name}")
-                return None
-
-            # Filter to the specific obsid
-            mask = [str(row[obsid_column]).strip() == str(obsid).strip() for row in table]
-            if not any(mask):
-                print(f"Obsid {obsid} not found in query results")
-                return None
-
-            filtered_table = table[mask][:1]
-
-            # Step 3: Call locate_data with the filtered table row
+                    await asyncio.wait({task})
+                except asyncio.CancelledError:
+                    continue
             try:
-                result = Heasarc.locate_data(filtered_table)
-            except Exception as locate_err:
-                print(f"locate_data API call failed: {locate_err}")
-                return None
+                task.result()
+            except Exception:
+                pass
+            raise
 
-            if result is None or len(result) == 0:
-                return None
-
-            # Step 4: Extract the access_url from the result
-            # locate_data returns a table with columns: ID, access_url, sciserver, aws, etc.
-            if "access_url" in result.colnames:
-                for row in result:
-                    url = str(row["access_url"]).strip()
-                    if url and "heasarc.gsfc.nasa.gov" in url:
-                        # Clean up double slashes in path (common in HEASARC URLs)
-                        url = re.sub(r"([^:])//+", r"\1/", url)
-                        if not url.endswith("/"):
-                            url += "/"
-                        return url
-
-            # Fallback: look in any column for HEASARC URLs
-            for row in result:
-                for col in result.colnames:
-                    val = str(row[col])
-                    if "heasarc.gsfc.nasa.gov" in val and "/FTP/" in val:
-                        url = val.strip()
-                        url = re.sub(r"([^:])//+", r"\1/", url)
-                        if not url.endswith("/"):
-                            url += "/"
-                        return url
-
-            return None
-
-        except Exception as e:
-            # Log but don't fail - we'll try alternative methods
-            print(f"locate_data failed for {mission}/{obsid}: {e}")
-            return None
+    @staticmethod
+    def _verify_download_artifact(
+        publication: SecurePublication,
+        expected_size: int,
+        expected_digest: bytes,
+        cancellation_event: threading.Event,
+    ) -> None:
+        digest = hashlib.sha256()
+        reopened_size = 0
+        with publication.open_reader("rb", encoding=None) as reader:
+            while True:
+                if cancellation_event.is_set():
+                    raise RemoteSourceCancelled("Download verification was cancelled")
+                chunk = reader.read(ARCHIVE_DOWNLOAD_CHUNK_BYTES)
+                if cancellation_event.is_set():
+                    raise RemoteSourceCancelled("Download verification was cancelled")
+                if not chunk:
+                    break
+                reopened_size += len(chunk)
+                digest.update(chunk)
+        if reopened_size != expected_size or digest.digest() != expected_digest:
+            raise ValueError("The staged download changed during verification")
+        if publication.verified_size() != expected_size:
+            raise ValueError("The staged download size changed during verification")

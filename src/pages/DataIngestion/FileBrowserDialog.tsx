@@ -5,7 +5,7 @@
  * allowing users to select and download files to their local disk.
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Dialog,
   DialogTitle,
@@ -53,14 +53,13 @@ interface FileBrowserDialogProps {
   obsTime: string;
   targetName: string;
   obsData?: ObsData;
-  onDownloadComplete?: (filePath: string) => void;
+  onDownloadComplete?: () => void;
 }
 
 interface DownloadState {
   status: 'idle' | 'downloading' | 'complete' | 'error';
   message: string;
   percent: number;
-  filePath?: string;
   error?: string;
 }
 
@@ -229,15 +228,21 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
     message: '',
     percent: 0,
   });
+  const downloadAbortController = useRef<AbortController | null>(null);
+  const downloadOperationId = useRef(0);
 
-  // Load files when dialog opens
-  useEffect(() => {
-    if (open) {
-      loadFiles();
-    }
-  }, [open, mission, obsid, obsTime, obsData]);
+  useEffect(
+    () => () => {
+      downloadOperationId.current += 1;
+      downloadAbortController.current?.abort();
+    },
+    []
+  );
 
-  const loadFiles = async (): Promise<void> => {
+  const loadFiles = useCallback(async (): Promise<void> => {
+    downloadOperationId.current += 1;
+    downloadAbortController.current?.abort();
+    downloadAbortController.current = null;
     setLoading(true);
     setError(null);
     setSelectedFiles(new Set());
@@ -293,7 +298,17 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
     } finally {
       setLoading(false);
     }
-  };
+  }, [mission, obsid, obsTime, obsData]);
+
+  // Load files when dialog opens
+  useEffect(() => {
+    if (open) {
+      void loadFiles();
+    } else {
+      downloadOperationId.current += 1;
+      downloadAbortController.current?.abort();
+    }
+  }, [open, loadFiles]);
 
   const handleToggleSelect = useCallback((entry: FileEntry): void => {
     setSelectedFiles((prev) => {
@@ -376,7 +391,7 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
     return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
   };
 
-  // Handle download to local disk via backend (bypasses CORS)
+  // Handle an authenticated, policy-bounded backend download to a granted destination.
   const handleDownload = async (): Promise<void> => {
     const fileInfo = getSelectedFileInfo();
     if (!fileInfo) {
@@ -389,16 +404,42 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
     }
 
     // Ask user where to save the file
-    const savePath = await window.electronAPI.saveFile({
-      title: 'Save Downloaded File',
-      defaultPath: fileInfo.name,
-      filters: [
-        { name: 'FITS Files', extensions: ['fits', 'fits.gz', 'evt', 'evt.gz'] },
-        { name: 'All Files', extensions: ['*'] },
-      ],
-    });
+    if (!window.electronAPI?.saveGrantedFile) {
+      addNotification({
+        type: 'error',
+        title: 'Secure Save Unavailable',
+        message: 'Restart the desktop application before downloading archive files.',
+      });
+      return;
+    }
+    const selectionOperationId = downloadOperationId.current;
+    let destination: { path: string; grant: string } | null;
+    try {
+      destination = await window.electronAPI.saveGrantedFile({
+        title: 'Save Downloaded File',
+        defaultPath: fileInfo.name,
+        filters: [
+          { name: 'FITS Files', extensions: ['fits', 'fits.gz', 'evt', 'evt.gz'] },
+          { name: 'All Files', extensions: ['*'] },
+        ],
+      });
+    } catch {
+      if (downloadOperationId.current !== selectionOperationId) {
+        return;
+      }
+      addNotification({
+        type: 'error',
+        title: 'Secure Save Failed',
+        message: 'Could not authorize the selected destination. Please try again.',
+      });
+      return;
+    }
 
-    if (!savePath) {
+    if (
+      !destination ||
+      !open ||
+      downloadOperationId.current !== selectionOperationId
+    ) {
       return; // User cancelled
     }
 
@@ -408,13 +449,22 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
       percent: 0,
     });
 
+    const abortController = new AbortController();
+    const operationId = downloadOperationId.current + 1;
+    downloadOperationId.current = operationId;
+    downloadAbortController.current = abortController;
+
     try {
-      // Download via backend to bypass CORS restrictions
-      // The backend downloads from HEASARC and saves directly to disk
+      let receivedTerminalEvent = false;
       for await (const event of archiveApi.downloadToDiskSSE({
         url: fileInfo.url,
-        save_path: savePath,
+        destination_path: destination.path,
+        destination_grant: destination.grant,
+        signal: abortController.signal,
       })) {
+        if (downloadOperationId.current !== operationId) {
+          break;
+        }
         if (event.type === 'progress') {
           const { bytes_downloaded, total_bytes, percent } = event;
           if (total_bytes > 0) {
@@ -431,26 +481,49 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
             });
           }
         } else if (event.type === 'complete') {
+          receivedTerminalEvent = true;
           setDownloadState({
             status: 'complete',
-            message: `Downloaded to: ${event.file_path}`,
+            message: `Downloaded ${event.file_name} (${formatTotalSize(event.size_bytes)})`,
             percent: 100,
-            filePath: event.file_path,
           });
 
           addNotification({
             type: 'success',
             title: 'Download Complete',
-            message: `File saved to ${event.file_path}. Use "Load from Local" to load it.`,
+            message: 'The file was securely saved. Use "Load from Local" to open it.',
           });
 
-          onDownloadComplete?.(event.file_path);
+          if (event.warnings.length > 0) {
+            addNotification({
+              type: 'warning',
+              title: 'Cleanup Warning',
+              message: event.warnings.join(' '),
+            });
+          }
+          onDownloadComplete?.();
+          break;
         } else if (event.type === 'error') {
+          receivedTerminalEvent = true;
           throw new Error(event.error);
         }
       }
+      if (downloadOperationId.current !== operationId) {
+        return;
+      }
+      if (!receivedTerminalEvent) {
+        throw new Error('Download ended before completion was confirmed');
+      }
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : 'Download failed';
+      if (downloadOperationId.current !== operationId) {
+        return;
+      }
+      const errorMsg =
+        abortController.signal.aborted || (err instanceof DOMException && err.name === 'AbortError')
+          ? 'Download cancelled'
+          : err instanceof Error
+            ? err.message
+            : 'Download failed';
       setDownloadState({
         status: 'error',
         message: errorMsg,
@@ -462,14 +535,23 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
         title: 'Download Failed',
         message: errorMsg,
       });
+    } finally {
+      if (downloadAbortController.current === abortController) {
+        downloadAbortController.current = null;
+      }
     }
   };
 
-  // Open file location in system file manager
-  const handleShowInFolder = (): void => {
-    if (downloadState.filePath) {
-      window.electronAPI.showItemInFolder(downloadState.filePath);
+  const handleCloseOrCancel = (): void => {
+    if (downloadState.status === 'downloading') {
+      downloadAbortController.current?.abort();
+      setDownloadState((current) => ({
+        ...current,
+        message: 'Cancelling download...',
+      }));
+      return;
     }
+    onClose();
   };
 
   const isDownloading = downloadState.status === 'downloading';
@@ -571,16 +653,7 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
                 {downloadState.status === 'error' ? (
                   <Alert severity="error">{downloadState.message}</Alert>
                 ) : downloadState.status === 'complete' ? (
-                  <Alert
-                    severity="success"
-                    action={
-                      <Button color="inherit" size="small" onClick={handleShowInFolder}>
-                        Show in Folder
-                      </Button>
-                    }
-                  >
-                    {downloadState.message}
-                  </Alert>
+                  <Alert severity="success">{downloadState.message}</Alert>
                 ) : (
                   <>
                     <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
@@ -607,8 +680,8 @@ const FileBrowserDialog: React.FC<FileBrowserDialogProps> = ({
       </DialogContent>
 
       <DialogActions sx={{ px: 3, py: 2 }}>
-        <Button onClick={onClose} disabled={isDownloading}>
-          {downloadState.status === 'complete' ? 'Close' : 'Cancel'}
+        <Button onClick={handleCloseOrCancel}>
+          {isDownloading ? 'Cancel Download' : 'Close'}
         </Button>
         <Button
           variant="contained"

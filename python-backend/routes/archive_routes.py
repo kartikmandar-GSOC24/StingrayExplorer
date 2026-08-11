@@ -6,12 +6,13 @@ X-ray observation data with progress tracking.
 """
 
 import json
-from typing import Any, Dict, Optional, Tuple
+from contextlib import aclosing
+from datetime import date
+from typing import Annotated, Literal, Optional, Tuple
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Path, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from services.archive_service import ArchiveService
 
 router = APIRouter()
@@ -23,6 +24,48 @@ def get_archive_service(request: Request) -> ArchiveService:
         state_manager=request.app.state.state_manager,
         performance_monitor=request.app.state.performance_monitor,
     )
+
+
+ArchiveServiceDependency = Annotated[
+    ArchiveService,
+    Depends(get_archive_service),
+]
+
+ArchiveMission = Literal[
+    "NICER",
+    "NuSTAR",
+    "XMM-Newton",
+    "Chandra",
+    "Swift",
+    "RXTE",
+    "IXPE",
+    "Suzaku",
+    "ASCA",
+    "XRISM",
+    "Hitomi",
+]
+
+
+def _validate_iso_date(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(
+            "Date must be a real calendar date in YYYY-MM-DD format"
+        ) from error
+    if parsed.isoformat() != value:
+        raise ValueError("Date must use canonical YYYY-MM-DD format")
+    return value
+
+
+def _validate_display_text(value: str) -> str:
+    if value != value.strip() or any(
+        ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F for character in value
+    ):
+        raise ValueError("Text must be canonical and contain no control characters")
+    return value
 
 
 def _iso_dates_to_mjd_range(
@@ -51,15 +94,15 @@ def _iso_dates_to_mjd_range(
     if start_date:
         try:
             mjd_start = Time(start_date, format="iso").mjd
-        except Exception:
-            pass
+        except Exception as error:
+            raise ValueError("Invalid start date") from error
 
     if end_date:
         try:
             # Add ~1 day to include the end date fully
             mjd_end = Time(end_date, format="iso").mjd + 1.0
-        except Exception:
-            pass
+        except Exception as error:
+            raise ValueError("Invalid end date") from error
 
     return (mjd_start, mjd_end)
 
@@ -67,53 +110,120 @@ def _iso_dates_to_mjd_range(
 # Request/Response Models
 class SearchByNameRequest(BaseModel):
     """Request model for searching by source name."""
-    source_name: str
-    mission: str
-    radius: float = 0.5  # Search radius in degrees
-    max_results: int = 100
-    min_exposure: Optional[float] = None  # Minimum exposure in seconds
-    start_date: Optional[str] = None  # ISO date string "YYYY-MM-DD"
-    end_date: Optional[str] = None  # ISO date string "YYYY-MM-DD"
+
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+    source_name: str = Field(min_length=1, max_length=256)
+    mission: ArchiveMission
+    radius: float = Field(default=0.5, gt=0.0, le=180.0)
+    max_results: int = Field(default=100, ge=1, le=1_000)
+    min_exposure: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1_000_000_000.0,
+    )
+    start_date: Optional[str] = Field(default=None, min_length=10, max_length=10)
+    end_date: Optional[str] = Field(default=None, min_length=10, max_length=10)
+
+    _canonical_source_name = field_validator("source_name")(_validate_display_text)
+    _real_dates = field_validator("start_date", "end_date")(_validate_iso_date)
+
+    @model_validator(mode="after")
+    def _ordered_date_range(self) -> "SearchByNameRequest":
+        if (
+            self.start_date is not None
+            and self.end_date is not None
+            and self.start_date > self.end_date
+        ):
+            raise ValueError("Start date must not be after end date")
+        return self
 
 
 class SearchByCoordinatesRequest(BaseModel):
     """Request model for searching by coordinates."""
-    ra: float  # Right Ascension in degrees
-    dec: float  # Declination in degrees
-    mission: str
-    radius: float = 0.5  # Search radius in degrees
-    max_results: int = 100
-    min_exposure: Optional[float] = None  # Minimum exposure in seconds
-    start_date: Optional[str] = None  # ISO date string "YYYY-MM-DD"
-    end_date: Optional[str] = None  # ISO date string "YYYY-MM-DD"
+
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+    ra: float = Field(ge=0.0, le=360.0)
+    dec: float = Field(ge=-90.0, le=90.0)
+    mission: ArchiveMission
+    radius: float = Field(default=0.5, gt=0.0, le=180.0)
+    max_results: int = Field(default=100, ge=1, le=1_000)
+    min_exposure: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1_000_000_000.0,
+    )
+    start_date: Optional[str] = Field(default=None, min_length=10, max_length=10)
+    end_date: Optional[str] = Field(default=None, min_length=10, max_length=10)
+
+    _real_dates = field_validator("start_date", "end_date")(_validate_iso_date)
+
+    @model_validator(mode="after")
+    def _ordered_date_range(self) -> "SearchByCoordinatesRequest":
+        if (
+            self.start_date is not None
+            and self.end_date is not None
+            and self.start_date > self.end_date
+        ):
+            raise ValueError("Start date must not be after end date")
+        return self
 
 
 class SearchByObsidRequest(BaseModel):
     """Request model for searching by Observation ID."""
-    obsid: str
-    mission: str
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    obsid: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+    mission: ArchiveMission
+
+
+class ObservationLookupData(BaseModel):
+    """Bounded optional metadata used only for deterministic archive paths."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    ra: Optional[float] = Field(default=None, ge=0.0, le=360.0)
+    dec: Optional[float] = Field(default=None, ge=-90.0, le=90.0)
+    prnb: Optional[str] = Field(default=None, pattern=r"^[0-9]{1,6}$")
 
 
 class ListFilesRequest(BaseModel):
-    """Request model for listing files in an observation directory."""
-    mission: str
-    obsid: str
-    obs_time: Optional[str] = None  # Observation time (MJD or ISO string) for directory lookup
-    obs_data: Optional[Dict[str, Any]] = None  # Additional observation data (e.g., prnb for RXTE, ra/dec for locate_data)
+    """Strict bounded request for crawling one known HEASARC observation."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    mission: ArchiveMission
+    obsid: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+    obs_time: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    obs_data: Optional[ObservationLookupData] = None
     recursive: bool = True
-    max_depth: int = 3
+    max_depth: int = Field(default=3, ge=0, le=3)
 
 
 class DownloadToDiskRequest(BaseModel):
-    """Request model for downloading a file to local disk."""
-    url: str  # URL to download from
-    save_path: str  # Local path to save the file
+    """One approved remote source and one native-granted destination."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    url: str = Field(min_length=1, max_length=4_096)
+    destination_path: str = Field(min_length=1, max_length=4_096)
+    destination_grant: str = Field(min_length=1, max_length=512)
 
 
 # Routes
 @router.get("/catalogs")
 async def get_catalogs(
-    service: ArchiveService = Depends(get_archive_service),
+    service: ArchiveServiceDependency,
 ):
     """
     Get list of supported HEASARC catalogs.
@@ -127,7 +237,7 @@ async def get_catalogs(
 @router.post("/search/name")
 async def search_by_name(
     request: SearchByNameRequest,
-    service: ArchiveService = Depends(get_archive_service),
+    service: ArchiveServiceDependency,
 ):
     """
     Search HEASARC for observations by source name.
@@ -155,7 +265,7 @@ async def search_by_name(
 @router.post("/search/coordinates")
 async def search_by_coordinates(
     request: SearchByCoordinatesRequest,
-    service: ArchiveService = Depends(get_archive_service),
+    service: ArchiveServiceDependency,
 ):
     """
     Search HEASARC for observations by coordinates.
@@ -182,7 +292,7 @@ async def search_by_coordinates(
 @router.post("/search/obsid")
 async def search_by_obsid(
     request: SearchByObsidRequest,
-    service: ArchiveService = Depends(get_archive_service),
+    service: ArchiveServiceDependency,
 ):
     """
     Search HEASARC for an observation by its Observation ID.
@@ -202,9 +312,16 @@ async def search_by_obsid(
 
 @router.get("/observation/{mission}/{obsid}")
 async def get_observation_urls(
-    mission: str,
-    obsid: str,
-    service: ArchiveService = Depends(get_archive_service),
+    mission: ArchiveMission,
+    obsid: Annotated[
+        str,
+        Path(
+            min_length=1,
+            max_length=128,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+        ),
+    ],
+    service: ArchiveServiceDependency,
 ):
     """
     Get download URLs for a specific observation.
@@ -220,8 +337,9 @@ async def get_observation_urls(
 
 @router.post("/list-files")
 async def list_observation_files(
-    request: ListFilesRequest,
-    service: ArchiveService = Depends(get_archive_service),
+    payload: ListFilesRequest,
+    request: Request,
+    service: ArchiveServiceDependency,
 ):
     """
     List all files in an observation directory.
@@ -240,48 +358,59 @@ async def list_observation_files(
         max_depth: Maximum recursion depth (default: 3)
     """
     return await service.list_observation_files(
-        mission=request.mission,
-        obsid=request.obsid,
-        obs_time=request.obs_time,
-        obs_data=request.obs_data,
-        recursive=request.recursive,
-        max_depth=request.max_depth,
+        mission=payload.mission,
+        obsid=payload.obsid,
+        obs_time=payload.obs_time,
+        obs_data=(payload.obs_data.model_dump() if payload.obs_data else None),
+        recursive=payload.recursive,
+        max_depth=payload.max_depth,
+        cancellation_check=request.is_disconnected,
     )
 
 
 @router.post("/download-to-disk")
 async def download_to_disk(
-    request: DownloadToDiskRequest,
-    service: ArchiveService = Depends(get_archive_service),
+    payload: DownloadToDiskRequest,
+    request: Request,
+    service: ArchiveServiceDependency,
 ):
     """
     Download a file from URL to local disk with SSE progress streaming.
 
-    This endpoint bypasses CORS restrictions by downloading through the backend.
-    Progress is streamed as Server-Sent Events (SSE).
+    The authenticated backend enforces the HEASARC source policy and streams
+    progress as Server-Sent Events (SSE).
 
     SSE Event Format:
     - type: "progress" - Download progress with bytes_downloaded, total_bytes, percent
-    - type: "complete" - Download finished with file_path and size_bytes
+    - type: "complete" - Download finished with verified file_name, size, and digest
     - type: "error" - An error occurred with error message
 
-    Args:
-        url: URL to download from (e.g., HEASARC HTTPS URL)
-        save_path: Local path to save the file
+    The response never contains the destination path or grant. Disconnecting
+    the renderer cancels work only before exclusive publication. Publication is
+    the commit point: a disconnect after it suppresses the terminal SSE event but
+    does not remove the completed destination.
     """
+
     async def event_generator():
-        async for event in service.download_file_to_disk(
-            url=request.url,
-            save_path=request.save_path,
-        ):
-            yield f"data: {json.dumps(event)}\n\n"
+        events = service.download_file_to_disk(
+            url=payload.url,
+            destination_path=payload.destination_path,
+            destination_grant=payload.destination_grant,
+            cancellation_check=request.is_disconnected,
+        )
+        async with aclosing(events):
+            async for event in events:
+                if await request.is_disconnected():
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-store",
             "Connection": "keep-alive",
+            "X-Content-Type-Options": "nosniff",
             "X-Accel-Buffering": "no",
         },
     )
