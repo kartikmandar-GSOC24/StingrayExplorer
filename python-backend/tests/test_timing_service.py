@@ -18,6 +18,9 @@ def test_coherence_of_identical_signals_is_one(loaded_state):
     # |unnorm_power|^2 bug, whose values were ~1e8.
     assert np.all(coh < 2.0)
     assert np.median(coh) > 0.9  # measured 0.993 for this fixture
+    assert result["data"]["metadata"]["units"]["freq"] == "Hz"
+    assert result["data"]["metadata"]["units"]["coherence"] == "1"
+    assert result["data"]["provenance"]["operation"] == "timing_coherence"
 
 
 def test_coherence_includes_uncertainty(loaded_state):
@@ -40,6 +43,12 @@ def test_time_lags_include_errors_and_serialize(loaded_state):
     assert len(data["freq"]) == len(data["time_lags"])
     assert data["time_lags_err"] is not None
     assert len(data["time_lags_err"]) == len(data["time_lags"])
+    assert data["metadata"]["units"] == {
+        "freq": "Hz",
+        "time_lags": "s",
+        "time_lags_err": "s",
+    }
+    assert data["provenance"]["operation"] == "timing_time_lags"
 
 
 def test_time_lags_freq_range_filters_all_arrays(loaded_state):
@@ -56,6 +65,7 @@ def test_time_lags_freq_range_filters_all_arrays(loaded_state):
     assert len(sub["data"]["time_lags"]) == len(sub["data"]["freq"])
     if sub["data"]["time_lags_err"] is not None:
         assert len(sub["data"]["time_lags_err"]) == len(sub["data"]["freq"])
+    assert sub["data"]["metadata"]["non_column_fields"] == ["freq_range"]
 
 
 def test_power_colors_serializes(loaded_state):

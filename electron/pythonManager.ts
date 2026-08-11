@@ -1,4 +1,5 @@
 import { spawn, ChildProcess } from 'child_process';
+import { randomBytes } from 'crypto';
 import path from 'path';
 import { app } from 'electron';
 import http from 'http';
@@ -29,6 +30,10 @@ export class PythonManager {
   private isRunning: boolean = false;
   private externalBackend: boolean = false; // True if backend was started externally
   private logCallback: LogCallback | null = null;
+  // Shared only with the spawned loopback backend. Renderer code receives
+  // short-lived HMAC grants, never this secret, so it cannot substitute a
+  // manually typed path for one selected in an owned native dialog.
+  private readonly fileGrantSecret: string = randomBytes(32).toString('hex');
 
   /**
    * Set the log callback for sending logs to the renderer
@@ -87,6 +92,7 @@ export class PythonManager {
         // handler it displaced - utils/log_stream.py does, and
         // tests/test_analysis_helpers.py keeps it that way.
         PYTHON_CONTEXT_AWARE_WARNINGS: '1',
+        STINGRAY_FILE_GRANT_SECRET: this.fileGrantSecret,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -409,6 +415,22 @@ export class PythonManager {
    */
   getIsRunning(): boolean {
     return this.isRunning;
+  }
+
+  /** Session secret used by Electron main to sign exact native-dialog paths. */
+  getFileGrantSecret(): string {
+    if (this.externalBackend) {
+      throw new Error(
+        'Native file access is unavailable while connected to an externally started backend. ' +
+        'Stop the external backend and restart Stingray Explorer so Electron can launch and secure it.'
+      );
+    }
+    if (!this.process) {
+      throw new Error(
+        'Native file access is unavailable until the Electron-managed backend is running; try again after startup.'
+      );
+    }
+    return this.fileGrantSecret;
   }
 
   /**

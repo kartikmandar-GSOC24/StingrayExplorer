@@ -27,21 +27,26 @@ const electronAPI = {
     filters?: { name: string; extensions: string[] }[];
   }): Promise<string | null> => ipcRenderer.invoke('dialog:saveFile', options),
 
+  /** Open native-selected files with short-lived backend-verifiable grants. */
+  openGrantedFile: (options?: {
+    title?: string;
+    filters?: { name: string; extensions: string[] }[];
+    multiple?: boolean;
+  }): Promise<{ path: string; grant: string }[] | null> =>
+    ipcRenderer.invoke('dialog:openGrantedFile', options),
+
+  /** Select an export destination and bind a write grant to that exact path. */
+  saveGrantedFile: (options?: {
+    title?: string;
+    defaultPath?: string;
+    filters?: { name: string; extensions: string[] }[];
+  }): Promise<{ path: string; grant: string } | null> =>
+    ipcRenderer.invoke('dialog:saveGrantedFile', options),
+
   /**
    * Open a directory selection dialog
    */
   openDirectory: (): Promise<string | null> => ipcRenderer.invoke('dialog:openDirectory'),
-
-  /**
-   * Read a file and return its contents
-   */
-  readFile: (filePath: string): Promise<ArrayBuffer> => ipcRenderer.invoke('file:read', filePath),
-
-  /**
-   * Write data to a file
-   */
-  writeFile: (filePath: string, data: ArrayBuffer | string): Promise<void> =>
-    ipcRenderer.invoke('file:write', filePath, data),
 
   /**
    * Check if a file exists

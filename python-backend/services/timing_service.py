@@ -10,6 +10,7 @@ import numpy as np
 from stingray import Bispectrum, DynamicalPowerspectrum
 
 from .base_service import BaseService
+from .utility_helpers import operation_provenance
 
 
 def _finite_list(arr) -> list:
@@ -306,6 +307,9 @@ class TimingService(BaseService):
                 if time_lags_err is not None:
                     time_lags_err = time_lags_err[mask]
 
+            lag_units = {"freq": "Hz", "time_lags": "s"}
+            if time_lags_err is not None:
+                lag_units["time_lags_err"] = "s"
             result_data = {
                 "name": output_name,
                 "freq": freq.tolist(),
@@ -314,6 +318,23 @@ class TimingService(BaseService):
                     _finite_list(time_lags_err) if time_lags_err is not None else None
                 ),
                 "freq_range": freq_range,
+                "metadata": {
+                    "units": lag_units,
+                    "non_column_fields": ["freq_range"],
+                },
+                "provenance": operation_provenance(
+                    "timing_time_lags",
+                    input_source={
+                        "kind": "event_list_pair",
+                        "names": [event_list_1_name, event_list_2_name],
+                    },
+                    parameters={
+                        "dt": dt,
+                        "segment_size": segment_size,
+                        "freq_range": freq_range,
+                        "output_name": output_name,
+                    },
+                ),
             }
 
             if output_name:
@@ -417,6 +438,9 @@ class TimingService(BaseService):
                 )
 
             # Uncertainty formula goes negative where coh > 1; report magnitude as the half-width.
+            coherence_units = {"freq": "Hz", "coherence": "1"}
+            if coherence_err is not None:
+                coherence_units["coherence_err"] = "1"
             result_data = {
                 "name": output_name,
                 "freq": cs.freq.tolist(),
@@ -428,6 +452,19 @@ class TimingService(BaseService):
                 ),
                 "segment_size": segment_size,
                 "n_segments": int(cs.m) if hasattr(cs, "m") else None,
+                "metadata": {"units": coherence_units},
+                "provenance": operation_provenance(
+                    "timing_coherence",
+                    input_source={
+                        "kind": "event_list_pair",
+                        "names": [event_list_1_name, event_list_2_name],
+                    },
+                    parameters={
+                        "dt": dt,
+                        "segment_size": segment_size,
+                        "output_name": output_name,
+                    },
+                ),
             }
 
             if output_name:

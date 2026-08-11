@@ -1,10 +1,50 @@
 import { ipcMain, dialog, app, shell, clipboard, BrowserWindow } from 'electron';
 import fs from 'fs/promises';
+import { realpathSync, statSync } from 'fs';
 import path from 'path';
+import { createHmac } from 'crypto';
 import { PythonManager } from './pythonManager';
 
 type PythonManagerGetter = () => PythonManager | null;
 type PythonRestarter = () => Promise<void>;
+
+export interface NativeFileGrant {
+  path: string;
+  grant: string;
+}
+
+const FILE_GRANT_TTL_SECONDS = 10 * 60;
+
+function issueFileGrant(
+  selectedPath: string,
+  access: 'read' | 'write',
+  pythonManager: PythonManager | null
+): NativeFileGrant {
+  if (!pythonManager) {
+    throw new Error('Python backend is not initialized; try selecting the file again');
+  }
+  const secret = pythonManager.getFileGrantSecret();
+  const resolvedPath =
+    access === 'read'
+      ? realpathSync(selectedPath)
+      : path.join(realpathSync(path.dirname(selectedPath)), path.basename(selectedPath));
+  const expires = Math.floor(Date.now() / 1000) + FILE_GRANT_TTL_SECONDS;
+  const identityPath = access === 'read' ? resolvedPath : path.dirname(resolvedPath);
+  const selectedStat = statSync(identityPath, { bigint: true });
+  if (access === 'read' && !selectedStat.isFile()) {
+    throw new Error('The selected input is not a regular file');
+  }
+  if (access === 'write' && !selectedStat.isDirectory()) {
+    throw new Error('The selected destination directory is unavailable');
+  }
+  const identity = `\0${selectedStat.dev}\0${selectedStat.ino}`;
+  const grantPrefix = `${expires}.${selectedStat.dev}.${selectedStat.ino}`;
+  const payload = `${access}\0${expires}\0${resolvedPath}${identity}`;
+  const digest = createHmac('sha256', secret)
+    .update(payload)
+    .digest('hex');
+  return { path: resolvedPath, grant: `${grantPrefix}.${digest}` };
+}
 
 /**
  * Set up all IPC handlers for communication between main and renderer processes
@@ -83,6 +123,69 @@ export function setupIpcHandlers(
     }
   );
 
+  // Utility pages use signed variants of the native dialogs. The signature is
+  // checked by FastAPI and binds each request to this exact path and access
+  // mode, rather than trusting an arbitrary renderer-provided path string.
+  ipcMain.handle(
+    'dialog:openGrantedFile',
+    (
+      event,
+      options?: {
+        title?: string;
+        filters?: { name: string; extensions: string[] }[];
+        multiple?: boolean;
+      }
+    ): NativeFileGrant[] | null => {
+      const parentWindow = BrowserWindow.fromWebContents(event.sender);
+      const dialogOptions = {
+        title: options?.title || 'Open Scientific File',
+        filters: options?.filters || [
+          { name: 'FITS and response files', extensions: ['fits', 'fit', 'fts', 'evt', 'rmf', 'rsp'] },
+          { name: 'Tabular files', extensions: ['csv', 'ecsv', 'json'] },
+          { name: 'All files', extensions: ['*'] },
+        ],
+        properties: options?.multiple
+          ? (['openFile', 'multiSelections'] as ('openFile' | 'multiSelections')[])
+          : (['openFile'] as ('openFile')[]),
+      };
+      const selected = parentWindow
+        ? dialog.showOpenDialogSync(parentWindow, dialogOptions)
+        : dialog.showOpenDialogSync(dialogOptions);
+      if (!selected?.length) return null;
+      return selected.map((selectedPath) =>
+        issueFileGrant(selectedPath, 'read', getPythonManager())
+      );
+    }
+  );
+
+  ipcMain.handle(
+    'dialog:saveGrantedFile',
+    (
+      event,
+      options?: {
+        title?: string;
+        defaultPath?: string;
+        filters?: { name: string; extensions: string[] }[];
+      }
+    ): NativeFileGrant | null => {
+      const parentWindow = BrowserWindow.fromWebContents(event.sender);
+      const dialogOptions = {
+        title: options?.title || 'Export Scientific Data',
+        defaultPath: options?.defaultPath,
+        filters: options?.filters || [
+          { name: 'FITS', extensions: ['fits'] },
+          { name: 'CSV', extensions: ['csv'] },
+          { name: 'ECSV', extensions: ['ecsv'] },
+          { name: 'JSON', extensions: ['json'] },
+        ],
+      };
+      const selected = parentWindow
+        ? dialog.showSaveDialogSync(parentWindow, dialogOptions)
+        : dialog.showSaveDialogSync(dialogOptions);
+      return selected ? issueFileGrant(selected, 'write', getPythonManager()) : null;
+    }
+  );
+
   ipcMain.handle('dialog:openDirectory', (event) => {
     const parentWindow = BrowserWindow.fromWebContents(event.sender);
 
@@ -105,24 +208,6 @@ export function setupIpcHandlers(
   // ============================================
   // File System Handlers
   // ============================================
-
-  ipcMain.handle('file:read', async (_event, filePath: string) => {
-    try {
-      const buffer = await fs.readFile(filePath);
-      return buffer.buffer;
-    } catch (error) {
-      throw new Error(`Failed to read file: ${error}`);
-    }
-  });
-
-  ipcMain.handle('file:write', async (_event, filePath: string, data: ArrayBuffer | string) => {
-    try {
-      const buffer = typeof data === 'string' ? data : Buffer.from(data);
-      await fs.writeFile(filePath, buffer);
-    } catch (error) {
-      throw new Error(`Failed to write file: ${error}`);
-    }
-  });
 
   ipcMain.handle('file:exists', async (_event, filePath: string) => {
     try {
