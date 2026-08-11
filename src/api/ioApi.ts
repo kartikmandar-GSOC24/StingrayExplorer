@@ -109,7 +109,7 @@ export interface EventListConversionResult extends UtilityMetadata {
 }
 
 export type ExportableObjectType = 'event_list' | 'lightcurve' | 'analysis_result';
-export type UtilityExportFormat = 'fits' | 'csv' | 'ecsv' | 'json';
+export type UtilityExportFormat = 'fits' | 'csv' | 'ecsv' | 'json' | 'hdf5';
 
 export interface ExportableObject {
   object_type: ExportableObjectType;
@@ -117,12 +117,20 @@ export interface ExportableObject {
   row_count: number | null;
   exportable: boolean;
   formats: UtilityExportFormat[];
+  format_reasons?: Partial<Record<UtilityExportFormat, string>>;
   reason: string | null;
 }
 
 export interface FormatCapability {
   supported: boolean;
   notes: string;
+  reason?: string | null;
+  extensions?: string[];
+  dependency?: {
+    name: string;
+    available: boolean;
+    version: string | null;
+  };
 }
 
 export interface ExportableObjectsResult {
@@ -145,6 +153,13 @@ export interface ExportResult extends UtilityMetadata {
   object_type: ExportableObjectType;
   object_name: string;
   verified: boolean;
+  verification?: {
+    schema: string;
+    table_path: string;
+    semantic_round_trip: boolean;
+    checks: string[];
+    h5py_version: string;
+  } | null;
 }
 
 export const ioApi = {

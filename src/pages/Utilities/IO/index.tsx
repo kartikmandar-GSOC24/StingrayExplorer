@@ -54,6 +54,13 @@ import {
 } from '@/api/ioApi';
 
 const EMPTY_EXPORTABLE_OBJECTS: ExportableObject[] = [];
+const EXPORT_DESTINATION_EXTENSION: Record<UtilityExportFormat, string> = {
+  fits: 'fits',
+  csv: 'csv',
+  ecsv: 'ecsv',
+  json: 'json',
+  hdf5: 'hdf5',
+};
 
 interface SummaryDatum {
   label: string;
@@ -105,8 +112,16 @@ function getObjectName(object: ExportableObject): string {
   return object.name;
 }
 
-function getObjectFormats(object: ExportableObject | undefined): UtilityExportFormat[] {
-  return object?.formats ?? [];
+function getObjectFormats(
+  object: ExportableObject | undefined,
+  catalog: ExportableObjectsResult | null
+): UtilityExportFormat[] {
+  if (!object || !catalog) return [];
+  const advertisedFormats = new Set(catalog.format_allowlist);
+  const capabilityMatrix = catalog.capability_matrix[object.object_type];
+  return object.formats.filter(
+    (format) => advertisedFormats.has(format) && capabilityMatrix[format]?.supported === true
+  );
 }
 
 function getObjectKey(object: ExportableObject): string {
@@ -197,18 +212,24 @@ const ExportCapabilitySummary: React.FC<{ catalog: ExportableObjectsResult }> = 
             const capability = matrix[allowedFormat];
             return [
               allowedFormat,
-              capability.supported
+              capability?.supported
                 ? `Supported — ${capability.notes}`
-                : capability.notes || 'Not supported',
+                : capability?.reason || capability?.notes || 'Not supported',
             ];
           })
         ),
       }))}
       pageSize={10}
     />
+    {catalog.excluded_formats.hdf5 ? (
+      <Alert severity="warning">
+        <strong>HDF5 unavailable:</strong> {catalog.excluded_formats.hdf5}
+      </Alert>
+    ) : null}
     <Typography variant="caption" color="text.secondary">
       Maximum export size: {catalog.row_cap.toLocaleString()} rows.{' '}
       {Object.entries(catalog.excluded_formats)
+        .filter(([format]) => format !== 'hdf5')
         .map(([format, reason]) => `${format.toUpperCase()}: ${reason}`)
         .join(' ')}
     </Typography>
@@ -794,7 +815,7 @@ const ExportPanel: React.FC<ExportPanelProps> = ({
   useEffect(() => {
     const current = objects.find((object) => getObjectKey(object) === objectKey);
     if (current?.exportable) {
-      const formats = getObjectFormats(current);
+      const formats = getObjectFormats(current, catalog);
       if (format && formats.includes(format)) return;
       setFormat(formats[0] ?? '');
       setDestination(null);
@@ -803,16 +824,16 @@ const ExportPanel: React.FC<ExportPanelProps> = ({
     }
     const first = objects.find((object) => object.exportable);
     setObjectKey(first ? getObjectKey(first) : '');
-    setFormat(first ? getObjectFormats(first)[0] ?? '' : '');
+    setFormat(first ? getObjectFormats(first, catalog)[0] ?? '' : '');
     setDestination(null);
     setDestinationError(null);
-  }, [objects, objectKey, format]);
+  }, [objects, objectKey, format, catalog]);
 
   const selectedObject = useMemo(
     () => objects.find((object) => getObjectKey(object) === objectKey),
     [objects, objectKey]
   );
-  const formats = getObjectFormats(selectedObject);
+  const formats = getObjectFormats(selectedObject, catalog);
   const selectedCapability =
     selectedObject && format && catalog
       ? catalog.capability_matrix[selectedObject.object_type][format]
@@ -821,7 +842,7 @@ const ExportPanel: React.FC<ExportPanelProps> = ({
   const selectObject = (nextKey: string): void => {
     const nextObject = objects.find((object) => getObjectKey(object) === nextKey);
     setObjectKey(nextKey);
-    setFormat(getObjectFormats(nextObject)[0] ?? '');
+    setFormat(getObjectFormats(nextObject, catalog)[0] ?? '');
     setDestination(null);
     setDestinationError(null);
   };
@@ -840,10 +861,11 @@ const ExportPanel: React.FC<ExportPanelProps> = ({
       return;
     }
     try {
+      const extension = EXPORT_DESTINATION_EXTENSION[format];
       const selected = await window.electronAPI.saveGrantedFile({
         title: `Export ${getObjectName(selectedObject)}`,
-        defaultPath: `${getObjectName(selectedObject)}.${format.toLowerCase()}`,
-        filters: [{ name: format.toUpperCase(), extensions: [format.toLowerCase()] }],
+        defaultPath: `${getObjectName(selectedObject)}.${extension}`,
+        filters: [{ name: format.toUpperCase(), extensions: [extension] }],
       });
       // Cancelling the native dialog intentionally preserves the previous destination.
       if (selected) setDestination(selected);
@@ -937,6 +959,19 @@ const ExportPanel: React.FC<ExportPanelProps> = ({
               {selectedCapability.notes}
             </Alert>
           ) : null}
+          {selectedObject
+            ? Object.entries(selectedObject.format_reasons ?? {}).map(
+                ([unavailableFormat, reason]) => (
+                  <Alert severity="warning" key={unavailableFormat}>
+                    <strong>
+                      {unavailableFormat.toUpperCase()} unavailable for{' '}
+                      {getObjectName(selectedObject)}:
+                    </strong>{' '}
+                    {reason}
+                  </Alert>
+                )
+              )
+            : null}
           <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1}>
             <TextField
               fullWidth
@@ -986,6 +1021,29 @@ const ExportPanel: React.FC<ExportPanelProps> = ({
                 ]}
               />
               <UtilityWarnings warnings={exportRunner.result.warnings} />
+              {exportRunner.result.verification ? (
+                <Stack spacing={1.5} aria-label="Export verification metadata">
+                  <Typography variant="subtitle2">Semantic round-trip verification</Typography>
+                  <SummaryGrid
+                    values={[
+                      { label: 'Schema', value: exportRunner.result.verification.schema },
+                      { label: 'Table path', value: exportRunner.result.verification.table_path },
+                      {
+                        label: 'Semantic round trip',
+                        value: exportRunner.result.verification.semantic_round_trip ? 'Passed' : 'Failed',
+                      },
+                      { label: 'h5py version', value: exportRunner.result.verification.h5py_version },
+                    ]}
+                  />
+                  <Stack component="ul" spacing={0.5} sx={{ my: 0, pl: 3 }}>
+                    {exportRunner.result.verification.checks.map((check) => (
+                      <Typography component="li" variant="body2" key={check}>
+                        {check}
+                      </Typography>
+                    ))}
+                  </Stack>
+                </Stack>
+              ) : null}
               <ProvenancePanel provenance={exportRunner.result.provenance} />
             </Stack>
           ) : null}

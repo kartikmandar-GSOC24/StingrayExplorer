@@ -44,18 +44,72 @@ const CAPABILITIES: ExportableObjectsResult['capability_matrix'] = {
     ecsv: { supported: true, notes: 'Metadata' },
     json: { supported: true, notes: 'Envelope' },
     fits: { supported: true, notes: 'Generic FITS with GTI' },
+    hdf5: {
+      supported: false,
+      notes: 'Optional HDF5 support is unavailable.',
+      reason: 'HDF5 dependency h5py is not installed.',
+      extensions: ['.hdf5'],
+      dependency: { name: 'h5py', available: false, version: null },
+    },
   },
   lightcurve: {
     csv: { supported: true, notes: 'Tabular only' },
     ecsv: { supported: true, notes: 'Metadata' },
     json: { supported: true, notes: 'Envelope' },
     fits: { supported: true, notes: 'Generic FITS' },
+    hdf5: {
+      supported: false,
+      notes: 'Optional HDF5 support is unavailable.',
+      reason: 'HDF5 dependency h5py is not installed.',
+      extensions: ['.hdf5'],
+      dependency: { name: 'h5py', available: false, version: null },
+    },
   },
   analysis_result: {
     csv: { supported: true, notes: 'Tabular only' },
     ecsv: { supported: true, notes: 'Metadata' },
     json: { supported: true, notes: 'Envelope' },
     fits: { supported: true, notes: 'Generic FITS' },
+    hdf5: {
+      supported: false,
+      notes: 'Optional HDF5 support is unavailable.',
+      reason: 'HDF5 dependency h5py is not installed.',
+      extensions: ['.hdf5'],
+      dependency: { name: 'h5py', available: false, version: null },
+    },
+  },
+};
+
+const HDF5_CAPABILITIES: ExportableObjectsResult['capability_matrix'] = {
+  event_list: {
+    ...CAPABILITIES.event_list,
+    hdf5: {
+      supported: true,
+      notes: 'Lossless Stingray Explorer schema with semantic reopen verification.',
+      reason: null,
+      extensions: ['.hdf5'],
+      dependency: { name: 'h5py', available: true, version: '3.15.1' },
+    },
+  },
+  lightcurve: {
+    ...CAPABILITIES.lightcurve,
+    hdf5: {
+      supported: true,
+      notes: 'Lossless Stingray Explorer schema with semantic reopen verification.',
+      reason: null,
+      extensions: ['.hdf5'],
+      dependency: { name: 'h5py', available: true, version: '3.15.1' },
+    },
+  },
+  analysis_result: {
+    ...CAPABILITIES.analysis_result,
+    hdf5: {
+      supported: true,
+      notes: 'Lossless Stingray Explorer schema with semantic reopen verification.',
+      reason: null,
+      extensions: ['.hdf5'],
+      dependency: { name: 'h5py', available: true, version: '3.15.1' },
+    },
   },
 };
 
@@ -68,10 +122,21 @@ function catalog(
     format_allowlist: ['csv', 'ecsv', 'json', 'fits'],
     excluded_formats: {
       pickle: 'Unsafe deserialization format',
-      hdf5: 'Round trip not verified',
+      hdf5: 'HDF5 dependency h5py is not installed.',
     },
     row_cap: 2_000_000,
     provenance: { operation: 'list_exportable_objects' },
+  };
+}
+
+function catalogWithHdf5(
+  objects: ExportableObjectsResult['objects'] = []
+): ExportableObjectsResult {
+  return {
+    ...catalog(objects),
+    capability_matrix: HDF5_CAPABILITIES,
+    format_allowlist: ['csv', 'ecsv', 'json', 'fits', 'hdf5'],
+    excluded_formats: { pickle: 'Unsafe deserialization format' },
   };
 }
 
@@ -193,6 +258,32 @@ describe('General I/O Utilities page', () => {
     expect(screen.getByText('Verified format compatibility')).toBeInTheDocument();
     expect(screen.getAllByText(/Supported — Tabular only/).length).toBeGreaterThan(0);
     expect(screen.getByText(/PICKLE: Unsafe deserialization format/)).toBeInTheDocument();
+    expect(screen.getByText('HDF5 dependency h5py is not installed.')).toBeInTheDocument();
+  });
+
+  it('does not offer HDF5 when the backend reports the capability as unavailable', async () => {
+    listExportableObjects.mockResolvedValue(
+      success(
+        catalog([
+          {
+            object_type: 'event_list',
+            name: 'events',
+            row_count: 3,
+            exportable: true,
+            formats: ['fits', 'hdf5'],
+            reason: null,
+          },
+        ])
+      )
+    );
+    renderWithProviders(<IOPage />);
+    await userEvent.click(screen.getByRole('tab', { name: 'Export / conversion' }));
+    await screen.findByLabelText('Loaded object');
+
+    await userEvent.click(screen.getByLabelText('Format'));
+    expect(screen.getByRole('option', { name: 'FITS' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'HDF5' })).not.toBeInTheDocument();
+    expect(screen.getByText('HDF5 dependency h5py is not installed.')).toBeInTheDocument();
   });
 
   it('preserves a native file selection on cancellation and sends the exact inspection payload', async () => {
@@ -487,6 +578,177 @@ describe('General I/O Utilities page', () => {
     await userEvent.click(screen.getByRole('option', { name: 'FITS' }));
     expect(screen.getByLabelText('Destination')).toHaveValue('');
     expect(screen.getByRole('button', { name: 'Export' })).toBeDisabled();
+  });
+
+  it('offers only capability-advertised HDF5 with an exact .hdf5 destination and verification record', async () => {
+    listExportableObjects.mockResolvedValue(
+      success(
+        catalogWithHdf5([
+          {
+            object_type: 'event_list',
+            name: 'events',
+            row_count: 3,
+            exportable: true,
+            formats: ['fits', 'hdf5'],
+            reason: null,
+          },
+        ])
+      )
+    );
+    const saveGrantedFile = vi.fn().mockResolvedValue({
+      path: '/exports/events.hdf5',
+      grant: 'hdf5-write-grant',
+    });
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: { ...originalElectronApi, saveGrantedFile },
+    });
+    exportObject.mockResolvedValueOnce(
+      success({
+        path: '/exports/events.hdf5',
+        bytes: 4096,
+        format: 'hdf5',
+        row_count: 3,
+        object_type: 'event_list',
+        object_name: 'events',
+        verified: true,
+        verification: {
+          schema: 'stingray-explorer.hdf5.v1',
+          table_path: 'stingray_explorer/table',
+          semantic_round_trip: true,
+          checks: ['Column order, dtypes, units, and masks match.', 'Explicit GTI state matches.'],
+          h5py_version: '3.15.1',
+        },
+        warnings: ['HDF5 was reopened before publication.'],
+        provenance: { operation: 'export_loaded_object', schema: 'stingray-explorer.hdf5.v1' },
+      })
+    );
+
+    renderWithProviders(<IOPage />);
+    await userEvent.click(screen.getByRole('tab', { name: 'Export / conversion' }));
+    await screen.findByLabelText('Loaded object');
+    expect(screen.queryByText(/HDF5 unavailable:/)).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText('Format'));
+    await userEvent.click(screen.getByRole('option', { name: 'HDF5' }));
+    expect(screen.getByText(/HDF5 scientific-data behavior:/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Choose destination' }));
+    expect(saveGrantedFile).toHaveBeenCalledWith({
+      title: 'Export events',
+      defaultPath: 'events.hdf5',
+      filters: [{ name: 'HDF5', extensions: ['hdf5'] }],
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Export' }));
+    expect(exportObject).toHaveBeenCalledWith({
+      object_type: 'event_list',
+      object_name: 'events',
+      format: 'hdf5',
+      destination_path: '/exports/events.hdf5',
+      destination_grant: 'hdf5-write-grant',
+    });
+    expect(await screen.findByLabelText('Export verification metadata')).toBeInTheDocument();
+    expect(screen.getByText('stingray-explorer.hdf5.v1')).toBeInTheDocument();
+    expect(screen.getByText('stingray_explorer/table')).toBeInTheDocument();
+    expect(screen.getByText('Explicit GTI state matches.')).toBeInTheDocument();
+    expect(screen.getByText('HDF5 was reopened before publication.')).toBeInTheDocument();
+  });
+
+  it('shows the exact per-object reason when HDF5 cannot represent a loaded object losslessly', async () => {
+    const unsupportedReason =
+      "Column 'cross' has complex values that the verified HDF5 schema does not support.";
+    listExportableObjects.mockResolvedValue(
+      success(
+        catalogWithHdf5([
+          {
+            object_type: 'analysis_result',
+            name: 'cross_spectrum',
+            row_count: 2,
+            exportable: true,
+            formats: ['fits'],
+            format_reasons: { hdf5: unsupportedReason },
+            reason: null,
+          },
+        ])
+      )
+    );
+
+    renderWithProviders(<IOPage />);
+    await userEvent.click(screen.getByRole('tab', { name: 'Export / conversion' }));
+    await screen.findByLabelText('Loaded object');
+    expect(screen.getByText(unsupportedReason)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText('Format'));
+    expect(screen.getByRole('option', { name: 'FITS' })).toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: 'HDF5' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the last successful HDF5 result visible when a later export fails', async () => {
+    listExportableObjects.mockResolvedValue(
+      success(
+        catalogWithHdf5([
+          {
+            object_type: 'analysis_result',
+            name: 'periodogram',
+            row_count: 2,
+            exportable: true,
+            formats: ['hdf5'],
+            reason: null,
+          },
+        ])
+      )
+    );
+    Object.defineProperty(window, 'electronAPI', {
+      configurable: true,
+      value: {
+        ...originalElectronApi,
+        saveGrantedFile: vi.fn().mockResolvedValue({
+          path: '/exports/periodogram.hdf5',
+          grant: 'analysis-write-grant',
+        }),
+      },
+    });
+    exportObject
+      .mockResolvedValueOnce(
+        success({
+          path: '/exports/periodogram.hdf5',
+          bytes: 2048,
+          format: 'hdf5',
+          row_count: 2,
+          object_type: 'analysis_result',
+          object_name: 'periodogram',
+          verified: true,
+          verification: {
+            schema: 'stingray-explorer.hdf5.v1',
+            table_path: 'stingray_explorer/table',
+            semantic_round_trip: true,
+            checks: ['Analysis metadata matches.'],
+            h5py_version: '3.15.1',
+          },
+          warnings: ['Successful export advisory.'],
+          provenance: { operation: 'export_loaded_object' },
+        })
+      )
+      .mockResolvedValueOnce({
+        success: false,
+        data: null,
+        message: 'HDF5 verification failed',
+        error: 'Reopened units did not match',
+        warnings: ['Failed artifact was removed before publication.'],
+      });
+
+    renderWithProviders(<IOPage />);
+    await userEvent.click(screen.getByRole('tab', { name: 'Export / conversion' }));
+    await screen.findByLabelText('Loaded object');
+    await userEvent.click(screen.getByRole('button', { name: 'Choose destination' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Export' }));
+    expect(await screen.findByText('Analysis metadata matches.')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Export' }));
+    expect(await screen.findByText('Reopened units did not match')).toBeInTheDocument();
+    expect(screen.getByText('Failed artifact was removed before publication.')).toBeInTheDocument();
+    expect(screen.getByText('Successful export advisory.')).toBeInTheDocument();
+    expect(screen.getByText('Analysis metadata matches.')).toBeInTheDocument();
   });
 
   it('requires a unique derived name and sends an explicit save-as conversion', async () => {
