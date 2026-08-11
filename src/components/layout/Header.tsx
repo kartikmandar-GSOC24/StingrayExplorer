@@ -22,7 +22,8 @@ import SearchIcon from '@mui/icons-material/Search';
 import CloseIcon from '@mui/icons-material/Close';
 import CircleIcon from '@mui/icons-material/Circle';
 import ViewSidebarIcon from '@mui/icons-material/ViewSidebar';
-import { ThemeContext, useBackendContext } from '../../App';
+import { ThemeContext } from '../../App';
+import { useBackendContext } from '@/context/BackendContext';
 import { useUIStore } from '@/store/uiStore';
 
 interface HeaderProps {

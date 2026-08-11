@@ -149,4 +149,105 @@ describe('PythonManager backend announcement protocol', () => {
       expect(() => manager.getBackendSessionSecret()).toThrow();
     }
   );
+
+  it('reports an unexpected child exit after authenticated readiness', async () => {
+    const child = new FakeChild();
+    const unexpectedExit = vi.fn();
+    installHttpResponses((options) => {
+      if (options.path === '/health') return 404;
+      if (options.path === '/api/status' && options.port === 54321) return 200;
+      return 500;
+    });
+    mocks.spawn.mockImplementation(() => {
+      setTimeout(() => child.stdout.emit('data', Buffer.from('BACKEND_PORT:54321\n')), 0);
+      return child;
+    });
+
+    const manager = new PythonManager();
+    manager.setUnexpectedExitCallback(unexpectedExit);
+    await manager.start();
+
+    child.emit('exit', 137, null);
+
+    expect(unexpectedExit).toHaveBeenCalledOnce();
+    expect(unexpectedExit).toHaveBeenCalledWith({ code: 137, signal: null });
+    expect(manager.getIsRunning()).toBe(false);
+    expect(manager.getPort()).toBe(DEFAULT_BACKEND_PORT);
+  });
+
+  it('does not report a deliberate stop as an unexpected exit', async () => {
+    const child = new FakeChild();
+    const unexpectedExit = vi.fn();
+    installHttpResponses((options) => {
+      if (options.path === '/health') return 404;
+      if (options.path === '/api/status' && options.port === 54321) return 200;
+      return 500;
+    });
+    mocks.spawn.mockImplementation(() => {
+      setTimeout(() => child.stdout.emit('data', Buffer.from('BACKEND_PORT:54321\n')), 0);
+      return child;
+    });
+
+    const manager = new PythonManager();
+    manager.setUnexpectedExitCallback(unexpectedExit);
+    await manager.start();
+    await manager.stop();
+
+    expect(unexpectedExit).not.toHaveBeenCalled();
+    expect(manager.getIsRunning()).toBe(false);
+  });
+
+  it('does not report the expected stop inside restart and reaches ready again', async () => {
+    const firstChild = new FakeChild();
+    const secondChild = new FakeChild();
+    const unexpectedExit = vi.fn();
+    installHttpResponses((options) => {
+      if (options.path === '/health') return 404;
+      if (options.path === '/api/status') return 200;
+      return 500;
+    });
+    mocks.spawn
+      .mockImplementationOnce(() => {
+        setTimeout(
+          () => firstChild.stdout.emit('data', Buffer.from('BACKEND_PORT:54321\n')),
+          0
+        );
+        return firstChild;
+      })
+      .mockImplementationOnce(() => {
+        setTimeout(
+          () => secondChild.stdout.emit('data', Buffer.from('BACKEND_PORT:54322\n')),
+          0
+        );
+        return secondChild;
+      });
+
+    const manager = new PythonManager();
+    manager.setUnexpectedExitCallback(unexpectedExit);
+    await manager.start();
+    await manager.restart();
+
+    expect(unexpectedExit).not.toHaveBeenCalled();
+    expect(manager.getIsRunning()).toBe(true);
+    expect(manager.getPort()).toBe(54322);
+    await manager.stop();
+  });
+
+  it('leaves pre-readiness startup exits to the start rejection path', async () => {
+    const child = new FakeChild();
+    const unexpectedExit = vi.fn();
+    installHttpResponses((options) => (options.path === '/health' ? 404 : 500));
+    mocks.spawn.mockImplementation(() => {
+      setTimeout(() => child.emit('exit', 1, null), 0);
+      return child;
+    });
+
+    const manager = new PythonManager();
+    manager.setUnexpectedExitCallback(unexpectedExit);
+
+    await expect(manager.start()).rejects.toThrow(
+      'Python backend process exited before becoming ready'
+    );
+    expect(unexpectedExit).not.toHaveBeenCalled();
+  });
 });

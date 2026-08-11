@@ -1,6 +1,7 @@
 /**
  * Type definitions for Electron API exposed via preload script
  */
+import type { BackendStatus } from './backendStatus';
 
 export interface ElectronAPI {
   // File System Operations
@@ -20,6 +21,10 @@ export interface ElectronAPI {
   getBackendPort: () => Promise<number>;
 
   isPythonRunning: () => Promise<boolean>;
+
+  getBackendStatus: () => Promise<BackendStatus>;
+
+  onBackendStatus: (callback: (status: BackendStatus) => void) => () => void;
 
   restartPython: () => Promise<void>;
 

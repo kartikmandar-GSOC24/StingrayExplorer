@@ -8,9 +8,11 @@ import {
   type OpenDialogOptions,
 } from 'electron';
 import { PythonManager, type NativeFileGrant } from './pythonManager';
+import type { BackendStatus } from '../src/types/backendStatus';
 
 type PythonManagerGetter = () => PythonManager | null;
 type PythonRestarter = () => Promise<void>;
+type BackendStatusGetter = () => BackendStatus;
 
 function requirePythonManager(pythonManager: PythonManager | null): PythonManager {
   if (!pythonManager) {
@@ -26,7 +28,8 @@ function requirePythonManager(pythonManager: PythonManager | null): PythonManage
  */
 export function setupIpcHandlers(
   getPythonManager: PythonManagerGetter,
-  restartPython: PythonRestarter
+  restartPython: PythonRestarter,
+  getBackendStatus: BackendStatusGetter
 ): void {
   // ============================================
   // File Dialog Handlers
@@ -109,6 +112,8 @@ export function setupIpcHandlers(
     const pythonManager = getPythonManager();
     return pythonManager?.getIsRunning() || false;
   });
+
+  ipcMain.handle('python:getStatus', () => getBackendStatus());
 
   // Restart goes through main.ts so the renderer receives the same
   // python:starting/python:ready/python:error events as initial startup —

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, createContext, useContext, useMemo } from 'react';
+import React, { useState, createContext, useContext, useMemo } from 'react';
 import { RouterProvider, createHashRouter } from 'react-router-dom';
 import { ThemeProvider as MuiThemeProvider, createTheme, Theme } from '@mui/material/styles';
 import CssBaseline from '@mui/material/CssBaseline';
@@ -66,6 +66,7 @@ import SimulatorPage from '@/pages/Simulator';
 
 // Hooks
 import { useJobStream } from '@/hooks/useJobStream';
+import { BackendStatusProvider } from '@/context/BackendContext';
 
 // Theme Context
 interface ThemeContextType {
@@ -79,21 +80,6 @@ export const ThemeContext = createContext<ThemeContextType>({
 });
 
 export const useThemeContext = (): ThemeContextType => useContext(ThemeContext);
-
-// Backend Context
-interface BackendContextType {
-  port: number | null;
-  isReady: boolean;
-  error: string | null;
-}
-
-export const BackendContext = createContext<BackendContextType>({
-  port: null,
-  isReady: false,
-  error: null,
-});
-
-export const useBackendContext = (): BackendContextType => useContext(BackendContext);
 
 // Create React Query client
 const queryClient = new QueryClient({
@@ -710,12 +696,6 @@ const App: React.FC = () => {
     return saved !== null ? JSON.parse(saved) : true;
   });
 
-  const [backendState, setBackendState] = useState<BackendContextType>({
-    port: null,
-    isReady: false,
-    error: null,
-  });
-
   // Toggle dark mode
   const toggleDarkMode = (): void => {
     setDarkMode((prev) => {
@@ -728,51 +708,17 @@ const App: React.FC = () => {
   // Theme memoization
   const theme = useMemo(() => (darkMode ? createDarkTheme() : createLightTheme()), [darkMode]);
 
-  // Listen for Python backend events
-  useEffect(() => {
-    if (typeof window !== 'undefined' && window.electronAPI) {
-      const unsubscribeReady = window.electronAPI.onPythonReady((port) => {
-        setBackendState({ port, isReady: true, error: null });
-      });
-
-      const unsubscribeError = window.electronAPI.onPythonError((error) => {
-        setBackendState((prev) => ({ ...prev, error }));
-      });
-
-      const unsubscribeStarting = window.electronAPI.onPythonStarting(() => {
-        setBackendState({ port: null, isReady: false, error: null });
-      });
-
-      // Check if already ready
-      window.electronAPI.getBackendPort().then((port) => {
-        if (port) {
-          window.electronAPI.isPythonRunning().then((isRunning) => {
-            if (isRunning) {
-              setBackendState({ port, isReady: true, error: null });
-            }
-          });
-        }
-      });
-
-      return () => {
-        unsubscribeReady();
-        unsubscribeError();
-        unsubscribeStarting();
-      };
-    }
-  }, []);
-
   return (
     <QueryClientProvider client={queryClient}>
       <ThemeContext.Provider value={{ darkMode, toggleDarkMode }}>
-        <BackendContext.Provider value={backendState}>
+        <BackendStatusProvider>
           <MuiThemeProvider theme={theme}>
             <CssBaseline />
             <JobStreamInitializer>
               <RouterProvider router={router} />
             </JobStreamInitializer>
           </MuiThemeProvider>
-        </BackendContext.Provider>
+        </BackendStatusProvider>
       </ThemeContext.Provider>
     </QueryClientProvider>
   );

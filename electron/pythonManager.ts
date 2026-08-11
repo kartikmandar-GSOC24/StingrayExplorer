@@ -37,6 +37,13 @@ export interface LogMessage {
 
 export type LogCallback = (level: LogLevel, message: string, source: LogSource) => void;
 
+export interface PythonExitInfo {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}
+
+export type UnexpectedExitCallback = (info: PythonExitInfo) => void;
+
 export class PythonManager {
   private process: ChildProcess | null = null;
   private port: number = DEFAULT_BACKEND_PORT;
@@ -53,6 +60,8 @@ export class PythonManager {
   private isRunning: boolean = false;
   private startupError: Error | null = null;
   private logCallback: LogCallback | null = null;
+  private unexpectedExitCallback: UnexpectedExitCallback | null = null;
+  private readonly expectedExits = new WeakSet<ChildProcess>();
   // Shared only with Electron main and the child backend. The renderer never
   // receives this credential; main adds it to trusted loopback requests.
   private readonly backendSessionSecret: string = randomBytes(32).toString('hex');
@@ -66,6 +75,11 @@ export class PythonManager {
    */
   setLogCallback(callback: LogCallback): void {
     this.logCallback = callback;
+  }
+
+  /** Report only child exits that occur after authenticated readiness. */
+  setUnexpectedExitCallback(callback: UnexpectedExitCallback): void {
+    this.unexpectedExitCallback = callback;
   }
 
   /**
@@ -170,6 +184,8 @@ export class PythonManager {
 
     // Handle process exit
     child.on('exit', (code, signal) => {
+      const wasRunning = this.process === child && this.isRunning;
+      const wasExpected = this.expectedExits.delete(child);
       const message = `Python backend exited with code ${code}, signal ${signal}`;
       this.sendLog(code === 0 ? 'info' : 'error', message);
       if (this.process === child) {
@@ -177,6 +193,9 @@ export class PythonManager {
         this.announcedPort = null;
         this.port = DEFAULT_BACKEND_PORT;
         this.process = null;
+      }
+      if (wasRunning && !wasExpected) {
+        this.unexpectedExitCallback?.({ code, signal });
       }
     });
 
@@ -257,6 +276,7 @@ export class PythonManager {
         resolve();
         return;
       }
+      this.expectedExits.add(proc);
 
       // Force kill after 5 seconds if this same process is still running
       const forceKillTimer = setTimeout(() => {

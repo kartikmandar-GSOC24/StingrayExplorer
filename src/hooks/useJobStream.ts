@@ -12,7 +12,7 @@ import { useEffect, useRef, useCallback } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { useJobStore } from '@/store/jobStore';
 import { useUIStore, NotificationType } from '@/store/uiStore';
-import { useBackendContext } from '@/App';
+import { useBackendContext } from '@/context/BackendContext';
 import { jobApi } from '@/api/jobApi';
 import { EVENT_LISTS_QUERY_KEY } from '@/hooks/useEventLists';
 import type { Job, JobStreamEvent } from '@/types/job';

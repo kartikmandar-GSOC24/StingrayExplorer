@@ -27,7 +27,7 @@ import {
   FormatListBulleted as FormattedIcon,
 } from '@mui/icons-material';
 import { useLogStore, selectFilteredLogs, LogEntry } from '@/store/logStore';
-import { useBackendContext } from '@/App';
+import { useBackendContext } from '@/context/BackendContext';
 import { logStreamClient } from '@/api/logApi';
 
 interface LogPanelProps {

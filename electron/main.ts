@@ -5,6 +5,10 @@ import { PythonManager, LogLevel, LogSource, LogMessage } from './pythonManager'
 import { setupIpcHandlers } from './ipcHandlers';
 import { createAppMenu } from './menu';
 import {
+  BackendStatusStore,
+  type BackendStatusTransition,
+} from './backendStatus';
+import {
   isTrustedRendererLocation,
   shouldAuthenticateBackendRequest,
   withBackendSessionHeader,
@@ -15,6 +19,41 @@ let pythonManager: PythonManager | null = null;
 let rendererReady = false;
 const logHistory: LogMessage[] = [];  // Persistent history for replay
 const MAX_LOG_HISTORY = 100;
+
+const backendStatusStore = new BackendStatusStore((status) => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+
+  mainWindow.webContents.send('python:status', status);
+
+  // Retain the existing public bridge events for compatibility. The renderer
+  // application uses only the atomic python:status contract below.
+  switch (status.phase) {
+    case 'starting':
+      mainWindow.webContents.send('python:starting');
+      break;
+    case 'ready':
+      mainWindow.webContents.send('python:ready', status.port);
+      break;
+    case 'error':
+      mainWindow.webContents.send('python:error', status.error);
+      break;
+    case 'stopped':
+      break;
+  }
+});
+
+function publishBackendStatus(transition: BackendStatusTransition): void {
+  backendStatusStore.publish(transition);
+}
+
+function getSafeBackendError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function getUnexpectedExitReason(code: number | null, signal: NodeJS.Signals | null): string {
+  if (signal) return `signal ${signal}`;
+  return `exit code ${code ?? 'unknown'}`;
+}
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 
@@ -181,26 +220,36 @@ async function createWindow(): Promise<void> {
 async function initializeApp(): Promise<void> {
   try {
     // Start Python backend
-    pythonManager = new PythonManager();
+    const manager = new PythonManager();
+    pythonManager = manager;
 
     // Set the log callback so pythonManager uses our buffered logging
-    pythonManager.setLogCallback((level, message, source) => {
+    manager.setLogCallback((level, message, source) => {
       sendLog(level, message, source);
     });
+    manager.setUnexpectedExitCallback(({ code, signal }) => {
+      // Ignore a delayed notification from a manager that has since been
+      // replaced by a fresh initialization attempt.
+      if (pythonManager !== manager) return;
+      const reason = getUnexpectedExitReason(code, signal);
+      sendLog('error', `Python backend exited unexpectedly with ${reason}`);
+      publishBackendStatus({
+        phase: 'error',
+        error: `The Python backend exited unexpectedly (${reason}). Restart the backend to continue.`,
+      });
+    });
 
-    // Notify renderer that we're starting Python
-    mainWindow?.webContents.send('python:starting');
+    publishBackendStatus({ phase: 'starting' });
     sendLog('info', 'Starting Python backend...');
 
-    await pythonManager.start();
+    await manager.start();
 
-    // Notify renderer that Python is ready
-    mainWindow?.webContents.send('python:ready', pythonManager.getPort());
+    publishBackendStatus({ phase: 'ready', port: manager.getPort() });
 
-    sendLog('info', `Python backend started successfully on port ${pythonManager.getPort()}`);
+    sendLog('info', `Python backend started successfully on port ${manager.getPort()}`);
   } catch (error) {
     sendLog('error', `Failed to start Python backend: ${error}`);
-    mainWindow?.webContents.send('python:error', String(error));
+    publishBackendStatus({ phase: 'error', error: getSafeBackendError(error) });
 
     // Show error dialog
     dialog.showErrorBox(
@@ -222,16 +271,16 @@ async function restartBackend(): Promise<void> {
     return;
   }
 
-  mainWindow?.webContents.send('python:starting');
+  publishBackendStatus({ phase: 'starting' });
   sendLog('info', 'Restarting Python backend...');
 
   try {
     await pythonManager.restart();
-    mainWindow?.webContents.send('python:ready', pythonManager.getPort());
+    publishBackendStatus({ phase: 'ready', port: pythonManager.getPort() });
     sendLog('info', `Python backend restarted successfully on port ${pythonManager.getPort()}`);
   } catch (error) {
     sendLog('error', `Failed to restart Python backend: ${error}`);
-    mainWindow?.webContents.send('python:error', String(error));
+    publishBackendStatus({ phase: 'error', error: getSafeBackendError(error) });
   }
 }
 
@@ -249,7 +298,11 @@ app.whenReady().then(async () => {
   app.setName('Stingray Explorer');
 
   // Set up IPC handlers before creating window
-  setupIpcHandlers(() => pythonManager, restartBackend);
+  setupIpcHandlers(
+    () => pythonManager,
+    restartBackend,
+    () => backendStatusStore.getSnapshot()
+  );
 
   await createWindow();
   await initializeApp();
@@ -259,14 +312,10 @@ app.whenReady().then(async () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       await createWindow();
 
-      // Make sure the freshly-loaded renderer ends up connected. Normally the
-      // backend is still running (see 'window-all-closed'), so just tell the new
-      // window its port — the renderer's mount-time check also reconnects on its
-      // own. If the backend somehow isn't running, (re)initialize it so we never
-      // get stuck showing "Starting..." with no backend.
-      if (pythonManager && pythonManager.getIsRunning()) {
-        mainWindow?.webContents.send('python:ready', pythonManager.getPort());
-      } else {
+      // The freshly-loaded renderer subscribes and reads the authoritative
+      // snapshot, so a ready notification does not need to be timed around its
+      // mount. Reinitialize only if the process is no longer running.
+      if (!pythonManager || !pythonManager.getIsRunning()) {
         await initializeApp();
       }
     }
@@ -283,6 +332,7 @@ app.on('window-all-closed', async () => {
     if (pythonManager) {
       await pythonManager.stop();
       pythonManager = null;
+      publishBackendStatus({ phase: 'stopped' });
     }
     app.quit();
   }
@@ -293,6 +343,7 @@ app.on('before-quit', async () => {
   if (pythonManager) {
     await pythonManager.stop();
     pythonManager = null;
+    publishBackendStatus({ phase: 'stopped' });
   }
 });
 

@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron';
+import type { BackendStatus } from '../src/types/backendStatus';
 
 /**
  * Electron API exposed to the renderer process via context bridge
@@ -39,32 +40,37 @@ const electronAPI = {
    */
   isPythonRunning: (): Promise<boolean> => ipcRenderer.invoke('python:isRunning'),
 
+  /** Get the atomic main-process backend lifecycle snapshot. */
+  getBackendStatus: (): Promise<BackendStatus> => ipcRenderer.invoke('python:getStatus'),
+
+  /** Subscribe to revisioned backend lifecycle snapshots. */
+  onBackendStatus: (callback: (status: BackendStatus) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, status: BackendStatus): void =>
+      callback(status);
+    ipcRenderer.on('python:status', handler);
+    return () => ipcRenderer.removeListener('python:status', handler);
+  },
+
   /**
    * Restart the Python backend
    */
   restartPython: (): Promise<void> => ipcRenderer.invoke('python:restart'),
 
-  /**
-   * Subscribe to Python backend ready event
-   */
+  /** @deprecated Use onBackendStatus for revision-safe lifecycle updates. */
   onPythonReady: (callback: (port: number) => void): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent, port: number): void => callback(port);
     ipcRenderer.on('python:ready', handler);
     return () => ipcRenderer.removeListener('python:ready', handler);
   },
 
-  /**
-   * Subscribe to Python backend starting event
-   */
+  /** @deprecated Use onBackendStatus for revision-safe lifecycle updates. */
   onPythonStarting: (callback: () => void): (() => void) => {
     const handler = (): void => callback();
     ipcRenderer.on('python:starting', handler);
     return () => ipcRenderer.removeListener('python:starting', handler);
   },
 
-  /**
-   * Subscribe to Python backend error event
-   */
+  /** @deprecated Use onBackendStatus for revision-safe lifecycle updates. */
   onPythonError: (callback: (error: string) => void): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent, error: string): void => callback(error);
     ipcRenderer.on('python:error', handler);

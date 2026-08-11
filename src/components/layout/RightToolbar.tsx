@@ -41,7 +41,7 @@ import MenuBookIcon from '@mui/icons-material/MenuBook';
 import ForumIcon from '@mui/icons-material/Forum';
 import { useUIStore, Notification, AppResources } from '@/store/uiStore';
 import { useLogStore } from '@/store/logStore';
-import { useBackendContext } from '@/App';
+import { useBackendContext } from '@/context/BackendContext';
 
 const TOOLBAR_WIDTH = 52;
 const HEADER_HEIGHT = 64;
